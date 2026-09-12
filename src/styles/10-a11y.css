@@ -1,0 +1,69 @@
+/* ===========================================================================
+   a11y 工具类：skip link + prefers-reduced-motion
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ---------- skip link (Phase M) ----------
+   键盘用户 Tab 时第一站直达主内容（#viewer-main），跳过 9 个工具栏按钮 +
+   侧栏若干入口 + 排序切换。
+   - 默认视觉隐藏（不占布局、不抢 mouse 焦点），focus 时滑出右上角
+   - 用 `:focus-visible` 而非 `:focus`：鼠标点击不触发（避免每次点击
+     主页都闪一下右上角）
+   - z-index 高于 toolbar（toolbar 顶层 100），保证焦点环可见
+*/
+.skip-link {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1000;
+  padding: 8px 14px;
+  background: var(--accent, #4f8cff);
+  color: #fff;
+  text-decoration: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  /* 默认视觉隐藏但保留可访问性 —— 用 transform 移到屏外，不影响
+     屏幕阅读器在第一个 Tab 焦点候选里看到它 */
+  transform: translateY(-200%);
+  transition: transform 120ms ease-out;
+}
+.skip-link:focus,
+.skip-link:focus-visible {
+  transform: translateY(0);
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+/* skip link target —— #viewer-main 拿到焦点时去掉默认 outline
+   （它是"已抵达目的地"的反馈，不是交互元素），但保留 SR focus 语义 */
+.viewer:focus,
+.viewer:focus-visible {
+  outline: none;
+}
+
+/* ---------- prefers-reduced-motion ----------
+   关掉持续脉冲 (dirty-pulse / halo / ai-pulse) 与一次性入场动画
+   （modal / toast / ai-diff / ai-chat / outline-slide）。
+   用 0.01ms 而非 0 / animation: none：保留渲染状态（toast/modal 还要显示），
+   只是让用户「感知不到」动画过程。
+   兜底使用 * 选择器覆盖未来新增 keyframes，避免遗漏。
+
+   关键修复：去掉 `transition-duration: 0.01ms !important` —— 之前 blanket 会
+   杀掉所有 hover/focus 过渡（按钮悬停高亮、tab 切换、focus 环），让前庭敏感
+   用户失去所有交互反馈（与禁用动画的初衷相反）。
+   transition 是「用户主动操作触发的短暂反馈」（平均 120ms），不是「持续脉冲」
+   这类持续性刺激；前者对前庭敏感用户基本无害，后者才是真正需要关的。
+   见 [[feedback-ui-detail-polish]] —— 体验与无障碍要兼顾。
+*/
+@media (prefers-reduced-motion: reduce) {
+  .btn-icon.is-dirty,
+  .btn-icon-text.is-dirty { animation: none; }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0 !important;
+  }
+}
+

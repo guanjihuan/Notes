@@ -1,0 +1,185 @@
+/* ===========================================================================
+   打印样式（@media print）
+   自动从 src/styles.css 拆分（audit #60 critical fix）
+
+   Notes 是阅读器，用户打印长笔记很常见。默认打印会把工具栏 / 侧栏 /
+   状态栏 / AI 面板 / 模态 / toast / 焦点模式提示全部印出来——
+   既浪费纸，又把内容挤到不可读的边角。
+
+   目标：打印 = 只剩干净的阅读视图 + 黑白配色 + 合理边距。
+   =========================================================================== */
+
+@media print {
+  /* 隐藏所有应用 chrome —— 阅读视图之外都不进纸 */
+  .toolbar,
+  .sidebar,
+  .sidebar-splitter,
+  .statusbar,
+  .app-ai,
+  .ai-splitter,
+  .ai-chat-dock,
+  .modal-overlay,
+  .toast-container,
+  .focus-hotzone,
+  .focus-exit-hint,
+  .boot-error,
+  #modal-root {
+    display: none !important;
+  }
+
+  /* 重置 app-shell 网格 —— 移除多栏布局，让正文占满整页 */
+  .app-shell,
+  body {
+    display: block !important;
+    grid-template-columns: none !important;
+    grid-template-rows: none !important;
+    background: white !important;
+    color: black !important;
+  }
+
+  /* 阅读视图：完整内容 + 合理边距 + 取消 max-width 限制 */
+  .viewer,
+  .editor-pane,
+  .markdown-body {
+    background: white !important;
+    color: black !important;
+    max-width: none !important;
+    width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* 阅读正文：1.5cm 边距 + serif fallback（用户机器可能没装 Source Serif Pro）。
+     audit fix (CSS P2 / print doubled margin)：之前在 .markdown-body 上又
+     叠一层 padding:1.5cm，与 @page margin:1.5cm 1.8cm 加起来 = 上下 3cm
+     / 左右 3.3cm，每页可用空间被吃光。@page margin 已经把页面边距定好，
+     这里只保留字体 / 字号 / 行高 / 链接色，不该再动 padding。 */
+  .markdown-body {
+    font-family: var(--font-reading, 'Source Serif Pro', 'Noto Serif CJK SC', Georgia, 'Times New Roman', serif) !important;
+    font-size: 11pt !important;
+    line-height: 1.5 !important;
+    color: black !important;
+  }
+
+  /* Markdown 内容：纯黑白 + 强对比 + 取消背景色（节省墨水） */
+  .markdown-body h1,
+  .markdown-body h2,
+  .markdown-body h3,
+  .markdown-body h4,
+  .markdown-body h5,
+  .markdown-body h6 {
+    color: black !important;
+    background: none !important;
+    page-break-after: avoid;
+    page-break-inside: avoid;
+  }
+
+  .markdown-body h1 { font-size: 22pt !important; }
+  .markdown-body h2 { font-size: 18pt !important; }
+  .markdown-body h3 { font-size: 14pt !important; }
+
+  .markdown-body p,
+  .markdown-body li,
+  .markdown-body blockquote {
+    color: black !important;
+    orphans: 3;
+    widows: 3;
+  }
+
+  .markdown-body a {
+    color: black !important;
+    text-decoration: underline;
+  }
+  /* 打印时显示 URL（让读者知道链接指向哪里）—— 链接文本后面追加 href
+     audit fix (#8 shared)：加 overflow-wrap: anywhere + word-break: break-all，
+     否则长 URL（github issue 链接、含 query string 的 API 文档等）在 A4 宽度下
+     会溢出页面右侧，超出可打印边距；保留 word-break 在伪元素上也生效。 */
+  .markdown-body a[href]::after {
+    content: ' (' attr(href) ')';
+    font-size: 0.85em;
+    color: #555 !important;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+  }
+  /* 但文内锚点（#xxx）不显示 —— 没意义 */
+  .markdown-body a[href^="#"]::after {
+    content: '';
+  }
+
+  .markdown-body blockquote {
+    border-left: 3px solid #888 !important;
+    background: none !important;
+    padding-left: 12pt !important;
+  }
+
+  .markdown-body pre,
+  .markdown-body code {
+    color: black !important;
+    background: #f4f4f4 !important;
+    border: 1px solid #ddd !important;
+    font-family: 'Consolas', 'Menlo', 'Courier New', monospace !important;
+    font-size: 9.5pt !important;
+    page-break-inside: avoid;
+  }
+  .markdown-body code {
+    /* 行内 code 不需要 box border，看起来更接近正常文本 */
+    border: none !important;
+    background: #f4f4f4 !important;
+    padding: 0 3pt !important;
+  }
+
+  .markdown-body table {
+    border-collapse: collapse !important;
+    page-break-inside: avoid;
+  }
+  .markdown-body th,
+  .markdown-body td {
+    border: 1px solid #888 !important;
+    background: white !important;
+    color: black !important;
+    padding: 4pt 8pt !important;
+  }
+
+  .markdown-body img {
+    max-width: 100% !important;
+    height: auto !important;
+    page-break-inside: avoid;
+  }
+
+  .markdown-body hr {
+    border: none !important;
+    border-top: 1px solid #888 !important;
+    background: none !important;
+    margin: 12pt 0 !important;
+  }
+
+  /* 避免在标题 / 表格 / 图片内分页 —— 阅读体验更连贯 */
+  .markdown-body h1,
+  .markdown-body h2,
+  .markdown-body h3,
+  .markdown-body figure,
+  .markdown-body pre,
+  .markdown-body table,
+  .markdown-body img,
+  .markdown-body blockquote {
+    page-break-inside: avoid;
+  }
+
+  /* 取消所有 hover/focus 视觉态（打印场景没意义，且会浪费墨水） */
+  *,
+  *::before,
+  *::after {
+    box-shadow: none !important;
+    text-shadow: none !important;
+    transition: none !important;
+    animation: none !important;
+  }
+
+  /* 页面设置：A4 + 合理边距 */
+  @page {
+    size: A4;
+    margin: 1.5cm 1.8cm;
+  }
+}

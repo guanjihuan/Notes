@@ -1,0 +1,18 @@
+/* ===========================================================================
+   Notes — 样式入口（Stage 4a：分片）
+   通过 @import 按顺序串联 01..12。
+   浏览器原生 CSS @import 性能成本可忽略（12 个文件并行或合并）；本应用零打包。
+   =========================================================================== */
+
+@import url('./styles/01-tokens.css');
+@import url('./styles/02-palettes.css');
+@import url('./styles/03-base.css');
+@import url('./styles/04-toolbar.css');
+@import url('./styles/05-sidebar.css');
+@import url('./styles/06-markdown.css');
+@import url('./styles/07-statusbar.css');
+@import url('./styles/08-modal.css');
+@import url('./styles/09-misc.css');
+@import url('./styles/10-a11y.css');
+@import url('./styles/11-ai.css');
+@import url('./styles/12-print.css');

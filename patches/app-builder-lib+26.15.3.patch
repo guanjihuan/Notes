@@ -1,0 +1,13 @@
+diff --git a/node_modules/app-builder-lib/out/targets/blockmap/blockmap.js b/node_modules/app-builder-lib/out/targets/blockmap/blockmap.js
+index 2492bc7..6587e60 100644
+--- a/node_modules/app-builder-lib/out/targets/blockmap/blockmap.js
++++ b/node_modules/app-builder-lib/out/targets/blockmap/blockmap.js
+@@ -5,7 +5,7 @@ const crypto_1 = require("crypto");
+ const fs_1 = require("fs");
+ const promises_1 = require("fs/promises");
+ const zlib = require("zlib");
+-const blake2_js_1 = require("@noble/hashes/blake2.js");
++const blake2_js_1 = require("@noble/hashes/blake2b");
+ // Rabin fingerprinting constants from github.com/aclements/go-rabin:
+ //   Poly64 = 0xbfe6b8a5bf378d83 (degree-63 irreducible polynomial over GF(2))
+ //   Window = 64 bytes, Avg = 16 KB, Min = 8 KB, Max = 32 KB

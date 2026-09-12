@@ -1,0 +1,714 @@
+/* ============================================================================
+   AI 修改功能（参考 markdown.guanjihuan.com 的设计思路）
+   - 中间面板 .app-ai：app-shell 的 grid 第 6 列，body[data-ai-diff-open] 控制可见
+   - 底部 dock .ai-chat-dock：body grid 第 3 行（app-shell 与 statusbar 之间），
+     由 grid-row:3 显式钉位；默认 hidden 不占空间，展开时 statusbar 自动让位
+   - Diff 渲染：行级 +/- + 词级 inline diff（equal/removed/added）
+   - 配色与现有 token 一致（accent / success / warning / danger / surface）
+   ============================================================================ */
+
+/* ============================================================
+   Body 网格：插入 AI 中间面板
+   ============================================================ */
+
+/*
+   AI 中间面板在三种模式下的位置（参考 markdown.guanjihuan.com 的
+   「编辑 / 预览中间夹 AI 审查区」设计）：
+
+   - preview（只显示 viewer）：AI 在 viewer 右边
+   - edit（只显示 editor）：AI 在 editor 右边
+   - split（editor + viewer 双栏）：AI 在 #splitter 右边、viewer 左边
+       —— 即「编辑和预览中间」的位置，用户对照原文档 / 编辑器的同时看 AI diff
+
+   AI 默认 hidden，由 ai-controller 切到 body[data-ai-diff-open="true"] 时显示。
+*/
+
+/*
+   BUG fix：CSS Grid auto-placement 按 DOM 顺序处理 cursor，cursor 越过列尾就
+   wrap 到下一行。.app-ai / .ai-splitter 都是显式钉列，.viewer 是 auto。
+
+   在 preview / edit 模式下，editor-pane / splitter 是 hidden 不占格，cursor
+   会跳过它们继续前进：sidebar→col 1、sb-splitter→col 2，再前进到 col 3 时
+   没有 hidden 项要放、cursor 继续走；如果 .app-ai 显式 col 5 让 cursor
+   走到 row 末，下面的 .ai-splitter（显式 col 4）和 .viewer（auto）就会被
+   全部挤到 row 2。
+
+   grid-auto-flow: dense 让算法回填 row 1 的空位：显式项尽量就近放、auto
+   项也能填中间空隙。配合 DOM 把 .app-ai / .ai-splitter 放在 .viewer 之前
+   （见 index.html 注释），所有模式（preview / edit / split / focus）
+   都自动落到正确列。
+*/
+body[data-ai-diff-open="true"] .app-shell {
+  grid-auto-flow: dense;
+}
+
+/* preview/edit + 仅 AI：5 列
+   sidebar(1) | sb-splitter(2) | main(3) | ai-splitter(4) | AI(5) */
+body[data-ai-diff-open="true"] .app-shell {
+  grid-template-columns:
+    var(--sidebar-width)
+    4px
+    minmax(0, 1fr)
+    var(--ai-splitter-width, 4px)
+    minmax(220px, var(--w-ai, 360px));
+}
+
+/* split + 仅 AI：7 列 —— AI 在 #splitter 和 viewer 之间（中间位置）
+   sidebar(1) | sb-splitter(2) | editor(3) | #splitter(4) | AI(5) | ai-splitter(6) | viewer(7)
+   - editor 用 px (--w-editor)，viewer 用 1fr 自动填剩余 —— 拖 ai-splitter 时 AI 增长 px、
+     fr space 缩小，viewer 缩小但 editor 不动；拖 #splitter 时 editor 增长 px、
+     viewer 缩小、AI 不动。
+   - ai-splitter 控制 AI 宽度（px，独立）
+   - editor 宽度由 mountSplitter 在 .app-shell 的 style 上写 --w-editor */
+body[data-ai-diff-open="true"][data-editor-mode="split"] .app-shell {
+  grid-template-columns:
+    var(--sidebar-width)
+    4px
+    minmax(280px, var(--w-editor, 50%))
+    4px
+    minmax(220px, var(--w-ai, 360px))
+    var(--ai-splitter-width, 4px)
+    minmax(0, 1fr);
+}
+
+/* preview/edit + AI：5 列（见上） */
+
+/*
+   聚焦模式（focus-mode）优先于 AI 网格 —— 11-ai.css 比 09-misc.css 后加载，
+   默认会被覆盖成「侧栏 + AI」。这里用更高特异性的选择器把侧栏收起，
+   只留「viewer + AI 中间面板」两列。
+
+   focus 模式下 AI 面板单独占一列；split 也退化成单栏（与 09-misc.css 的 focus 简化一致）。
+*/
+body[data-focus-mode="true"][data-ai-diff-open="true"] .app-shell,
+body[data-focus-mode="true"][data-ai-diff-open="true"][data-editor-mode="split"] .app-shell {
+  grid-template-columns:
+    0
+    0
+    minmax(0, 1fr)
+    0
+    var(--ai-splitter-width, 4px)
+    minmax(220px, var(--w-ai, 360px));
+}
+
+/*
+   窄窗口（< 720px）：让 AI 中间面板与 viewer 共享空间，避免 viewer 被挤到 0px。
+   同样限制主进程的最小宽度为 600，实际只影响 600~720 区间。
+
+   Bug-1 fix (audit)：这里必须把 .ai-splitter 也一起 display:none —— 否则
+   媒体查询把 grid-template 压成 3 列，但 .ai-splitter 仍带 grid-column:5/6/7/8，
+   CSS Grid 会为了满足显式列号自动扩展隐式列，把 4px 宽的 splitter 推到
+   viewer 旁边成为一个"孤儿"光标条。app.js 的 mountAiSplitter 命中检查
+   也已经依赖这个隐藏（否则窄屏下拖一个看不见的 splitter 写入 --w-ai）。
+*/
+@media (max-width: 720px) {
+  body[data-ai-diff-open="true"] .app-shell,
+  body[data-ai-diff-open="true"][data-editor-mode="split"] .app-shell {
+    grid-template-columns: var(--sidebar-width) 4px minmax(0, 1fr);
+  }
+  body[data-ai-diff-open="true"] .app-ai,
+  body[data-ai-diff-open="true"] .ai-splitter {
+    display: none; /* 窄屏默认关闭 AI 中间面板；用户可用 toolbar AI 按钮查看 */
+  }
+}
+
+/*
+   BUG-1 fix (audit)：.app-ai 必须显式声明 grid-column，否则会被
+   grid-auto-flow: row 推到 4px 间隔列，宽度被压成 4px（看似"消失了"）。
+   模板列数随模式不同，所以这里按场景分别钉列。
+
+   新设计（AI 在 split 模式放中间）的 grid 列映射：
+
+   | 场景                | 列数 | ai-splitter | app-ai |
+   | ------------------- | ---- | ----------- | ------ |
+   | preview/edit + AI   | 5    | 4           | 5      |
+   | split + AI          | 7    | 6           | 5      | ← AI 在 #splitter 和 viewer 之间
+   | focus + AI          | 6    | 5           | 6      | ← focus 退化为单栏
+*/
+
+/* preview/edit + AI：5 列 */
+body[data-ai-diff-open="true"][data-editor-mode="preview"] .ai-splitter,
+body[data-ai-diff-open="true"][data-editor-mode="edit"] .ai-splitter {
+  grid-column: 4;
+}
+body[data-ai-diff-open="true"][data-editor-mode="preview"] .app-ai,
+body[data-ai-diff-open="true"][data-editor-mode="edit"] .app-ai {
+  grid-column: 5;
+}
+
+/* split + AI：AI 嵌在 #splitter(col 4) 和 viewer(col 7) 之间
+   7 列：sb(1) | sb-splitter(2) | editor(3) | #splitter(4) | AI(5) | ai-splitter(6) | viewer(7) */
+body[data-ai-diff-open="true"][data-editor-mode="split"] .app-ai {
+  grid-column: 5;
+}
+body[data-ai-diff-open="true"][data-editor-mode="split"] .ai-splitter {
+  grid-column: 6;
+}
+
+/* focus + AI（split 在 focus 下退化为单栏）：6 列 */
+body[data-focus-mode="true"][data-ai-diff-open="true"] .ai-splitter {
+  grid-column: 5;
+}
+body[data-focus-mode="true"][data-ai-diff-open="true"] .app-ai {
+  grid-column: 6;
+}
+
+/* ============================================================
+   .ai-splitter 拖动条（视觉 4px + 命中区扩展）
+   ============================================================ */
+
+/*
+   与 #splitter / #sidebar-splitter 同套设计：视觉宽度 4px，但命中区通过
+   ::before / ::after 伪元素左右各扩 6px，让鼠标接近边缘就能抓住。
+   视觉上的「薄线」用渐变显示 hover 态。
+*/
+.ai-splitter {
+  background: transparent;
+  cursor: col-resize;
+  /* 默认位置：grid 自定（grid-column 由各模式场景单独钉） */
+  position: relative;
+  /* 阻止浏览器默认拖选 / 文本选择 */
+  user-select: none;
+  touch-action: none;
+}
+.ai-splitter::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  /* 视觉条居中，宽度 4px */
+  left: 50%;
+  width: var(--ai-splitter-width, 4px);
+  transform: translateX(-50%);
+  background: var(--border-subtle);
+  transition: background var(--transition-fast, 120ms ease-out);
+}
+.ai-splitter:hover::before,
+.ai-splitter.is-dragging::before {
+  background: var(--accent);
+}
+.ai-splitter:focus-visible {
+  outline: none;
+}
+.ai-splitter:focus-visible::before {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/*
+   focus 模式下 AI 面板也整体隐藏（与 .app-ai 同步）—— 用户已经进入
+   「只看 viewer」状态，splitter 出现反而提醒宽度可调，分散注意力。
+*/
+body[data-focus-mode="true"] .ai-splitter {
+  display: none;
+}
+
+/* ============================================================
+   .app-ai 中间面板
+   ============================================================ */
+.app-ai {
+  background: var(--bg-sidebar);
+  border-left: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  /* 入场动画：从右往左 8px，淡入 150ms */
+  animation: ai-diff-enter 150ms ease-out;
+}
+
+@keyframes ai-diff-enter {
+  from { opacity: 0; transform: translateX(8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ============================================================
+   Diff 面板头部
+   ============================================================ */
+.ai-diff-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  gap: var(--space-3);
+}
+
+.ai-diff-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--fg-primary);
+  margin: 0 0 2px;
+}
+
+.ai-diff-summary {
+  /* 11px + --fg-muted 在 --bg-card 上仅 ~3.2:1（dark default），低于 AA。
+     这是"5 处变更" / "+12 / -3"这类用户主动扫的统计数字，提一档到
+     --fg-tertiary（~5.4:1）让 11px 信息也能稳定看清。
+     字重 500 加粗辅助，让小字号+低饱和组合仍可读 */
+  font-size: var(--fs-xs);
+  color: var(--fg-tertiary);
+  font-weight: 500;
+  margin: 0;
+}
+
+.ai-diff-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ai-diff-apply-all {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--btn-on-accent);
+  border: 1px solid var(--accent);
+  font-size: var(--fs-xs-readable);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.ai-diff-apply-all:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.ai-diff-apply-all:active {
+  transform: scale(0.98);
+}
+
+.ai-diff-apply-all:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ai-diff-dismiss {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px solid var(--border-subtle);
+  font-size: var(--fs-base);
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.ai-diff-dismiss:hover {
+  color: var(--fg-primary);
+  border-color: var(--border-default);
+  background: var(--accent-soft);
+}
+
+.ai-diff-dismiss:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ============================================================
+   Diff 主体（行级 + 词级）
+   ============================================================ */
+.ai-diff-fulltext {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: var(--fs-xs-readable);
+  line-height: 1.55;
+  padding: 8px 0;
+}
+
+/* 单行：行号 + +/-/space 前缀 + 文本 */
+.ai-diff-line {
+  display: grid;
+  /* 行号列从 36px 收到 32px：999 行以内（~32px 够放 3 位数字 + 6px padding）
+     已经覆盖 99% 文档；超过 999 的极端情况用 ellipsis 截断 */
+  grid-template-columns: 32px 16px 1fr;
+  align-items: baseline;
+  padding: 1px 14px 1px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ai-diff-line-added   { background: color-mix(in srgb, var(--success) 12%, transparent); }
+.ai-diff-line-removed { background: color-mix(in srgb, var(--danger)  12%, transparent); }
+.ai-diff-line-context { color: var(--fg-secondary); }
+.ai-diff-line-plain   { grid-template-columns: 1fr; }
+
+.ai-diff-line-number {
+  color: var(--fg-muted);
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+  /* audit fix (CSS P1 / diff line numbers opacity removed)：
+     旧实现 opacity: 0.65 在 --fg-muted 之上再叠一层 alpha。对比度从原本
+     约 4.5:1 跌到 ~3:1（叠透明度 + 暗色底），line number 看着像「水印」
+     而不是结构信息 —— 用户来回滚 diff 时眼睛定位行号很费劲。--fg-muted
+     本身在各 palette 都已经过 AA 调整（02-palettes.css 注释），单独用
+     这个色就足够弱化但仍可读，去掉 opacity 让对比度回到 palette 设计
+     目标值。
+   */
+}
+
+.ai-diff-line-prefix {
+  color: var(--fg-muted);
+  text-align: center;
+  user-select: none;
+}
+
+.ai-diff-line-added   .ai-diff-line-prefix { color: var(--success); font-weight: 600; }
+.ai-diff-line-removed .ai-diff-line-prefix { color: var(--danger);  font-weight: 600; }
+
+.ai-diff-line-text {
+  color: var(--fg-primary);
+}
+
+/* 词级 inline diff */
+.ai-diff-segment { white-space: pre-wrap; }
+.ai-diff-segment-removed {
+  /* 词级删除：底色 + 删除线。
+     底色透明度从 24% 降到 18%，因为叠加行级 12% 后总透度接近 30%，
+     行内 highlight 看起来太重。叠两层后 18% 让"行"和"词"的视觉权重拉开 */
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--fg-primary);
+  border-radius: 2px;
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--danger) 60%, transparent);
+  text-decoration-thickness: 1px;
+}
+.ai-diff-segment-added {
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--fg-primary);
+  border-radius: 2px;
+}
+
+/* ============================================================
+   Diff Region（修改块）：每个 region 一个 section + 头部 + 主体
+   ============================================================ */
+.ai-diff-region {
+  /* region 之间靠 border-top + margin 8px 隔开；不要底部边框，
+     否则下一个 region 的顶部会和自己的底部边线"撞"成 2px */
+  border-top: 1px solid var(--border-subtle);
+  margin: 8px 0;
+  /* region 是"修改块"，用 30% bg-elevated 微微抬起，让眼睛能快速定位。
+     配合圆角 + 微阴影让每个 region 像一张卡片 */
+  background: color-mix(in srgb, var(--bg-elevated) 30%, transparent);
+  border-radius: var(--radius-sm);
+}
+
+.ai-diff-region:first-child {
+  /* 第一个 region 顶部贴顶，不需要 border-top */
+  border-top: none;
+  margin-top: 0;
+}
+
+.ai-diff-region-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: color-mix(in srgb, var(--bg-elevated) 60%, transparent);
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+}
+
+.ai-diff-region-apply {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.ai-diff-region-apply:hover:not([disabled]) {
+  background: var(--accent);
+  color: var(--btn-on-accent);
+}
+
+.ai-diff-region-apply:active:not([disabled]) {
+  transform: scale(0.98);
+}
+
+.ai-diff-region-apply[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* audit fix：conflict 区域新增的"跳过此处"按钮 —— 比 apply 更弱的视觉权重，
+   让用户优先尝试 apply，失败时才有第二选项。 */
+.ai-diff-region-actions {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.ai-diff-region-skip {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  /* 与 apply 按钮成对：apply 用 accent 主色，skip 用 muted 次色 —— 形成视觉权重差，
+     让用户在冲突时优先尝试 apply，skip 才是退路 */
+  color: var(--fg-secondary);
+  border: 1px solid var(--border-subtle);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.ai-diff-region-skip:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+  border-color: var(--border-default);
+}
+
+.ai-diff-region-skip:active {
+  transform: scale(0.98);
+}
+
+.ai-diff-conflict {
+  font-size: var(--fs-xs);
+  /* 文字降彩度（--warning-text）："冲突"两字若用纯橙小字与行内 +/- 同色
+     saturate，易在密集 diff 块里"跳出来"。左侧 +/- 行号前缀用纯色，
+     文字让一档，保持可识别但不抢戏。 */
+  color: var(--warning-text);
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+.ai-diff-region-body {
+  /* 内部每行延用 .ai-diff-line */
+}
+
+/* ============================================================
+   空状态 / 普通回复（AI 返回纯文本，不改文档时）
+   ============================================================ */
+.ai-diff-empty {
+  /* 上下加大间距，左右收敛到 16px，让中间文案看起来「居中呼吸」。
+     用 flex column + gap 而不是一个段落，方便未来插入图标 */
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 16px;
+  color: var(--fg-tertiary);
+  font-size: var(--fs-sm);
+  text-align: center;
+  line-height: var(--lh-relaxed);
+}
+
+/* (audit fix Round 9: .ai-diff-empty-icon / .ai-diff-empty-title /
+   .ai-diff-empty-hint / .ai-reply-plain 全部为零引用死 CSS —— ai-diff-panel.js
+   只用 .ai-diff-empty 容器，suffix 三个变体没有调用方) */
+
+.ai-reply-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  /* 上下 18px，左右 16px：比之前的 12px/14px 更舒展，
+     AI 回复通常字数多，给点上下呼吸让长文不挤 */
+  padding: 18px 16px;
+}
+
+.ai-reply-content.markdown-body {
+  /* 复用 .markdown-body 的字体/排版（参见 06-viewer.css） */
+}
+
+/* (audit fix Round 9: .ai-reply-plain 死 CSS，已在文件头注释) */
+
+/* ============================================================
+   底部 AI 对话 dock
+   挂在 app-shell 与 statusbar 之间，侧栏式 UI 风格
+   ============================================================ */
+.ai-chat-dock {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border-subtle);
+  /* 上下 8px 收紧 dock 高度：原来 10px 让 dock 总高 76px，输入框下沿到
+     状态栏之间有 ~34px 空白（含 status row 始终保留的 16px），视觉偏空。
+     收到 8px 后空闲高度 60px 左右，更紧凑又不挤 */
+  padding: 8px 16px;
+  gap: 4px;
+  /* 入场动画：自下而上淡入 */
+  animation: ai-chat-enter 150ms ease-out;
+}
+
+@keyframes ai-chat-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.ai-chat-form-row {
+  display: grid;
+  grid-template-columns: 28px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.ai-chat-toggle {
+  width: 28px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px solid var(--border-subtle);
+  font-size: var(--fs-base);
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.ai-chat-toggle:hover {
+  color: var(--fg-primary);
+  border-color: var(--border-default);
+  background: var(--accent-soft);
+}
+
+.ai-chat-input-wrap {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 32px;
+}
+
+.ai-chat-input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  /* padding: 0 10px 完整重置 UA 默认 padding（Chromium 给 input 是 padding: 1px 2px），
+     避免 1px 上下 padding 让 height 计算偏移。border-box 下 32 - 2(border) = 30 内容区。 */
+  padding: 0 10px;
+  background: var(--bg-viewer);
+  color: var(--fg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  /* line-height: 30 让单行文字在 30px 内容区内垂直居中（避免 line-height: normal
+     按 1.2× 计算导致基线偏移）。 */
+  line-height: 30px;
+  transition: border-color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.ai-chat-input:hover:not(:focus) {
+  border-color: var(--border-default);
+}
+
+.ai-chat-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--bg-app);
+  /* 微微发光，让 focus 视觉反馈更明确，配合 outline 不会"双圈" */
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 键盘焦点反馈：移除默认 outline 后，键盘用户（Tab 切换）看不到当前位置。
+   :focus-visible 只在键盘聚焦时触发，鼠标点击不显示，保持视觉简洁。
+
+   修复 audit #9：之前 box-shadow 在 :focus 上无条件生效，键盘聚焦时与下方
+   outline 同时存在造成「3px 外发光 + 2px 描边」双圈；现在 :focus-visible
+   时清掉 box-shadow，只保留更明确的 outline。 */
+.ai-chat-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  box-shadow: none;
+}
+
+.ai-chat-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ai-chat-input::placeholder {
+  /* 从 fg-muted（暗色 ~2:1 几乎看不见）提到 fg-secondary（~8.5:1），
+     与搜索框一致 —— AI 输入也是核心入口，placeholder 必须看清 */
+  color: var(--fg-tertiary);
+}
+
+.ai-chat-submit {
+  height: 32px;
+  /* P2-6 fix (audit)：min-width 锁定宽度，防止"生成修改"（4字）和
+   "取消"/"取消中…"（2/4字）切换时按钮宽度跳变 */
+  min-width: 76px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--btn-on-accent);
+  border: 1px solid var(--accent);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  /* 与 input 一致：32(总高) - 2(border) = 30 内容区，让按钮文字与输入框
+     文字在同一基线垂直居中。 */
+  line-height: 30px;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.ai-chat-submit:hover:not([disabled]) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.ai-chat-submit:active:not([disabled]) {
+  transform: scale(0.98);
+}
+
+.ai-chat-submit[data-mode="cancel"] {
+  background: transparent;
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+.ai-chat-submit[data-mode="cancel"]:hover:not([disabled]) {
+  background: var(--warning);
+  color: var(--bg-viewer);
+}
+
+.ai-chat-submit[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ai-chat-submit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ============================================================
+   AI 按钮激活态（侧栏底部）
+   当 AI 面板展开时给 btn-ai 一个明显区别于"主操作描边态"的实心强调态：
+     - 关闭：沿用 .sidebar-new-btn 的描边 + 8% accent 底（与「新建笔记」同款）
+     - 打开：实心 accent 底 + 白字 + accent 边，让用户一眼看出 AI dock 已开
+   用 #btn-ai.sidebar-new-btn 这种 ID+class 组合是为了 specificity 高过
+   .sidebar-new-btn:hover（0,2,0），保证 hover 时不会把"已打开"的视觉态冲掉。
+   ============================================================ */
+#btn-ai.sidebar-new-btn[aria-pressed="true"],
+#btn-ai.sidebar-new-btn[aria-pressed="true"]:hover {
+  color: var(--btn-on-accent, #fff);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+#btn-ai.sidebar-new-btn[aria-pressed="true"]:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}

@@ -1,0 +1,159 @@
+/* ===========================================================================
+   Reset + Focus Visibility
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ---------- Reset ---------- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  -webkit-text-size-adjust: 100%;
+}
+
+/*
+  长文件名截断（fix：长文件名导致 toolbar 偏移）：
+  - html/body 是顶层容器，需要 min-width:0 防止内部 grid item 的 min-content
+    把整个 grid 撑得比视口宽（虽然 .toolbar 自己已加 min-width:0，但 body grid
+    在 grid-template-columns 未指定的情况下默认按 max-content 自适应，多加
+    一层防御能避免任何子 grid item 把 body 撑出去）
+*/
+html, body { min-width: 0; }
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  color: var(--fg-primary);
+  background: var(--bg-app);
+  /* font-weight: 500 全局提升，让 UI 文字（statusbar / file-meta / 空状态等
+     没有显式 font-weight 的元素）默认就更厚重，
+     解决「看着发淡」的问题。Markdown body 等显式 400 的不受影响 */
+  font-weight: 500;
+  /* 字体平滑策略：默认开启 ClearType（subpixel-antialiased），
+     在 Windows LCD 上比 grayscale 抗锯齿更锐利、字形更黑。
+     旧值 antialiased 在 Chromium 上会强制关闭 ClearType，反而让字变细变糊。
+     Retina / 高 DPI 屏幕下用下方媒体查询切回 antialiased 避免色边 */
+  -webkit-font-smoothing: subpixel-antialiased;
+  -moz-osx-font-smoothing: auto;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1, "cv11" 1;
+  /* 让浏览器能在字体缺少对应字重时合成粗体（如 system Segoe UI 落到 600），
+     避免某些 weight 实际渲染为 400 看着发淡 */
+  font-synthesis: weight;
+  user-select: none;
+  display: grid;
+  /* 四行：顶部工具栏 / 主区 / AI 对话 dock / 状态栏；fr 单位随窗口缩放自适应。
+     AI dock 默认 hidden（auto 高度 = 0）；展开时挤占 app-shell 高度，
+     状态栏始终钉在最底。 */
+  grid-template-rows: var(--h-toolbar) 1fr auto var(--h-statusbar);
+  /*
+    长文件名截断（fix：长文件名导致 toolbar 偏移）：
+    - 单列 grid 显式声明 minmax(0, 1fr) 防止任何 grid item 的 min-content
+      把整列撑得比视口宽（虽然 .toolbar 自己已加 min-width:0，但显式 1fr
+      让浏览器明确按可用空间分配，防御性更好）
+  */
+  grid-template-columns: minmax(0, 1fr);
+  /* 防止内容溢出导致整个 body 高度超过视口，破坏 grid */
+  height: 100vh;
+  overflow: hidden;
+  /* 切主题时让背景/前景色平滑过渡（避免一帧硬切） */
+  transition: background var(--transition-slow), color var(--transition-slow);
+}
+
+/* 高 DPI / Retina 屏幕：关闭 subpixel，否则字形边缘出现红蓝色彩边看着脏。
+   非高 DPI 屏幕（普通 LCD）保留 subpixel，字形更黑更锐利 */
+@media (-webkit-min-device-pixel-ratio: 1.5), (min-resolution: 144dpi) {
+  body {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* 把四个「chrome」元素显式钉到对应 grid 行 —— 防御性。
+   即使 DOM 里在它们之前有其他 grid 子元素（如 .focus-hotzone 在某些路径下
+   被加进 grid 流），也不会错位。
+   .ai-chat-dock 默认 hidden；展开时占据第 3 行（auto），状态栏被推到第 4 行。 */
+.toolbar      { grid-row: 1; }
+.app-shell    { grid-row: 2; }
+.ai-chat-dock { grid-row: 3; }
+.statusbar    { grid-row: 4; }
+
+/* [hidden] 必须真正生效：
+   浏览器 UA 默认 [hidden] { display: none } 与 .status-chip { display: inline-flex }
+   同特异性 (0,1,0)，用户样式后写胜出 → 隐藏时仍占位、推挤布局。
+   状态栏的 status-stats / status-heading 一旦被设 [hidden] 还会拉伸 17.5px，
+   把右侧 chip 簇向右推；其他模块也有类似问题。统一加 !important 兜底。 */
+[hidden] {
+  display: none !important;
+}
+
+/* ---------- 键盘焦点可见性 ----------
+   - 鼠标点击不应画外圈：浏览器原生行为 (Chromium / WebKit 已支持 :focus-visible)
+   - 键盘 Tab 走到哪儿都该看到一个 2px accent 环
+   - 不破坏现有「假轮廓」元素（.search-input / .form-input）：它们各自有
+     :not(:focus-visible) 块把鼠标态的 box-shadow 收回，外圈再叠加
+*/
+:where(a, button, [role="option"], [tabindex], input, select, textarea, summary, label):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: inherit;
+}
+/* 列表项的 outline 不需要 offset，否则会贴住左侧色条 */
+.file-item:focus-visible {
+  outline-offset: -2px;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+a {
+  /* 全局链接默认色：用 --accent-text（65% 装饰色 + 35% fg-primary）。
+     之前纯 --accent 在 13-14px 链接上"扎眼"：锚点链接有时是 4-5 字短词，
+     在一片中性正文里像贴了荧光贴纸。markdown-body 自己的链接走 --md-link
+     （更亮一档），全局默认行内/工具栏链接走这一档，视觉权重一致 */
+  color: var(--accent-text);
+  text-decoration: none;
+  transition: color var(--transition-fast);
+}
+a:hover {
+  /* hover 提亮一档：从文字版（--accent-text）→ 纯 --accent，给出"可点"的明确反馈 */
+  color: var(--accent);
+}
+
+input {
+  font: inherit;
+  color: inherit;
+}
+
+ul {
+  list-style: none;
+}
+
+code, pre, kbd {
+  font-family: var(--font-mono);
+  user-select: text;
+}
+
+::selection {
+  /* 用 --accent-selection（alpha 0.28-0.50）而非 --accent-soft（0.12-0.22）：
+     旧值在亮色主题上 alpha 仅 0.12，选区看起来像没选中，新建笔记标题、
+     重命名、设置输入框、AI dock 等所有 input 的文字选中态都受影响。
+     CM 编辑器早就走 --accent-selection（见 src/editor-theme.js），全局规则
+     跟它对齐，保证 input 内 / 编辑器内 / Markdown viewer 任意位置选中态一致 */
+  background: var(--accent-selection);
+  color: var(--fg-primary);
+}
+

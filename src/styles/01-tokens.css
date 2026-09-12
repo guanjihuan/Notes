@@ -1,0 +1,105 @@
+/* ===========================================================================
+   Design Tokens
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ===========================================================================
+   Notes — 全局样式
+   设计理念：现代简约 + 排版优先
+
+   - 设计令牌：间距、字号、颜色、阴影、动画曲线统一管理
+   - 浅色 / 深色主题：暖色调低饱和度，长时间阅读舒适
+   - 排版：行高 1.85、字号 16px、优化的中英文字体栈
+   - 组件：浮动卡片、柔和阴影、克制的圆角
+   =========================================================================== */
+
+/* ---------- Design Tokens ---------- */
+:root {
+  /* 间距系统（基于 4 的倍数） */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-9: 48px;
+
+  /* 圆角 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;          /* 仅 .modal 消费 (styles.css:1892) */
+
+  /* 字号（基于 1.2 比例）
+     --fs-base 14 → 15：UI 文字比 markdown 正文小一档会看着发「瘦」；
+     提到 15px 后配合 font-weight: 500 可读性显著提升，但只 +1px，
+     不破坏现有 52px 工具栏 / 38px 状态栏的纵向布局 */
+  --fs-xs: 11px;
+  --fs-xs-readable: 12px;  /* 11px 在低 DPI/小屏幕上易"糊"，settings 对话框内的 hint / 副标题用它 */
+  --fs-sm: 13px;
+  --fs-base: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
+  --fs-2xl: 24px;
+  --fs-4xl: 38px;
+
+  /* 行高 */
+  --lh-snug: 1.4;
+  --lh-normal: 1.55;
+  --lh-relaxed: 1.75;
+  --lh-loose: 1.85;
+
+  /* 字距 */
+  --tracking-tight: -0.01em;
+  --tracking-wide: 0.02em;
+
+  /* 字体栈：英文优先 Inter，中文用系统字体保性能 */
+  --font-sans:
+    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    "Helvetica Neue", Helvetica, Arial, sans-serif;
+
+  /* 阅读字体（用于 markdown 正文）：CJK 优先 */
+  --font-reading:
+    "Source Serif Pro", "Noto Serif CJK SC", "Source Han Serif SC",
+    "Songti SC", "STSong", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", "PingFang SC", serif;
+
+  /* 等宽字体：JetBrains Mono 优先，回落到系统等宽 */
+  --font-mono:
+    "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular,
+    "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* 高度 */
+  --h-toolbar: 52px;
+  --h-statusbar: 38px;
+  --w-sidebar: 220px;
+  --sidebar-width: var(--w-sidebar);
+  --w-sidebar-narrow: 200px;
+  --w-reader-max: 720px;
+
+  /* 阅读排版：默认值与现有 --fs-lg / --lh-loose 同步；
+     在 <html> 行内 style 上由 renderer 动态覆盖，切主题不会重置 */
+  --reader-font-size: var(--fs-lg);
+  --reader-line-height: var(--lh-loose);
+
+  /* Z-index */
+  --z-sidebar: 5;
+  --z-toolbar: 10;
+  --z-statusbar: 10;
+  --z-modal: 1000;
+  --z-toast: 1100;
+  --z-boot-error: 1200;       /* 比 toast 高一档，确保启动错误盖在所有内容之上 */
+
+  /* 过渡曲线 */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-fast: 120ms var(--ease-out);
+  --transition-normal: 200ms var(--ease-out);
+  --transition-slow: 320ms var(--ease-out);
+
+  /* 遮罩（modal / drawer / popover 背后的暗化层） —— 与主题正交，
+     light 主题用更轻的 alpha，否则会把 modal 卡片压成灰底破坏文字对比 */
+  --scrim: rgba(0, 0, 0, 0.5);
+  --scrim-soft: rgba(0, 0, 0, 0.12);
+}
+

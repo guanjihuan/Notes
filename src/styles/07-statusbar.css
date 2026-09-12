@@ -1,0 +1,446 @@
+/* ===========================================================================
+   Statusbar + Toast
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ============================================================
+   Statusbar
+   ============================================================ */
+.statusbar {
+  display: flex;
+  align-items: center;
+  height: var(--h-statusbar);
+  padding: 0 14px;
+  background: var(--bg-toolbar);
+  border-top: 1px solid var(--border-subtle);
+  /* 状态栏显示路径 / 字数 / 模式 / 文件数，是核心信息展示区，
+     颜色用 primary（最重），font-weight: 500 保证不淡。
+     旧值 secondary 在 13px 下仍偏淡，看着发灰 */
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--fg-primary);
+  gap: var(--space-3);
+  z-index: var(--z-statusbar);
+  letter-spacing: var(--tracking-wide);
+  /* audit fix (P2)：与 toolbar 同步去掉 backdrop-filter —— 实色背景上看不出
+     毛玻璃效果，但每帧重算模糊成本真实存在（1200×24 px × 60 fps = 大量 GPU）。 */
+}
+
+/* 三段式状态栏：左段（弱化路径）/ 中段（核心字数）/ 右段（chip 簇） */
+.status-segment {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.status-segment-left {
+  flex: 0 1 auto;
+  min-width: 0;
+  /* 路径长时允许截断；用 ellipsis 而不是 overflow 隐藏 */
+}
+
+.status-segment-center {
+  flex: 0 0 auto;
+  justify-content: center;
+}
+
+.status-segment-right {
+  /* 用 0 1 auto 而不是 0 0 auto：让右段在窗口窄时也能压缩，
+     不至于把整段 statusbar 顶出去。count chip 收敛后整体宽度更小，
+     给一个"柔性右段"避免溢出 */
+  flex: 0 1 auto;
+  justify-content: flex-end;
+}
+
+/* 右段：scroll / mode / AI 是核心可交互 chip，count 是辅助信息。
+   chip 组与 count 之间用细分隔线隔开，形成"主-辅"分组。
+   比单纯加大 gap 更精致，与左段 [path | divider | meta] 同款语法 */
+.status-segment-right .status-divider {
+  margin: 0 var(--space-1);
+}
+
+.status-path {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  /* 路径是状态栏最重要的信息（当前打开的文件位置），用 primary 不发淡。
+     旧值 secondary 在 13px mono 看着发灰 */
+  color: var(--fg-primary);
+  font-weight: 500;
+}
+
+/* 路径 chip 可点击态：hover 时背景与 accent 文本提示「可点」。
+   通过 button 元素实现 —— 与 status-chip-clickable 风格统一。 */
+.status-path-clickable {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  padding: 5px 8px;
+  margin: 0 -8px;
+  /* button 默认字体继承 */
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--fg-primary);
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+/* 路径 hover：与全局 a 同步用 --accent-text，配合 bg-hover 给"可点"反馈。
+   不要纯 --accent：状态栏里长时间停留的路径若 hover 出满彩度文字，眼睛
+   会被刚指上去那一下"拉住"，反而显得突兀。 */
+.status-path-clickable:hover {
+  background: var(--bg-hover);
+  color: var(--accent-text);
+}
+.status-path-clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.status-divider {
+  flex: 0 0 auto;
+  width: 1px;
+  height: 10px;
+  /* 圆角胶囊状的点状分隔符，比纯色线条更精致 */
+  background: var(--border-default);
+  border-radius: 1px;
+}
+
+.status-meta {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+}
+
+.status-spacer {
+  flex: 1 1 auto;
+}
+
+.status-count {
+  flex: 0 0 auto;
+  color: var(--fg-tertiary);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  /* 文件计数是辅助信息（"5 个文件"），不再用 bg-hover chip：
+     让右段核心信息（模式 / AI / 滚动）更突出，count 退到 tertiary 文字。
+     用户需要时 hover 也能感知，但视觉权重降低 */
+  padding: 5px 4px;
+}
+
+/* 状态栏 chip：模式 / 字数 / 滚动进度 */
+.status-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  letter-spacing: var(--tracking-wide);
+  /* 状态切换平滑：saved ↔ unsaved、preview ↔ edit ↔ split 等通过 class / data-mode
+     切换会发生 background + color 跳变。无 transition 时眼睛会"被光闪一下"——
+     这正是用户说的"看着不舒服"。120ms ease-out 跟上主节奏，跨态变化
+     自然衔接。prefers-reduced-motion 不关 transition（10-a11y.css 注释），
+     前庭敏感用户仍得到"可感知反馈"但不至于动画扰神 */
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+/* 模式 chip：带左侧 SVG 图标暗示「这是切换器」。
+   旧版只显示文字 + tooltip，用户不知道点了会切；现在一眼能看出是控件。*/
+.status-chip-mode {
+  gap: 4px;
+}
+.status-chip-mode svg {
+  flex: 0 0 auto;
+  opacity: 0.7;
+  transition: opacity var(--transition-fast);
+}
+.status-chip-mode:hover svg {
+  opacity: 1;
+}
+
+/* 字数 chip：是状态栏的核心信息 —— 文字降彩度（--accent-text），
+   让大段数字 / 字符长时间停留在状态栏里时不"刺眼"。背景仍带 accent 含义。 */
+.status-chip-stats {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* 可点击 chip：状态栏的「模式」现在可直接点击切换 */
+.status-chip-clickable {
+  border: none;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+.status-chip-clickable:hover {
+  background: var(--bg-active);
+  filter: brightness(1.08);
+}
+
+.status-chip-clickable:active {
+  transform: scale(0.95);
+}
+
+/* 当前 heading：高亮显示阅读视图当前的章节名（轻量 breadcrumb） */
+.status-heading {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 260px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-primary);
+  font-weight: 500;
+  font-size: var(--fs-sm);
+  letter-spacing: var(--tracking-wide);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-heading::before {
+  /* § 符号暗示「章节」 */
+  content: "§";
+  color: var(--fg-tertiary);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs-readable);
+  flex: 0 0 auto;
+}
+
+.status-chip-muted {
+  background: transparent;
+  color: var(--fg-tertiary);
+  font-weight: 500;
+}
+
+.status-chip[data-mode="edit"],
+.status-chip[data-mode="split"] {
+  background: var(--accent-soft);
+  /* 11px 字号 + accent 文字在 accent-soft 背景上仅 ~3.6:1；
+     用正文链接同色相的 --md-link（≈5.5:1 on dark）替代 */
+  color: var(--md-link);
+}
+
+/* unsaved chip：替代原本在 toolbar 上靠脏态按钮传递信息的旧设计。
+   状态栏上的 chip 是「当前文档的真实状态」，比 toolbar 按钮更准；
+   warning 色 + 圆点，让用户即使不在编辑视图也能一眼看到「未保存」。
+   文字用 --warning-text（60% 纯色 + 40% fg-primary）：纯橙小字会因高
+   chroma 振动，看着累；前 6px 圆点已经承担纯色警示，文字降彩度即可。 */
+.status-chip-unsaved {
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning-text);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.status-chip-unsaved::before {
+  /* 圆点标识：替代可能过大的图标，6px 与 toolbar status-dot 同尺度 */
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning);
+  /* 微微辉光，呼应 dirty-pulse 动画语义 */
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 24%, transparent);
+}
+
+/* ============================================================
+   AI chip：状态栏新增，承载 AI 过程/错误/待确认状态 + dock 开关入口。
+
+   设计要点（[feedback-ai-tips-into-status-bar]）：
+     - idle / success / cancelled → 中性 muted，不抢视觉权重（与 .status-chip 默认对齐）
+     - running → accent-soft + 脉冲点，提示「正在工作」
+     - diff   → accent-soft + --md-link，让「中间面板有 N 处待确认」一眼可见
+     - error  → danger 色 + 14% transparent bg，最强警示但不刺眼
+
+   不引入新色彩 token：复用 --accent / --accent-soft / --danger / --md-link / --fg-tertiary。
+   ============================================================ */
+.status-chip-ai {
+  /* 默认 idle：与 .status-chip 默认同款（bg-hover + primary text） */
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  /* AI chip 走 [data-ai-state] 在 idle / running / diff / error / success / cancelled
+     之间切换，每个态都有自己的 background + color。120ms 平滑过渡，
+     "AI 思考中..." → "AI: 3 处待确认" → "AI 已完成" 让色阶连成一条线 */
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+/* running：accent-soft 底 + 脉冲点（与原 ai-thinking-pulse 同款 keyframe 搬到下面）。
+   文字降一档彩度（--accent-text），由脉冲点承担纯色，
+   避免「AI 思考中…」纯 accent 小字长时间占据视觉中心看着累。 */
+.status-chip-ai[data-ai-state="running"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.status-chip-ai[data-ai-state="running"] .status-chip-ai-text::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: 1px;
+  animation: status-ai-pulse 1.4s ease-in-out infinite;
+}
+@keyframes status-ai-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent);
+    opacity: 0.7;
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent);
+    opacity: 1;
+  }
+}
+
+/* error：danger 14% 透明 + danger 文字 —— 强警示但不全屏铺红。
+   文字降一档彩度，避免「AI 调用失败」红字在状态栏里"刺眼"。
+   左右侧 dot/border 仍是纯 danger 色，整体警示强度不丢。 */
+.status-chip-ai[data-ai-state="error"] {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger-text);
+}
+
+/* info：超长提示词等软警告（audit Phase L3-AI 1）—— accent 8% 透明 + accent
+   文字，比 error 弱、比 success 强；不脉冲不闪烁，避免干扰用户继续打字。
+   文字降彩度，背景继续承载 accent 意味。 */
+.status-chip-ai[data-ai-state="info"] {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent-text);
+}
+
+/* diff：与 mode chip 的 [data-mode] 变体同款（accent-soft + --md-link），
+   让「中间面板有 N 处待确认」与「当前是 split / edit 模式」视觉权重一致。
+   用户已经习惯在状态栏右段看到这类「重要 action chip」。 */
+.status-chip-ai[data-ai-state="diff"] {
+  background: var(--accent-soft);
+  color: var(--md-link);
+  font-weight: 600;
+}
+
+/* success / cancelled：透明底 + tertiary 文字，短暂停留后由下次操作覆盖 */
+.status-chip-ai[data-ai-state="success"],
+.status-chip-ai[data-ai-state="cancelled"] {
+  background: transparent;
+  color: var(--fg-tertiary);
+}
+
+/* ============================================================
+   Toast
+   ============================================================ */
+.toast-container {
+  position: fixed;
+  /* 跟随状态栏高度，再加一格间距让 toast 浮在状态栏上方不贴边 */
+  bottom: calc(var(--h-statusbar) + var(--space-2));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  /* 上下 12px / 左右 16px；旧值 12px/24px 偏窄；icon + 文案的布局需要更多内边距 */
+  padding: 11px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--fg-primary);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  box-shadow: var(--shadow-lg);
+  animation: toast-in 280ms var(--ease-out);
+  max-width: 480px;
+  white-space: pre-wrap;
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  /* 可选 icon：用 grid 而不是 inline-flex 是为了 icon 缺失时布局也稳定 */
+  display: inline-grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+/* icon 缺失时不留空 column —— 用 :has 反向检测浏览器支持，
+   不支持时降级到 grid-template-columns: 1fr（文字独占一列） */
+@supports selector(:has(*)) {
+  .toast:not(:has(.toast-icon)) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.toast-icon {
+  /* 图标：16px，与文字 baseline 视觉对齐 */
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  color: currentColor;
+}
+
+.toast.is-success {
+  border-left: 3px solid var(--success);
+  color: var(--fg-primary);
+}
+.toast.is-success .toast-icon {
+  color: var(--success);
+}
+.toast.is-warning {
+  border-left: 3px solid var(--warning);
+}
+.toast.is-warning .toast-icon {
+  color: var(--warning);
+}
+.toast.is-error {
+  border-left: 3px solid var(--danger);
+}
+.toast.is-error .toast-icon {
+  color: var(--danger);
+}
+.toast.is-info {
+  border-left: 3px solid var(--accent);
+}
+.toast.is-info .toast-icon {
+  color: var(--accent);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+

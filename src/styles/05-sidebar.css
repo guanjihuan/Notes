@@ -1,0 +1,872 @@
+/* ===========================================================================
+   Sidebar + Viewer + Editor Split Layout
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ============================================================
+   Sidebar
+   ============================================================ */
+.sidebar {
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  z-index: var(--z-sidebar);
+  /* 宽度由 .app-shell 的 grid 模板通过 --sidebar-width 决定；这里不再写死 px */
+  min-width: 0;
+}
+
+.sidebar-header {
+  /* 紧凑的 header —— 上下 12px、左右 14px，让搜索框有呼吸但不浪费空间 */
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* 新建笔记行：放在 .sidebar-header 下方、排序条上方的独立主操作行。
+   左右 padding 用 10px（与 .sidebar-sort / .file-list 对齐），
+   让「创建」按钮和它作用的列表视觉上是一组；搜索框保留 14px 更深的内嵌来强调 */
+.sidebar-new-row {
+  padding: 10px 10px 8px;
+}
+
+/* 「+ 新建笔记」按钮：全宽、带文字的主操作按钮
+   ——accent 文字 + 微微的 accent 底色 + 1px accent 边框，hover/active 进一步加深。
+   2026-08 把字号从 12px 提到 14px、字重 500 → 600、加 8% accent 底色 + 32% accent 边框，
+   解决「新建笔记」字看着发淡、按钮太瘦的问题 */
+.sidebar-new-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  /* audit fix (Round 9)：font-size 13px (fs-sm) 的文字走 --accent-text（混色 65/70%），
+     不能用装饰色 token --accent（饱和度太高，13px 文字看着刺眼）。
+     见 [[feedback-colored-text-tier]]。background / border 仍走 --accent 因为
+     它们是装饰而非文字。 */
+  color: var(--accent-text);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: 0;
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+}
+.sidebar-new-btn:hover {
+  /* audit fix (CSS P2 / sidebar new-btn hover)：之前 color 走 --accent-hover
+     （纯 accent 饱和色），13px 小字直接用饱和色会"扎眼"、在 dark 调色板
+     还会出现 vibration（红绿高频抖动）现象。base 态已经走 --accent-text
+     （accent 65/70% 混色），hover 应当保持同套语义色 token 一致，只是
+     把混色比例上调一档或换更暖的 --accent-text 变体，让视觉权重随交互
+     上升但 chroma 仍温和（见 [[feedback-colored-text-tier]]）。 */
+  color: var(--accent-text);
+  border-color: var(--accent);
+  background: var(--accent-soft-hover);
+}
+.sidebar-new-btn:active {
+  transform: scale(0.98);
+}
+.sidebar-new-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.search-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.search-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  /* 用 secondary 替代 tertiary：搜索框是核心入口，图标应该一眼看清 */
+  color: var(--fg-secondary);
+  pointer-events: none;
+  transition: color var(--transition-fast);
+}
+
+.search-input {
+  width: 100%;
+  /* 收紧内边距、改为 8px/0/8px/32px；高度由 line-height + 7px*2 padding 决定 ≈ 30px */
+  padding: 7px 10px 7px 32px;
+  background: var(--bg-card);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--fg-primary);
+  transition: border-color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.search-input::placeholder {
+  /* 占位符原本用 fg-muted（暗色 ~2:1 几乎看不见），提到 fg-secondary 让"搜索文件..."
+     提示文字可见 —— 用户至少能看清这里有输入框 */
+  color: var(--fg-tertiary);
+}
+
+.search-input:hover {
+  border-color: var(--border-default);
+}
+
+.search-input:focus {
+  /* 鼠标点击不画外圈：键盘 focus-visible 由全局规则接管（见 :focus-visible 基线） */
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-glow);
+  background: var(--bg-elevated);
+}
+@supports (focus-visible) {
+  .search-input:focus:not(:focus-visible) {
+    box-shadow: none;
+  }
+  .search-input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+.search-input:focus + .search-icon {
+  color: var(--accent);
+}
+
+/* ============================================================
+   Sidebar 排序工具条
+   紧贴它作用的 .file-list 上方 —— 这是「列表的工具」，
+   不应该埋进三层深的设置对话框（见 [[feedback-prefer-near-affected-area]]）。
+   设计目标：紧凑到不抢搜索框注意力，active 态明确但不过重。
+   ============================================================ */
+.sidebar-sort {
+  display: flex;
+  gap: 2px;
+  /* 顶 header 12px、底 6px —— 让工具条与列表的视觉关联 > 与 header 的关联 */
+  padding: 6px 10px 8px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.sidebar-sort-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  /* 2026-08 把字号从 12px 提到 13px（--fs-sm），与文件 meta / 工具栏按钮文字同档，
+     解决排序按钮在 13px 字号下字看着小、发淡的问题。字重 500 → 600 让文字更"实" */
+  color: var(--fg-secondary);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: var(--tracking-wide);
+  cursor: pointer;
+  /* 防止「修改时间」等 4 字标签在 180px 窄侧栏里换行成两行（高度塌到 46px，
+     挤压下方文件列表）。即使不够也用省略号截断，保持一行紧凑 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.sidebar-sort-btn:hover {
+  color: var(--fg-secondary);
+  background: var(--bg-hover);
+}
+
+.sidebar-sort-btn.is-active {
+  /* active 选中态：文字降彩度（--accent-text）。"名称"/"修改时间"/"创建时间"
+     三个 sort 按钮并排时，纯 accent 文字让三者同时"跳出来"，观感刺眼；
+     改用文字版后，accent-soft 底色仍明确选中，但字不再"贴脸"。 */
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.sidebar-sort-btn.is-active:hover {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-hover));
+}
+
+.sidebar-sort-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.sidebar-sort-btn svg {
+  flex: 0 0 auto;
+}
+
+.file-list {
+  flex: 1;
+  overflow-y: auto;
+  /* 上下 8px 比之前的 12px 更紧凑；列表项自身有 padding 已经够了 */
+  padding: 8px 10px;
+  /* 列表项间距：用 gap 而非 item 的 margin-bottom，避免 list 总高累加偏差。
+     1px gap 与原 margin-bottom:1px 视觉一致，但语义更清晰 */
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* 滚动条预留空间 —— 让滚动条 hover 才出现，不抢视觉 */
+  scrollbar-gutter: stable;
+}
+
+.file-list:empty::after {
+  /* 空列表：淡灰色提示。设置里改数据目录、或把 .md 拖到目录里都会自动消失。
+     原来用 --fg-muted 在 bg-sidebar 上仅 ~3.2:1（default dark），低于 WCAG AA。
+     提到 --fg-tertiary（~5.4:1）让这段引导文字真能"看清"——
+     无列表可看时用户全部注意力都落在这段字上，发淡等于无效提示 */
+  content: attr(data-empty);
+  display: block;
+  padding: var(--space-7) var(--space-3);
+  text-align: center;
+  color: var(--fg-tertiary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  /* 留点上方间距，与 sidebar-header 拉开 */
+  margin-top: var(--space-2);
+  /* 避免一行字过长在窄侧栏里截断为半个字 */
+  word-break: break-word;
+}
+
+.file-item {
+  /* grid 两列：16px 图标 + 1fr 文本区。
+     用 grid 而不是 padding-left+absolute 是为了：
+     1) 文本区能正常占满剩余宽度（min-width:0 走 grid 才生效）
+     2) 图标列固定，文本列弹性，缩窄侧栏不挤图标 */
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  align-items: center;
+  column-gap: 10px;
+  /* 上下 padding 9px → 6px：原 9px 在 13px name + 13px meta 两行下让单条 file-item
+     撑到 ~60px，50 个文件就要 3000px 滚动，太松。压到 6px 后 ~50px/item，
+     列表更紧凑、可见项更多，仍保留点击区域与 hover 反馈呼吸 */
+  padding: 6px 12px 6px 10px;
+  /* margin-bottom 去掉，改用 file-list 的 gap 统一间距；
+     同时消除"两行间距靠 margin 累加"导致的列表总高计算偏差 */
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  /* transition 增加 border-color / box-shadow，让激活态色条 + 微弱内阴影的进入更顺滑 */
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    transform var(--transition-fast);
+  position: relative;
+}
+
+.file-text {
+  /* 文本列：name + meta 仍然竖排；min-width:0 让 ellipsis 真正生效 */
+  display: flex;
+  flex-direction: column;
+  /* name↔meta gap 2px → 1px：与 file-item 上下 padding 同步收紧，让整条紧凑 */
+  gap: 1px;
+  min-width: 0;
+}
+
+.file-icon {
+  /* 平时 muted，hover/active 时跟随主题升级。
+     用 grid 让图标"漂"在 item 左侧 + 上下居中，比 padding-left+absolute 更稳 */
+  color: var(--fg-tertiary);
+  flex-shrink: 0;
+  transition: color var(--transition-fast);
+}
+
+.file-item:hover .file-icon {
+  color: var(--fg-secondary);
+}
+
+.file-item:active {
+  transform: scale(0.985);
+}
+
+.file-item.is-active {
+  /* 激活态：accent-soft 底色 + 左侧 3px 色条。
+     用 accent-soft 替代 accent-soft-hover：hover 态是临时高亮（更深一档），
+     active 态是稳定选中，两者用不同 token 区分意图 */
+  background: var(--accent-soft);
+}
+
+.file-item.is-active:hover {
+  /* 激活态 hover 走更深一档 —— 与 idle 态 hover（bg-hover）形成层次差 */
+  background: var(--accent-soft-hover);
+}
+
+.file-item.is-active .file-icon {
+  /* 激活态：图标与正文同色，构成一致的视觉语言 */
+  color: var(--accent);
+}
+
+.file-item.is-active::before {
+  content: "";
+  position: absolute;
+  /* 从 -3px 移到 0，让色条贴着 item 内沿，更紧凑不"漂" */
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 60%;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+
+.file-name {
+  font-size: var(--fs-sm);
+  color: var(--fg-primary);
+  /* 字重 500 → 600：让 file-name 成为主视觉。
+     之前 file-meta 也是 600 + 同字号，导致 meta 看起来比 name 还"实"，
+     层级倒挂（次要信息喧宾夺主）。现在 name 600 / meta 500，名字优先 */
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: var(--tracking-tight);
+  transition: color var(--transition-fast);
+}
+
+.file-item .file-name mark {
+  /* 搜索高亮：在文件名里命中搜索关键字时的视觉标识。
+     22% accent 背景已经给出"高亮"信号，文字再纯 accent 会与背景同色相"贴
+     一起"。改用 --accent-text —— 仍可识别色相（青蓝/紫/红等色调随 palette），
+     但 chroma 降到不会与底色"撞色"的程度。
+     字重保持 700，因为 mark 通常只有 1-3 字，需要靠粗细扛"高亮"识别。 */
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent-text);
+  padding: 0 2px;
+  border-radius: 3px;
+  font-weight: 700;
+}
+
+.file-item.is-active .file-name {
+  /* accent #5e6ad2 在 #08090a 上只有 ~4.0:1，作为正文偏暗。
+     用与正文链接同色相的 --md-link（已在 #08090a 上 ~5.5:1）替代 */
+  color: var(--md-link);
+  /* 已与 idle file-name 同字重（600），保持选中态只是颜色升级、不再额外加粗 */
+  font-weight: 600;
+}
+
+.file-meta {
+  /* 字号 13px → 12px（--fs-xs-readable），比 file-name 小一档；
+     字重 600 → 500 让 meta 视觉退到次级，与 file-name 的 600 形成对比。
+     两层降级（更小 + 更轻）让 meta 真正成为"辅助信息"而不是与 name 平级 */
+  font-size: var(--fs-xs-readable);
+  color: var(--fg-secondary);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--tracking-wide);
+  /* 窄侧栏（拖到 180px）时 meta 行可能换行成两行，让 file-item 高度跳变。
+     强制单行 + 省略号，保持列表项高度稳定 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-item.is-active .file-meta {
+  color: var(--md-link);
+  opacity: 0.75;
+}
+
+.sidebar-footer {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 侧栏底部视觉分隔：把上方"打开/切换数据目录"二级链接和下方 AI 主操作分开。
+   用 1px 细线 + 上下 6px 留白，避免紧贴导致 AI 按钮和文件夹链接"挤成一团" */
+.sidebar-footer-sep {
+  height: 1px;
+  background: var(--border-subtle);
+  margin: 6px 0;
+}
+
+/* AI 主操作按钮在侧栏底部已不再与 footer-sep 紧邻（sep 在 AI 上方），
+   不再需要 margin-bottom: 0 来解耦 gap。 */
+
+.link-subtle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* 11px 字号在低 DPI 上偏糊，提到 12px（fs-xs-readable）保持视觉小但不模糊；
+     颜色已用 secondary（2026-08 提亮后约 8.5:1 on dark） */
+  font-size: var(--fs-xs-readable);
+  color: var(--fg-secondary);
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast), color var(--transition-fast);
+  font-weight: 500;
+  min-width: 0;  /* 允许 flex item 在窄侧栏（180px）收缩到内容宽度以下 */
+}
+
+/* 文字单行 + 溢出省略号：防止「切换数据文件夹…」在窄侧栏里折成两行 */
+.link-subtle > span {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* link-subtle / footer-action：侧栏底部"打开数据目录 / 切换目录"等
+   二级链接。hover 时给 bg-hover + accent 文字提示"可点"——
+   与全局 a 一致用 --accent-text，让"hover 才出颜色"的反馈也维持文字版。 */
+.link-subtle:hover {
+  background: var(--bg-hover);
+  color: var(--accent-text);
+}
+
+/* <button> 重置：与 .link-subtle 一致的"链接外观"，但语义上是动作按钮 */
+.footer-action {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+/* 键盘 focus 高亮 —— 鼠标点击不画，键盘 Tab 才出现（hover 不等于 focus） */
+.link-subtle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ============================================================
+   Viewer
+   ============================================================ */
+.viewer {
+  background: var(--bg-viewer);
+  overflow-y: auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  scroll-behavior: smooth;
+}
+
+.markdown-body {
+  flex: 1;
+  max-width: var(--w-reader-max);
+  width: 100%;
+  margin: 0 auto;
+  padding: var(--space-9) var(--space-7) calc(var(--space-9) * 1.5);
+  font-family: var(--font-reading);
+  font-size: var(--reader-font-size);
+  line-height: var(--reader-line-height);
+  color: var(--fg-primary);
+  user-select: text;
+  letter-spacing: 0.005em;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* 空状态：更有温度的视觉 */
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  /* gap 用 0，靠各元素的 margin 控制间距：
+     - icon → 标题：靠 icon 自身的 margin-bottom
+     - 标题 → 主 hint：12px，让主信息与提示分隔
+     - 主 hint → 次 hint：6px，形成层次
+     用统一 gap 会让主 hint 与次 hint 之间也有 12px，反而拉得太平 */
+  gap: 0;
+  color: var(--fg-tertiary);
+  text-align: center;
+  padding: var(--space-7);
+  /* 顶部加一点点品牌色辉光，强化「这是 Notes 应用」的氛围 */
+  position: relative;
+}
+
+.empty-state-icon {
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  /* 三层渐变叠出「呼吸光晕」：从中心发散到外圈的柔光 */
+  background:
+    radial-gradient(circle at 50% 45%,
+      color-mix(in srgb, var(--accent) 22%, transparent) 0%,
+      color-mix(in srgb, var(--accent) 8%, transparent) 35%,
+      transparent 70%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  margin-bottom: var(--space-3);
+  position: relative;
+  /* 让 halo 缓慢呼吸，强化「等待/邀请」感 */
+  animation: empty-halo 4s ease-in-out infinite;
+}
+.empty-state-icon::after {
+  /* 内圈实色圆 + 微阴影：让图标有「浮起」感 */
+  content: "";
+  position: absolute;
+  inset: 16px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent),
+    0 4px 12px color-mix(in srgb, var(--accent) 8%, transparent);
+  z-index: -1;
+}
+.empty-state-icon svg {
+  /* 图标本身略浮起，配合 halo 制造层次 */
+  filter: drop-shadow(0 2px 4px color-mix(in srgb, var(--accent) 18%, transparent));
+}
+
+@keyframes empty-halo {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.95;
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+}
+
+.empty-state p {
+  margin: 0;
+  font-size: var(--fs-lg);
+  color: var(--fg-primary);
+  font-weight: 700;
+  /* 标题与下面 hint 之间的留白由 gap 控制，避免再加 margin */
+  letter-spacing: var(--tracking-tight);
+  /* 标题用次级 fg-primary 突出 —— primary 比 secondary 更有视觉重量 */
+}
+
+/* 标题（"选择一个 Markdown 文件开始阅读"）需要与图标 / 提示都拉出层次 */
+.empty-state > p:not(.hint) {
+  margin-bottom: var(--space-3);
+}
+
+.empty-state .hint {
+  font-size: var(--fs-sm);
+  /* 13px 提示文本：用 secondary（2026-08 提亮到 ~8.5:1），避开 tertiary 旧值的 3.5:1
+     —— 注释说要用 secondary 但实际代码仍是 tertiary，已修复 */
+  color: var(--fg-secondary);
+  /* max-width 从 360 提到 400：让"放进数据文件夹后，" + ".md" chip 一行内放得下，
+     避免折成两行导致后段「自动出现」只剩一两个汉字成行（orphan 字）。
+     text-wrap: pretty 是 Chromium 114+ 的 CSS Text Level 4 优化，
+     优先避免单字成行（对 CJK 也生效：算法看 line-end penalty） */
+  max-width: 400px;
+  line-height: var(--lh-relaxed);
+  /* 主 hint 与标题之间已经由标题 margin-bottom 12px 撑开，
+     主 hint 自身的 margin-top 设为 0 避免与上面 margin 叠加 */
+  margin-top: 0;
+  text-wrap: pretty;
+}
+
+/* 二级提示：用 tertiary + 略小字号，与主 hint 拉开视觉权重 */
+.empty-state .hint.hint-secondary {
+  color: var(--fg-tertiary);
+  font-size: var(--fs-xs-readable);
+  margin-top: 6px;
+  max-width: 380px;
+}
+
+.empty-state .hint kbd {
+  /* .md 这种代码 chip 用 kbd 标签更语义化 */
+  padding: 2px 7px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  /* 2026-08 从 11px 提到 12px：11px 在低 DPI 上偏糊，挤在提示文本里看着小 */
+  font-size: var(--fs-xs-readable);
+  font-family: var(--font-mono);
+  color: var(--fg-secondary);
+  font-weight: 600;
+  box-shadow: 0 1px 0 var(--border-subtle);
+}
+
+.empty-state code {
+  padding: 2px 8px;
+  background: var(--bg-hover);
+  border-radius: var(--radius-sm);
+  /* 0.85em of 13px ≈ 11px —— 提到 12px（--fs-xs-readable）让 .md chip 跟 kbd 同档 */
+  font-size: var(--fs-xs-readable);
+  font-family: var(--font-mono);
+  /* accent 文字在 bg-hover 上仅 ~4:1；改用 fg-secondary 满足 AA */
+  color: var(--fg-secondary);
+}
+
+/* ============================================================
+   Editor Pane & Split View
+   三种模式：preview（仅 viewer）/ edit（仅 editor）/ split（双栏 + 分割条）
+   ============================================================ */
+
+body[data-editor-mode="split"] .app-shell {
+  /* 五列：sidebar | sb-splitter | editor | splitter | viewer
+     editor 用 px (--w-editor) 由 app.js 拖动时写在 .app-shell 的 style 上；
+     viewer 用 1fr 自动填剩余空间。
+     这样在 split + AI 模式下拖 ai-splitter 不会挤编辑器（详见 src/app.js mountSplitter）。
+     minmax(280px, ...) 给编辑器最小宽度 —— 编辑器内容至少要够阅读宽度才不挤；
+     默认 var(--w-editor, 50%) 在 CSS fallback 阶段给一个等分初始值，
+     app.js 启动时根据 splitRatio 重算覆盖。 */
+  grid-template-columns:
+    var(--sidebar-width)
+    4px
+    minmax(280px, var(--w-editor, 50%))
+    4px
+    minmax(0, 1fr);
+}
+
+body[data-editor-mode="preview"] .app-shell {
+  /* 三列：sidebar | sb-splitter | viewer */
+  grid-template-columns: var(--sidebar-width) 4px minmax(0, 1fr);
+}
+
+body[data-editor-mode="edit"] .app-shell {
+  /* 三列：sidebar | sb-splitter | editor */
+  grid-template-columns: var(--sidebar-width) 4px minmax(0, 1fr);
+}
+
+.editor-pane {
+  background: var(--bg-viewer);
+  overflow: hidden;            /* CM6 自己处理滚动 */
+  min-width: 0;
+  min-height: 0;
+  display: none;                /* 默认隐藏（preview 模式） */
+  user-select: text;
+}
+
+body[data-editor-mode="edit"]  .editor-pane,
+body[data-editor-mode="split"] .editor-pane {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 让编辑器像 viewer 一样「居中 + 限定行宽」，与预览区域视觉重量一致。
+   max-width 与 .markdown-body 共用 --w-reader-max，保证 gutter + 内容总宽
+   不超过 reader max；margin auto 在更宽的窗口中把编辑器推到中部。
+   窄窗口下 max-width 不再生效，编辑器自然占满全宽（不破坏小屏体验）。 */
+.editor-pane .cm-editor {
+  max-width: var(--w-reader-max);
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* 窄窗口（< 720px）：三栏挤到 1xx px 时退化为「单栏 + 隐藏阅读视图」——
+   至少保留可读可编辑区域。minWidth: 600 仍由主进程限制，这里只处理 600~720 区间 */
+@media (max-width: 720px) {
+  body[data-editor-mode="split"] .app-shell {
+    /* 侧栏 splitter 仍保留，方便用户把侧栏压到最小留更多编辑区 */
+    grid-template-columns: var(--sidebar-width) 4px minmax(0, 1fr);
+  }
+  /* 直接隐藏 editor/viewer 之间的 splitter 元素，避免它作为孤儿占据第 5 个 grid 单元 */
+  body[data-editor-mode="split"] .splitter {
+    display: none !important;
+  }
+  body[data-editor-mode="split"] .viewer {
+    display: none !important;
+  }
+  /* 窄屏默认侧栏宽度变窄 */
+  :root { --sidebar-width: var(--w-sidebar-narrow); }
+}
+
+/* edit 模式：隐藏阅读视图 —— 编辑器已经占据右侧，不需要再显示预览 */
+body[data-editor-mode="edit"] .viewer {
+  display: none;
+}
+
+.splitter {
+  background: var(--border-subtle);
+  cursor: col-resize;
+  position: relative;
+  display: none;
+  transition: background var(--transition-fast);
+}
+
+body[data-editor-mode="split"] .splitter {
+  display: block;
+}
+
+.splitter:hover,
+.splitter.is-dragging {
+  background: var(--accent-soft);
+}
+
+.splitter::after {
+  /* 抓握提示：两条短竖线 */
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 1px;
+  height: 24px;
+  background: var(--border-default);
+  box-shadow: 3px 0 0 var(--border-default);
+}
+
+.splitter:hover::after,
+.splitter.is-dragging::after {
+  background: var(--accent);
+  box-shadow: 3px 0 0 var(--accent);
+}
+
+/* 编辑器底色 / 文字色已由 editor-theme.js 的 spec（var(--bg-viewer) / var(--fg-primary)）
+   覆盖；老的"dark 强制 bg-viewer、light 强制 bg-viewer"那段代码冗余且容易出错，删除。 */
+
+.cm-editor .cm-tooltip {
+  background: var(--bg-elevated);
+  color: var(--fg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
+.cm-editor .cm-tooltip-autocomplete ul li[aria-selected] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ============================================================
+   Folder Browser（Stage 8）：面包屑 + 文件夹 / 二进制条目样式
+
+   面包屑放在 .sidebar-sort 下方、.file-list 上方，贴近它作用的列表。
+   根目录时整个 <nav> hidden（HTML 里默认带 hidden 属性），
+   不需要 CSS 处理空态。
+
+   文件夹（.file-item.is-folder）：
+     - 文件夹图标 + 名称略加粗（区别于普通文件）
+     - meta 行简化为「文件夹」
+   二进制（.file-item.is-binary）：
+     - opacity 0.45 + cursor not-allowed —— 视觉与文件管理器对不可执行项的灰态一致
+     - 仍可被点击（事件不被禁用，渲染端弹 toast 提示）
+   ============================================================ */
+
+.sidebar-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px 4px;
+  /* 横向溢出 + 不换行：用户进入很深层子目录时（如 archive/2026/03/15）
+     末尾「当前段」是最重要的，前面的历史段可以横滑出可见区 */
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  /* 让滚动条只在 hover 时更显眼，平时几乎不可见 —— 避免视觉噪音 */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.sidebar-breadcrumb:hover {
+  scrollbar-color: var(--border-subtle) transparent;
+}
+
+/* 回到根按钮：图标 + 文字，单独占左侧 */
+.sidebar-breadcrumb-root {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  color: var(--fg-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  border-radius: 3px;
+  font-family: inherit;
+}
+.sidebar-breadcrumb-root:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+.sidebar-breadcrumb-root:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.sidebar-breadcrumb-root svg {
+  flex: 0 0 auto;
+}
+
+/* 面包屑分段按钮（中间段，可点击跳转） */
+.sidebar-breadcrumb-btn {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  color: var(--fg-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  border-radius: 3px;
+  font-family: inherit;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sidebar-breadcrumb-btn:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+.sidebar-breadcrumb-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 当前段（非可点击，纯文本）：稍亮，与「根 / 中间段」做对比 */
+.sidebar-breadcrumb-current {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: var(--fs-xs);
+  color: var(--fg-primary);
+  font-weight: 600;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-breadcrumb-sep {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  opacity: 0.6;
+}
+
+/* 文件夹条目：粗体名称 + 文件夹图标颜色稍亮 */
+.file-item.is-folder .file-name {
+  font-weight: 600;
+  color: var(--fg-primary);
+}
+.file-item.is-folder .file-icon {
+  /* 文件夹图标用 accent 而不是 fg-muted：让「这是目录」的视觉信号更直接 */
+  color: var(--accent);
+}
+
+/* 二进制条目：灰态 + cursor 提示不可编辑，但仍可点击（弹 toast） */
+.file-item.is-binary {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.file-item.is-binary .file-icon {
+  /* 与灰度视觉统一：图标也走 fg-muted */
+  color: var(--fg-muted);
+}
+.file-item.is-binary:hover {
+  /* 灰态项 hover 不要让背景喧宾夺主 —— 用更弱的 hover 背景 */
+  background: var(--bg-hover);
+}
+.file-item.is-binary.is-active {
+  /* 即使被键盘选中也不打破「不可编辑」的视觉信号 —— 不用 accent 高亮 */
+  background: var(--bg-hover);
+}
+.file-item.is-binary.is-active::before {
+  /* 不画左侧色条：用户已经看 opacity 知道这一项不可编辑 */
+  opacity: 0.4;
+}
+

@@ -1,0 +1,1190 @@
+/* ===========================================================================
+   Modal + Form
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ============================================================
+   Modal
+   ============================================================ */
+/* #modal-root 是挂载点，平时为空。
+   必须 position:fixed + 0 尺寸，否则会成为 body grid 的第 4 个 grid item，
+   即便 height:0 也会多生成一行（grid-template-rows: 52px 680px 28px 0px），
+   把 toolbar/app-shell/statusbar 的 grid-row 防御性声明变成「看起来有用但本可避免」。
+   真正显示的 .modal-overlay 自己就是 position:fixed + inset:0，挂在 root 里不受影响。 */
+#modal-root {
+  position: fixed;
+  inset: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-7);
+  animation: fade-in var(--transition-normal) var(--ease-out);
+  /* #modal-root 设了 pointer-events:none 防止空挂载点吃掉背景点击。
+     但 pointer-events 是可继承属性（spec：initial=auto, inherited=yes），
+     整棵 .modal-overlay 子树都会继承到 none → 按钮看起来正常却点不动。
+     在 .modal-overlay 上显式开启 auto，让子树全部恢复接收事件。 */
+  pointer-events: auto;
+}
+
+[data-theme="light"] .modal-overlay {
+  /* light 主题底色本身就亮，遮罩黑度从 0.5 降到 0.12 即可识别 modal，
+     同时保持 modal 内文字对比（不至于把卡片压成 167 灰，破坏文字 contrast）。 */
+  background: var(--scrim-soft);
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.modal {
+  background: var(--bg-elevated);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  width: 100%;
+  /* 500 → 560：设置对话框现在含：3 段 + 4 种视觉选择器（最宽的 fontsize 5 列）
+     + 实时预览 block + AI 段 5 字段。560 让字体选择器单卡 ~92px，
+     配置路径在 mono 字体下也能完整显示不换行；不至于撞 padding 边沿。
+     min(560px, calc(100vw - 48px)) — 当窗口被用户拖得很窄时（侧边栏展开 + 屏幕小），
+     modal 自动收缩但保留左右 24px 安全边距，不至于撞到窗口边缘 */
+  max-width: min(560px, calc(100vw - 48px));
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  animation: modal-in 320ms var(--ease-out);
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.modal-header {
+  padding: var(--space-5) var(--space-6);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.modal-title {
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  color: var(--fg-primary);
+  letter-spacing: var(--tracking-tight);
+}
+
+.modal-close {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  /* 同 .btn-icon：默认 secondary 避免发灰 */
+  color: var(--fg-secondary);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.modal-close:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.modal-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.modal-body {
+  flex: 1;
+  padding: var(--space-6);
+  overflow-y: auto;
+}
+
+.modal-footer {
+  padding: var(--space-4) var(--space-6);
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  background: var(--bg-app);
+}
+
+/* ============================================================
+   Form
+   ============================================================ */
+.form-row {
+  margin-bottom: var(--space-4);
+}
+
+.form-row:last-child {
+  margin-bottom: 0;
+}
+
+/* settings-section 用 flex + gap 控制垂直节奏，里面的 form-row 再叠 margin-bottom
+   会让外观段 3 个内联行之间出现 32px 巨大空洞。在这里把
+   margin-bottom 归零，由 section 的 gap 统一负责，视觉上各行更紧凑。 */
+.settings-section .form-row {
+  margin-bottom: 0;
+}
+
+.form-label {
+  display: block;
+  /* 13 → 14：与 input 同字号，视觉对齐；13px 在某些渲染下偏小发糊 */
+  font-size: var(--fs-base);
+  color: var(--fg-secondary);
+  margin-bottom: var(--space-2);
+  font-weight: 600;
+  letter-spacing: var(--tracking-tight);
+}
+
+.form-input {
+  width: 100%;
+  /* 12 → 10：纵向收紧 4px，配合 --fs-base 让控件不至于"鼓出来" */
+  padding: 10px var(--space-3);
+  background: var(--bg-app);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  /* 13 → 14：input 文字是用户真正要阅读的内容，不再用 --fs-sm；颜色用 primary
+     而非 secondary，保证 select 选项文字清晰可读 */
+  font-size: var(--fs-base);
+  color: var(--fg-primary);
+  /* 默认走 sans：之前所有 input 都套 --font-mono，导致「配色 / 字号 / 行距」
+     这种短下拉也用 JetBrains Mono，密度高反而显糊。路径类 input 用
+     .form-input-mono 单独再切回 mono */
+  font-family: var(--font-sans);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+/* 文件路径 / 配置 id 等"代码类"内容才用等宽字体 */
+.form-input-mono {
+  font-family: var(--font-mono);
+  /* 13 → 12.5：mono 字符本身比 sans 宽，略缩小避免路径溢出按钮 */
+  font-size: 12.5px;
+}
+
+/* M-series fix (audit Phase M-CSS-11)：AI 系统提示词框等 textarea 之前
+   只继承 .form-input，被赋的是 input 的样式（无 min-height / resize）。
+   加 textarea 专用规则：垂直 resize + 等宽字体（系统提示词里多半是 YAML /
+   JSON / 模板）+ 最小 4 行高度，避免双击 textarea 后立刻只有 1 行。 */
+.form-input.form-textarea {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  min-height: calc(1.5em * 4 + 20px); /* 4 行 + 上下 padding */
+  resize: vertical;
+}
+
+.form-input:focus {
+  /* 同 search-input：键盘焦点由全局 :focus-visible 接管 */
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-glow);
+}
+@supports (focus-visible) {
+  .form-input:focus:not(:focus-visible) {
+    box-shadow: none;
+  }
+  .form-input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+.form-input[readonly] {
+  background: var(--bg-hover);
+  color: var(--fg-secondary);
+  cursor: default;
+}
+
+/* 校验错误（prompt-dialog validate 返回非 null 时显示）
+ * 用装饰色（--accent）作为 outline，文字色走 --*-text 保持视觉一致；
+ * 不要跟普通焦点环（--accent）混淆 —— 这里加 box-shadow inset 区别。*/
+.form-input.is-invalid {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.form-error {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--accent-text);
+}
+.form-error[hidden] { display: none; }
+
+.form-hint {
+  /* 11 → 12：原本 --fs-xs 在 Windows 上偏糊；用 --fs-xs-readable 保持视觉小但不模糊。
+     仍走 --fg-secondary 保证 WCAG AA */
+  font-size: var(--fs-xs-readable);
+  color: var(--fg-secondary);
+  /* 8 → 6：hint 与上方 input 的呼吸更紧一档 */
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.form-hint code {
+  font-family: var(--font-mono);
+  padding: 1px 5px;
+  background: var(--bg-hover);
+  border-radius: 3px;
+}
+
+/* M-series fix (audit Phase M-CSS-10)：API Key reveal 风险等需要更高
+   警示层级的 hint。settings-dialog.js:551 输出 form-hint-warning 但
+   之前没定义该 class，警告没视觉高亮。
+   - 文字色用 --warning-text（60% 纯色 + 40% fg-primary）让 13px 警示文
+     不"刺眼"；左侧色条 + 背景继续走纯 --warning，承担警示意味。
+   - 加左侧 3px 色条强化"警告条"语义
+   - padding 内缩让色条不被文字压住 */
+.form-hint.form-hint-warning {
+  color: var(--warning-text);
+  padding-left: 10px;
+  border-left: 3px solid var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.confirm-message {
+  font-size: var(--fs-base);
+  color: var(--fg-primary);
+  line-height: var(--lh-relaxed);
+  white-space: pre-wrap;
+  margin: 0;
+}
+
+/* ============================================================
+   Confirm Dialog — 视觉升级
+   与设置对话框共享设计语言（图标 + 卡片化 body），但更紧凑：
+   - 收窄 modal 宽度（confirm 文案短，560px 太空）
+   - body 居中排列 icon + 文案，视觉焦点集中
+   - icon 用圆形着色背景强调语义（warning 黄 / danger 红 / conflict 蓝 / info 灰）
+   ============================================================ */
+
+/* 收窄 confirm modal 宽度 —— 文案一般 2-3 行，400px 足矣。
+   与 settings 的 560px 拉开差距，视觉上「轻量确认」 vs 「重量配置」一眼区分。 */
+.modal--confirm {
+  max-width: min(420px, calc(100vw - 48px));
+}
+
+/* confirm body：垂直居中 icon + 文案，给足呼吸空间。
+   16px 24px 20px —— 上 16 与 icon 顶部形成舒适留白，下 20 与 footer 分隔自然。 */
+.modal--confirm .modal-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 20px var(--space-6) 24px;
+  gap: 12px;
+}
+
+/* icon 容器：40px 圆形着色背景，与 settings-section-icon (26px 方形) 同语言但
+   更大更圆 —— confirm 是「一次性决策」，需要比「配置分区」更强的视觉聚焦。
+   颜色由 .confirm-icon-{variant} 子类控制。 */
+.confirm-icon-wrap {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  /* 默认 fallback（未匹配变体时走中性灰） */
+  background: var(--bg-hover);
+  color: var(--fg-secondary);
+}
+
+/* warning：未保存改动 / 放弃前提醒 —— 黄底 + 黄描边，与状态栏 warning toast 一致 */
+.confirm-icon-warning {
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  color: var(--warning);
+}
+
+/* danger：删除 / 不可逆操作 —— 红底，与 .btn-danger 视觉呼应 */
+.confirm-icon-danger {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+/* conflict：外部修改冲突 —— 蓝底（用 accent），与「需要用户介入」的语义匹配 */
+.confirm-icon-conflict {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* info：一般信息 —— 中性灰，不抢注意力 */
+.confirm-icon-info {
+  background: var(--bg-hover);
+  color: var(--fg-secondary);
+}
+
+/* confirm 文案在 icon 下方居中：max-width 防止窄窗口文字撑太宽影响阅读。
+   字号与默认 .confirm-message 一致（--fs-base），但 text-align: center 让它
+   在居中布局下视觉平衡。white-space: pre-wrap 保留调用方的 \n 换行。 */
+.modal--confirm .confirm-message {
+  max-width: 32ch;
+}
+
+/* footer 在 confirm 中保持靠右对齐，但加一点上内边距与 body 分隔。
+   按钮排列不变 —— 最右侧仍是 primary/danger（用户决策的最终动作）。 */
+.modal--confirm .modal-footer {
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-6);
+}
+
+/* (audit fix Round 9: .prompt-input / .confirm-input / .btn-danger / .form-row-inline
+   / .md-preview-link 全部为零引用死 CSS，详见 08-modal.css 注释) */
+
+.btn-link {
+  background: none;
+  border: none;
+  /* 11px 小字需要 ≥ 4.5:1 contrast，用 --md-link（亮变体）而非 --accent */
+  color: var(--md-link, var(--accent));
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  font-weight: 500;
+  margin-left: var(--space-2);
+}
+
+.btn-link:hover {
+  color: var(--md-link-hover, var(--accent-hover));
+  text-decoration: underline;
+}
+
+.form-path-row {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.form-path-row .form-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 设置对话框分区卡片化 */
+.settings-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  /* 14 → 16：modal 加宽到 560 后，每张 section 卡的横向空间更宽裕，
+     同步加 2px 上下 padding 让卡片"立"起来；不至于贴边。 */
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  /* 10 → 12：section 内部节奏与 picker card padding 对齐，
+     让 header → form-row 的呼吸更舒展，与外部 section 间隔成比例。 */
+  gap: 12px;
+}
+
+.settings-section + .settings-section {
+  /* 10 → 14：随 modal 加宽，section 之间给一档更明显的视觉分隔；
+     卡片化设计必须有可见的"卡片间空气"，否则会糊成一片。 */
+  margin-top: 14px;
+}
+
+.settings-section-header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  /* 之前还有 margin-bottom: var(--space-2)（8px），但 section 是 flex + gap，
+     gap 已经管了 header → form-row 的距离，再叠 8px 让 header 视觉过重。
+     与上面的 form-row 修复思路一致：margins and gaps 二选一，避免叠加。 */
+}
+
+.settings-section-icon {
+  flex: 0 0 auto;
+  /* 28 → 24：再缩小一档，配合 14px section padding，整张卡片视觉重量更轻；
+     内部 SVG 18px 不动，icon 容器收紧让它"贴边"感更强。
+     24 → 26：随 modal 加宽 + section padding 16，icon 也大一档
+     与下方的 subsection title 文字（13px 700）形成更均衡的视觉重量。 */
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* subsection 标题 —— 用于 AI 段分组（"连接"/"行为"）
+   比 section 标题小一档，与下一级控件（form-input 15px）的反差更小。 */
+.settings-subsection-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--fg-secondary);
+  letter-spacing: var(--tracking-tight);
+  margin: 0;
+  /* 用相对定位 + 下方 1px hairline 替代传统 div 分割线，
+     比 border-bottom: 1px solid 更轻、与整张卡片极简风格一致。 */
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* 安全提示 callout —— 单独的小卡片，比灰色 form-hint 更醒目
+   但仍然不抢主按钮的视觉权重。accent-soft 背景让用户在表单流里一眼看到。 */
+.settings-callout {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs-readable);
+  line-height: 1.5;
+  color: var(--fg-secondary);
+}
+
+.settings-callout-icon {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  color: var(--accent);
+  margin-top: 1px;
+}
+
+.settings-callout-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-callout-text code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 1px 5px;
+  background: var(--bg-hover);
+  border-radius: 3px;
+}
+
+/* 带边框的清空行动区 —— 与下方普通 form-hint 拉开层级 */
+.settings-callout-danger {
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 22%, transparent);
+  color: color-mix(in srgb, var(--danger) 80%, var(--fg-primary));
+}
+
+.settings-callout-danger .settings-callout-icon {
+  color: var(--danger);
+}
+
+/* danger callout 里的链接（[清空 AI 配置]）：色调用 --danger-text 与 callout
+   整体走的「文字版」保持一致（16-22 行已用 color-mix(...)）。
+   box 已经给出了"危险操作"语义（左色条 + 8-22% danger tint 底），
+   链接文字降彩度，靠 callout 整体而不是靠单字传递破坏性。
+   不与提示 info 区里用 --md-link 相同的色 —— danger 区仍要走 danger 色相，
+   否则用户看不出"这是清空"，与 [[feedback-ai-clear-button-works]] 对齐 */
+.settings-callout-danger .btn-link {
+  color: var(--danger-text);
+}
+
+.settings-callout-danger .btn-link:hover {
+  color: var(--danger);
+}
+
+.settings-section-title {
+  /* 15 → 14：与表单文字同字号，仅靠 weight 700 / 颜色 primary 拉开层级；
+     之前 15px 让标题"大一级"，但和下面的控件反差过大，视觉分裂 */
+  font-size: var(--fs-base);
+  font-weight: 700;
+  color: var(--fg-primary);
+  margin: 0;
+  line-height: 1.3;
+}
+
+.settings-section-subtitle {
+  /* 11 → 12：用 --fs-xs-readable 解决"看不清"，仍走 --fg-secondary 保对比度 */
+  font-size: var(--fs-xs-readable);
+  color: var(--fg-secondary);
+  margin: 1px 0 0 0;
+  line-height: 1.4;
+}
+
+.settings-section-subtitle code {
+  font-family: var(--font-mono);
+  background: var(--bg-hover);
+  padding: 1px 5px;
+  border-radius: 3px;
+  /* 11 → 12：与外层 subtitle 一致，避免 code 反而更小 */
+  font-size: 12px;
+}
+
+/* 关于段：开发者信息 + 主页链接 —— 不可改，只展示。 */
+.about-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  /* 行间距与 form-row 内其他内容保持一致 */
+  line-height: 1.6;
+  font-size: var(--fs-base);
+}
+
+.about-line + .about-line {
+  /* 两行（开发者 / 主页）之间给一档呼吸，与其它 form-row 内部节奏对齐 */
+  margin-top: 6px;
+}
+
+.about-label {
+  /* 「开发者：」「主页：」作为字段名，走 secondary 与 fg-primary 内容拉开层级 */
+  color: var(--fg-secondary);
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.about-value {
+  color: var(--fg-primary);
+  font-weight: 500;
+}
+
+/* 主页链接 —— 与 .btn-link 共享颜色，但去掉它的 left margin（label 已经给出
+   间距），且 URL 类内容用 mono 字体显得更"代码"。 */
+.about-link {
+  margin-left: 0;
+  font-family: var(--font-mono);
+  /* URL 一般偏长，13px 即可；与 .form-input-mono 同字号 */
+  font-size: 12.5px;
+  /* 长 URL 默认会在空格 / 标点断行；强制按字符断，避免撑出右侧 padding */
+  word-break: break-all;
+}
+
+.form-input-inline {
+  flex: 1;
+  /* 280 → 200：select 最多展示「配色名称」四个字 + value，200 已经足够；
+     之前 280 让 select 视觉上"飘"在卡片中部；现在与 label 一起构成紧凑一行 */
+  max-width: 200px;
+}
+
+/* 整行可点击的 radio card */
+.form-radio-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  /* 用 --bg-card 而非未定义的 --bg-input：hover 态是 --bg-card-hover，两者成对 */
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.form-radio-card:hover {
+  border-color: var(--border-default);
+  background: var(--bg-card-hover);
+}
+
+.form-radio-card.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.form-radio-card input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  height: 0;
+}
+
+.form-radio-card-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.form-radio-card-label {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--fg-primary);
+}
+
+.form-radio-card.is-selected .form-radio-card-label {
+  /* selected label 用 --md-link 而非 --accent：--md-link 已经是「在 modal 卡片
+     半透明底上 ≥ 4.5:1 的亮变体」。直接用 --accent 在 default/ocean/forest/sunset
+     light 主题只有 3.5-4.0:1（不达 WCAG AA）。 */
+  color: var(--md-link);
+  font-weight: 700; /* 加粗补偿亮度差 */
+}
+
+.form-radio-card-hint {
+  font-size: var(--fs-xs);
+  /* 11px 小字需要 ≥ 4.5:1 contrast，--fg-tertiary 在 default dark 上只有 4.0。
+     提升到 --fg-secondary（已在 default dark 上 5.0:1）。 */
+  color: var(--fg-secondary);
+}
+
+.form-radio-card-check {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid var(--border-default);
+  position: relative;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.form-radio-card.is-selected .form-radio-card-check {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 3px var(--bg-card);
+}
+
+/* ============================================================
+   Visual Picker（视觉化选择器）
+   替代 <select>，让用户在选择「配色 / 字号 / 行距 / AI 服务」时
+   看到真实的视觉反馈，而不是抽象的下拉菜单。
+   ============================================================ */
+
+.picker-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.picker-group-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.picker-group-value {
+  font-size: var(--fs-xs-readable);
+  color: var(--fg-tertiary);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  /* 选中后显示当前值的「数值镜像」：用户对所选档位一眼有数 */
+  padding: 2px 7px;
+  background: var(--bg-hover);
+  border-radius: var(--radius-sm);
+}
+
+.picker-grid {
+  display: grid;
+  gap: 8px;
+}
+
+/* 通用 picker card（palette / font-size / line-height / ai-provider 复用） */
+.picker-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  /* 6 → 8：section gap 同步抬到 12 后，card 内 gap 也对等抬一档，
+     配合 min-height 让"预览 → 标签"呼吸更舒展。 */
+  gap: 8px;
+  /* 8px 8px 10px → 10px 10px 12px：picker card 是用户主要点击区域，
+     padding 抬一档让卡片有更明确的"可点击边界"；同时配合
+     min-height 92 形成稳定视觉块。 */
+  padding: 10px 10px 12px;
+  /* min-height 保证 5 列同行的卡片（不同字号"Aa" / 不同字符长度的 swatch）
+     不会出现「14px 字体的卡」比「22px 字体的卡」矮 8px 那种参差。
+     Grid 子项默认 align-self: stretch 拉齐同 row；跨 row 不强制。 */
+  min-height: 92px;
+  /* 把预览推到顶部、label 推到底部，「卡片」结构更清晰 */
+  justify-content: space-between;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  cursor: pointer;
+  text-align: center;
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+.picker-card:hover {
+  border-color: var(--border-default);
+  background: var(--bg-card-hover);
+}
+
+.picker-card:active {
+  transform: scale(0.97);
+}
+
+.picker-card.is-selected {
+  border-color: var(--accent);
+  background: var(--bg-card-hover);
+  /* 2px soft glow 提示「选中」，比单纯边框更有视觉重量 */
+  box-shadow:
+    0 0 0 1px var(--accent),
+    0 0 0 4px var(--accent-soft);
+}
+
+/* 卡片底部 label 容器共享样式 —— 不论 palette / fontsize / lineheight / ai-provider，
+   视觉重量（字号 11px + tabular-nums + mono）在所有 picker 间一致，
+   让用户看到所有 picker 都是同一套"卡片 + 数值标签"语言。 */
+.picker-card-label,
+.fontsize-card-label,
+.lineheight-card-label {
+  font-size: var(--fs-xs);
+  font-family: var(--font-mono);
+  color: var(--fg-tertiary);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  /* 16px 固定行高保证 picker row 内卡片底部对齐 —— 即使数字字符串
+     "14" vs "22" 等占位不同，label 都在同一 baseline */
+  line-height: 16px;
+  letter-spacing: 0.01em;
+}
+
+/* picker / fontsize / lineheight card 选中态 label：
+   文字降彩度（--accent-text），由右上角 ✓ 角标维持纯 accent 强调，
+   避免"阅读行距：标准 / 紧凑 / 宽松"三个并排时纯 accent 字同时扎眼。 */
+.picker-card.is-selected .picker-card-label,
+.fontsize-card.is-selected .fontsize-card-label,
+.lineheight-card.is-selected .lineheight-card-label {
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* 选中态角标（右上角 ✓）—— 避免完全靠颜色辨识，
+   色盲用户也能一眼区分；同时取代旧的「凸出边框」视觉 */
+.picker-card-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--btn-on-accent, #fff);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.picker-card.is-selected .picker-card-check {
+  opacity: 1;
+  transform: scale(1);
+}
+
+/* 让原生 radio / checkbox 不渲染但可被键盘/表单访问 */
+.picker-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  height: 0;
+}
+
+/* ---------- 配色（palette）swatch ----------
+   每个 swatch 用一段 3 色横条展示该 palette 的：bg / accent / fg。
+   真实展示色彩性格，比纯文字 "默认/海洋/森林" 直观得多。 */
+.picker-grid-palette {
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+}
+
+.palette-strip {
+  display: flex;
+  /* 26 → 32：随 card min-height 抬到 92，让 swatch 在 5 列布局里
+     视觉上更显眼（卡片宽度 ~96px，26px 高度比例偏矮）。 */
+  height: 32px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+
+.palette-strip-bg {
+  flex: 1;
+}
+
+.palette-strip-accent {
+  /* accent 占 30%，让用户看清「主色是什么」 */
+  flex: 0 0 30%;
+}
+
+/* ---------- 字号 picker ----------
+   5 张卡（14/15/17/19/22），每张渲染一个 "Aa" 样本。
+   用 CSS 自定义属性 --sample-size 在卡片上独立设置字号，
+   避免渲染整个 dialog 的 --reader-font-size 被覆盖 */
+.picker-grid-fontsize {
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+}
+
+.fontsize-card {
+  /* 沿用 .picker-card 通用 padding；之前 fontsize-card 单独写
+     padding: 10px 4px 8px 是为了把 label 拉到一行底，但跟 .picker-card
+     justify-content: space-between 重复。统一靠 space-between 即可。 */
+  padding: 10px 6px 12px;
+}
+
+.fontsize-preview {
+  font-family: var(--font-reading);
+  font-weight: 600;
+  font-size: var(--sample-size, 17px);
+  color: var(--fg-primary);
+  line-height: 1;
+  letter-spacing: -0.01em;
+  /* 让 "Aa" 在卡片中居中显示，配合 space-between 让不同字号"14/22"
+     看上去都卡在同一个视觉中心，不再因为字号差异上下跳动。 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* min-height 让 14px / 22px 的 "Aa" 都占同一纵向区间；
+     不至于最小卡看着空，最大卡撑爆。 */
+  min-height: 36px;
+}
+
+/* ---------- 行距 picker ----------
+   4 张卡（1.5/1.7/1.85/2.0），每张渲染 3 行示例文本，
+   让用户一眼看出每档的「疏密」差异 */
+.picker-grid-lineheight {
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.lineheight-card {
+  /* 与 fontsize-card 统一 padding，让所有视觉 picker 卡片底缘对齐 */
+  padding: 10px 8px 12px;
+  align-items: stretch;
+}
+
+.lineheight-preview {
+  font-family: var(--font-reading);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--fg-secondary);
+  line-height: var(--sample-lh, 1.85);
+  /* 固定 56px 容器高度 —— 行距的差异通过文本内的实际行间距来体现
+     （更密的卡片显示更多内容行，更疏的卡片显示更少行 + 行间更宽），
+     而不是让卡片高度本身随行距拉伸。
+     配合 picker card 的 justify-content: space-between，
+     4 张卡在同一行高度完全一致；只有中间文字密度在变。 */
+  height: 56px;
+  max-height: 56px;
+  width: 100%;
+  text-align: left;
+  /* 截断到 3 行：更高 lineheight 时只显示 2.x 行，但视觉密度仍清晰 */
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+
+/* ---------- AI 服务 picker ----------
+   整宽单列堆叠（grid 1fr）：每张卡片只显示 icon + 名称 + hint。
+   之前是 2 列 + 右侧 .aiprovider-protocol 角标，但 hint 文本里已经包含
+   协议路径，protocol 角标是纯重复信息；2 列还导致长 hint 断行成 3 行。
+   只有 2 个 provider，"并排比较"收益小，整宽单列给 hint 留足单行空间。 */
+.picker-grid-aiprovider {
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.aiprovider-card {
+  display: grid;
+  /* icon 24px + body 1fr：去掉旧版的 `auto` 第三列（.aiprovider-protocol），
+     那列重复了 hint 文本里的协议路径，且把 body 挤窄。 */
+  grid-template-columns: 24px 1fr;
+  align-items: center;
+  gap: 10px;
+  /* 沿用 .picker-card 通用 padding 即可；AI 卡片是横向布局，
+     不用 min-height —— 强制 92px 会让横向卡片"拉伸成空条"，
+     与上下视觉 picker 的纵向密度形成不和谐对比。
+     50-60px 自然高度更贴合"一行紧凑控件"的语义。 */
+  padding: 12px 14px;
+  text-align: left;
+  min-height: 56px;
+}
+
+.aiprovider-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.aiprovider-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.aiprovider-card-label {
+  font-size: var(--fs-sm);
+  color: var(--fg-primary);
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+/* AI provider 选中态 label：与 picker-card 一致降彩度，避免与卡片
+   右侧 ✓ 角标争抢注意力。hint 行已经走 fg-secondary。 */
+.aiprovider-card.is-selected .aiprovider-card-label {
+  color: var(--accent-text);
+}
+
+.aiprovider-card-hint {
+  font-size: var(--fs-xs);
+  color: var(--fg-tertiary);
+  line-height: 1.3;
+  /* 允许 hint 在窄屏（移动端 / 窄 modal）下折行；
+     整宽桌面 modal 下基本保持单行。
+     overflow-wrap 防超长 token（如 URL）撑破卡片。 */
+  overflow-wrap: anywhere;
+}
+
+.aiprovider-card.is-selected .aiprovider-card-hint {
+  color: var(--fg-secondary);
+}
+
+/* ============================================================
+   Markdown 实时预览（外观设置里的小预览框）
+   让用户在选字号/行距时立刻看到效果，所见即所得。
+   升级后展示：标题 / 段落 / 行内 code / 链接 / 引用 / 列表 / 代码块，
+   让"14/22px 字号"和"1.5/2.0 行距"的差异在多元素上同时可见。
+   ============================================================ */
+.md-preview {
+  margin-top: 12px;
+  padding: 14px 18px;
+  background: var(--bg-viewer);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.md-preview-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--fg-tertiary);
+  margin-bottom: 8px;
+}
+
+.md-preview-body {
+  font-family: var(--font-reading);
+  font-size: var(--sample-font-size, 17px);
+  line-height: var(--sample-line-height, 1.85);
+  color: var(--fg-primary);
+}
+
+/* 行间节奏：标题 → 正文 → 列表 → 引用都给与上下 margin，
+   让多元素预览看起来是一份真正的文档而不是松散的元素堆。 */
+.md-preview-body > * + * {
+  margin-top: calc(var(--sample-line-height, 1.85) * 0.5em);
+}
+
+.md-preview-body > * + .md-preview-heading,
+.md-preview-body > .md-preview-heading + * {
+  margin-top: calc(var(--sample-line-height, 1.85) * 0.4em);
+}
+
+/* 预览内的"小标题"：用 div 不用 h3，避免与设置段的 h3 同级冲突。
+   视觉上当 h3 用（粗 + 略大），但不参与文档大纲。 */
+.md-preview-heading {
+  margin: 0;
+  font-family: var(--font-reading);
+  color: var(--fg-primary);
+  /* heading 不跟随 sample-font-size 自有节奏，
+     但跟随用户调的 line-height（间接影响上下间距） */
+  font-size: calc(var(--sample-font-size, 17px) * 1.15);
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.015em;
+}
+
+.md-preview-body p {
+  margin: 0;
+}
+
+.md-preview-body strong {
+  font-weight: 700;
+}
+
+.md-preview-body em {
+  font-style: italic;
+}
+
+.md-preview-body a {
+  color: var(--md-link);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--md-link) 50%, transparent);
+  text-underline-offset: 2px;
+}
+
+.md-preview-body code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  padding: 1px 5px;
+  background: var(--md-inline-code-bg);
+  color: var(--md-code-text);
+  border-radius: 3px;
+}
+
+/* 引用：左侧色条 + 内边距；行距跟随用户选择 */
+.md-preview-body blockquote {
+  margin: 0;
+  padding: 0.2em 0.8em;
+  border-left: 3px solid var(--accent);
+  background: var(--md-blockquote-bg, transparent);
+  color: var(--fg-secondary);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-style: italic;
+}
+
+/* 列表：保留紧凑缩进，行距跟随 sample-line-height */
+.md-preview-body ul {
+  margin: 0;
+  padding-left: 1.5em;
+  list-style: disc;
+}
+
+.md-preview-body li {
+  margin: 0;
+}
+
+.md-preview-body li + li {
+  margin-top: calc(var(--sample-line-height, 1.85) * 0.15em);
+}
+
+/* 代码块：与 md.css 06 的代码块风格一致 */
+.md-preview-body pre {
+  margin: 0;
+  padding: 0.6em 0.8em;
+  background: var(--md-code-bg);
+  color: var(--md-code-text);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: calc(var(--sample-font-size, 17px) * 0.85);
+  line-height: 1.55;
+  overflow-x: auto;
+}
+
+.md-preview-body pre code {
+  padding: 0;
+  background: none;
+  font-size: inherit;
+}
+
+/* (audit fix Round 9: .md-preview-link 死 CSS，已在文件头注释) */
+
+.btn {
+  /* inline-flex 让 SVG + 文字按钮 baseline 对齐。
+     32px min-height：与 AI chat submit / search input 一档，构成统一控件高度语言 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: var(--space-2) var(--space-5);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast);
+  letter-spacing: var(--tracking-tight);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+/* 键盘焦点反馈：所有按钮统一 2px accent outline，与 input 保持一致 */
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 图标 + 文字按钮（目前只用在设置对话框 API Key 显示/隐藏）：
+   让 SVG 眼睛图标和文字 baseline 对齐，否则 inline-block 默认按文字 baseline
+   排 SVG，14px svg 会显得偏高。
+   命名与工具栏的 .btn-icon-text (segmented control) 区分开，避免误用
+   —— 工具栏版本有 12px / height: 30px 等样式，套到普通按钮上会错位。 */
+.btn-with-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.btn-with-icon > svg {
+  flex-shrink: 0;
+}
+
+.btn-secondary {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+  border-color: var(--border-default);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--bg-active);
+  border-color: var(--border-strong);
+}
+
+.btn-primary {
+  background: var(--accent);
+  /* 主按钮文字色由调色板定义（--btn-on-accent），保证每个 palette 都 ≥ 4.5:1。
+     不能用 color-contrast()：Electron 28 内核 Chromium 120 不支持。 */
+  color: var(--btn-on-accent, #ffffff);
+  box-shadow: 0 2px 6px var(--accent-soft);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--btn-on-accent, #ffffff);
+  /* 阴影从 2px 抬到 4px + 透明度更高，"浮起来"感更强 */
+  box-shadow: 0 4px 12px var(--accent-soft-hover);
+}
+
+.btn-primary:disabled {
+  /* disabled 时把 box-shadow 也去掉，避免"按钮还有阴影"的迷惑感 */
+  box-shadow: none;
+}
+
+/* (audit fix Round 9: .btn-danger 死 CSS，已在文件头注释) */
+

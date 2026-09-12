@@ -1,0 +1,251 @@
+/* ===========================================================================
+   Scrollbar + Context Menu + Boot error
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ============================================================
+   Scrollbar
+   ============================================================ */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background var(--transition-fast);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ============================================================
+   Context Menu（右键菜单：阅读视图 + 编辑器共用）
+   ============================================================ */
+.context-menu {
+  position: fixed;
+  z-index: var(--z-modal);
+  min-width: 160px;
+  padding: var(--space-1);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  animation: context-menu-in 120ms var(--ease-out);
+  user-select: none;
+  /* 阻止菜单自身的文本被选中 */
+  -webkit-user-select: none;
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--fg-primary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  white-space: nowrap;
+}
+
+/* 右键菜单 hover：纯 --accent 文字在 accent-soft 底上"同色相对撞"。
+   改用 --accent-text：背景已明确"hover 中"，文字降彩度避免菜单里每一行
+   hover 时都"跳"出来一份硬彩文字。 */
+.context-menu-item:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.context-menu-item:active:not(:disabled) {
+  /* 给一点按下反馈 */
+  background: color-mix(in srgb, var(--accent-soft) 80%, transparent);
+}
+
+.context-menu-item:disabled {
+  color: var(--fg-tertiary);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.context-menu-separator {
+  height: 1px;
+  background: var(--border-subtle);
+  margin: var(--space-1) calc(var(--space-1) * 1);
+}
+
+@keyframes context-menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* ============================================================
+   Boot error fallback
+   ============================================================ */
+#boot-error {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-app);
+  color: var(--fg-primary);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-9);
+  z-index: var(--z-boot-error);
+  text-align: center;
+}
+
+#boot-error h2 {
+  color: var(--danger);
+  margin-bottom: var(--space-3);
+  font-size: var(--fs-2xl);
+}
+
+#boot-error p {
+  margin-bottom: var(--space-3);
+  color: var(--fg-secondary);
+}
+
+/* ============================================================
+   Focus Mode —— 隐藏所有 chrome，只留阅读视图
+   ============================================================ */
+
+/* 工具栏、侧栏、状态栏全部隐藏（保留定位以避免布局重排） */
+body[data-focus-mode="true"] .toolbar,
+body[data-focus-mode="true"] .sidebar,
+body[data-focus-mode="true"] .sidebar-splitter,
+body[data-focus-mode="true"] .statusbar,
+body[data-focus-mode="true"] .ai-chat-dock {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-fast, 120ms ease-out);
+}
+
+/*
+   BUG-3 fix (audit)：focus mode 下 .ai-chat-dock 即便被 opacity:0 隐藏，
+   仍然占据 body grid row 3 的自然高度（~88px），把 app-shell 高度挤掉。
+   这里在 focus mode 下用 display:none 真正释放 grid 空间；
+   用户退出 focus mode 后 controller 会重新挂 dock（见 ai-controller.bindMountPoint）。
+*/
+body[data-focus-mode="true"] .ai-chat-dock {
+  display: none;
+}
+
+/*
+   BUG-2 fix (audit)：focus mode + AI 同时打开时，dock 已 display:none 但
+   .app-ai 中间面板仍可见 —— 用户能看 diff 但无法输入新 prompt，违反 focus 语义。
+   这里把 .app-ai 也隐藏。退出 focus 后 ai-controller._syncGridFlag 重新切回
+   body[data-ai-diff-open="true"]，面板恢复可见。
+*/
+body[data-focus-mode="true"] .app-ai {
+  display: none;
+}
+
+/* 工具栏从顶部滑出（默认隐藏，hover 顶边热区时滑入） */
+body[data-focus-mode="true"] .toolbar {
+  transform: translateY(-100%);
+  transition: transform 180ms ease-out, opacity 180ms ease-out;
+}
+
+/* 顶部「热区」：默认脱离 grid 流（不影响 body 三行布局），
+   聚焦模式才显示。body 是 display:grid，若让 .focus-hotzone 占普通 grid cell
+   会抢走 row1（52px），把 .toolbar 挤到 row2、.app-shell 挤到 row3 状态栏行，
+   整个主区塌掉。默认 display:none + position:fixed 让它不占格、不挡操作；
+   聚焦模式再开启 display:block + pointer-events:auto 接管事件。 */
+.focus-hotzone {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  width: auto;
+  height: 14px;
+  z-index: var(--z-toolbar, 100);
+  display: none;
+  pointer-events: none;
+}
+body[data-focus-mode="true"] .focus-hotzone {
+  display: block;
+  pointer-events: auto;
+}
+body[data-focus-mode="true"]:has(.focus-hotzone:hover) .toolbar {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+/* 聚焦模式时，去掉 app-shell 的网格第一列（侧栏）和状态栏高度，
+   整个窗口让位给阅读视图。
+   状态栏占位约 28px，去掉后内容自动撑满；
+   侧栏 width: 0 让 reader/viewer 直接吃满 viewport。 */
+body[data-focus-mode="true"] .app-shell {
+  grid-template-columns: 0 0 minmax(0, 1fr);
+}
+body[data-focus-mode="true"][data-editor-mode="split"] .app-shell {
+  grid-template-columns: 0 0 minmax(0, 1fr);
+}
+body[data-focus-mode="true"][data-editor-mode="split"] .editor-pane,
+body[data-focus-mode="true"][data-editor-mode="split"] .splitter {
+  display: none !important;
+}
+
+/* 退出聚焦的提示：聚焦模式时显示一个右下角的「退出」按钮 + 状态条。
+   平时默认隐藏；鼠标在窗口内悬停 600ms 后显出，避免一进入 focus 就跳提示。 */
+.focus-exit-hint {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: var(--z-toolbar, 100);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 6px 12px;
+  font-size: var(--fs-xs);
+  color: var(--fg-tertiary);
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  transition: opacity 600ms ease-out;
+  pointer-events: none;
+}
+.focus-exit-hint kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  background: var(--bg-card);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  margin: 0 1px;
+}
+body[data-focus-mode="true"]:hover .focus-exit-hint {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+

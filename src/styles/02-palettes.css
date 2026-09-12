@@ -1,0 +1,500 @@
+/* ===========================================================================
+   Palettes × Themes —— 收敛表达
+   Stage 4a.2：用「主题骨架 + palette 差异补丁」替代原 10 块字符级复制
+
+   设计思路：
+     所有 palette × theme 共享同一组 token 表达（bg-hover / bg-active / 阴影
+     / scrollbar / 边框等），但每个 palette 在每个 theme 下各自有自己的
+     视觉个性（accent 色、带色相的 bg / fg）。
+
+     所以分两层：
+     1. 主题骨架（深 / 浅）：定义所有「主题相关但 palette 无感」的 token。
+        主题骨架只装「公共部分」，不装任何 palette 个性。
+     2. palette 差异补丁：每块只覆盖该 palette 的 accent 系列 + 带色相的
+        bg/fg/text + markdown 配色 + toolbar-divider。其余 token 走主题骨架。
+
+   选择器特异性：
+     - [data-theme="dark"]            (0,1,1)
+     - [data-theme-palette="X"][data-theme="Y"]  (0,2,0)
+     后者更高，所以 palette 块能覆盖主题骨架。
+   =========================================================================== */
+
+/* ---------- Dark Theme Skeleton ----------
+   暗色通用 token —— 5 个 palette 的暗色版共享这些。
+   palette 块只覆盖带色相部分（accent + 自身 bg/fg/md-*）。
+*/
+[data-theme="dark"] {
+  /* 背景交互态：所有暗色 palette 都用白叠加 */
+  --bg-hover: rgba(255, 255, 255, 0.04);
+  --bg-active: rgba(255, 255, 255, 0.08);
+
+  /* 边框：所有暗色 palette 浅边用白叠加、强边用更深的白 */
+  --border-subtle: rgba(255, 255, 255, 0.04);
+  --border-strong: rgba(255, 255, 255, 0.12);
+
+  /* 滚动条 */
+  --scrollbar-thumb: rgba(255, 255, 255, 0.10);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.20);
+
+  /* 阴影：暗色下更深 */
+  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.25), 0 1px 2px rgba(0, 0, 0, 0.15);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.32), 0 2px 4px rgba(0, 0, 0, 0.16);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.42), 0 4px 8px rgba(0, 0, 0, 0.25);
+  /* --shadow-glow 由 palette 设（带 accent-soft） */
+
+  /* 语义色：所有暗色 palette 统一
+     audit fix (H4/H5)：--danger 由 #ff6b6b → #d23636（white-on-bg 对比从 2.2:1
+     提到 4.86:1，AA 通过）。btn-danger / error chip 都用这个 token，统一收敛。 */
+  --danger: #d23636;
+  --btn-on-danger: #ffffff;
+  --warning: #ffb454;
+  --success: #5ad19a;
+
+  /* Markdown 通用（不带色相）：所有暗色 palette 都用白叠加 */
+  --md-table-border: rgba(255, 255, 255, 0.08);
+  --md-table-stripe: rgba(255, 255, 255, 0.02);
+  --md-table-header-bg: rgba(255, 255, 255, 0.04);
+  --md-hr: rgba(255, 255, 255, 0.08);
+  /* --md-blockquote-* / --md-inline-code-bg / --md-code-bg / --md-link 由 palette 设 */
+  --md-heading: var(--fg-primary);
+
+  /* ── 文字版语义色 ───────────────────────────────────────────────
+     用途：状态栏 chip 字、AI 错误小字、表单 hint、设置卡 selected label
+     等 11-14px 的有色正文。装饰色（warning / danger / success / accent）
+     为图标、边框、圆点、单字符（AI diff +/-）设计，直接套到正文字符上
+     会因高彩度小字"振动"看着累。这里取 60-65% 装饰色 + 35-40%
+     fg-primary 调和：色相仍可识别（暖橙 / 红 / 绿 / 蓝调），但 chroma
+     降到不会刺眼的程度。
+     比例选择：
+       dark 用 60% 装饰色 —— 深底 fg-primary 偏白，混出"暖白"效果。
+       light 用 70% 装饰色 —— 浅底 fg-primary 偏黑，需要更高的色比保证
+       文字可见度，70% 仍比 100% 纯色温和一档。
+     边界：borders / dots / icons / 单字符 +/- 继续用纯 *（不退色），
+     详见各组件 CSS 注释。 */
+  --warning-text: color-mix(in srgb, var(--warning) 60%, var(--fg-primary));
+  --danger-text:  color-mix(in srgb, var(--danger)  60%, var(--fg-primary));
+  --accent-text:  color-mix(in srgb, var(--accent)  65%, var(--fg-primary));
+}
+
+/* ---------- Light Theme Skeleton ---------- */
+[data-theme="light"] {
+  --bg-hover: rgba(0, 0, 0, 0.04);
+  --bg-active: rgba(0, 0, 0, 0.07);
+
+  --border-subtle: rgba(0, 0, 0, 0.04);
+  --border-strong: rgba(0, 0, 0, 0.14);
+
+  --scrollbar-thumb: rgba(0, 0, 0, 0.14);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.26);
+
+  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.035), 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.07), 0 2px 4px rgba(0, 0, 0, 0.035);
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.09), 0 4px 12px rgba(0, 0, 0, 0.05);
+  /* --shadow-glow 由 palette 设（带 accent-soft） */
+
+  /* audit fix (H4/H5)：light --danger 由 #e54848 → #c52424（white-on-bg 对比从
+     3.93:1 提到 5.84:1，AA 通过）。--warning / --success 本身对比足够，未动。 */
+  --danger: #c52424;
+  --btn-on-danger: #ffffff;
+  --warning: #d97706;
+  --success: #10b981;
+
+  --md-table-border: rgba(0, 0, 0, 0.08);
+  --md-table-stripe: rgba(0, 0, 0, 0.02);
+  --md-table-header-bg: rgba(0, 0, 0, 0.03);
+  --md-hr: rgba(0, 0, 0, 0.08);
+  --md-heading: var(--fg-primary);
+
+  /* 文字版语义色（与 dark 段对应注释）。light 底 fg-primary 偏黑，
+     用 70% 装饰色让色相仍清晰，但比纯色温和：避免红字"扎眼"、橙字"泛酸"。 */
+  --warning-text: color-mix(in srgb, var(--warning) 70%, var(--fg-primary));
+  --danger-text:  color-mix(in srgb, var(--danger)  70%, var(--fg-primary));
+  --accent-text:  color-mix(in srgb, var(--accent)  70%, var(--fg-primary));
+}
+
+/* ===========================================================================
+   Palette overrides —— 每个块只覆盖该 palette 个性化的 token
+   =========================================================================== */
+
+/* ---------- Default (Linear 风格：近黑中性底 + indigo) ----------
+   兜底：body 上没有 data-theme-palette 时也应用 default（兼容未挂属性场景）。 */
+body:not([data-theme-palette]),
+[data-theme-palette="default"][data-theme="dark"] {
+  --bg-app: #08090a;
+  --bg-toolbar: rgba(8, 9, 10, 0.85);
+  --bg-sidebar: rgba(255, 255, 255, 0.022);
+  --bg-viewer: #08090a;
+  --bg-elevated: #16171a;
+  --bg-card: #101113;
+  --bg-card-hover: #191a1d;
+
+  --fg-primary: #f7f8f8;
+  --fg-secondary: #b0b6c0;
+  --fg-tertiary: #8e95a1;
+  --fg-muted: #6c7178;
+
+  --border-default: rgba(255, 255, 255, 0.06);
+
+  /* audit fix (H4/H5)：--accent 由 #7883e0 → #4f5ec7（white-on-bg 对比从 3.46:1
+     提到 5.6:1，AA 通过）。其它 indigo 调色板都是浅 accent 配深色字（--btn-on-accent
+     = #1a232e），已经满足 AA，无需调。 */
+  --accent: #4f5ec7;
+  --btn-on-accent: #ffffff;
+  --accent-hover: #6473d3;
+  --accent-soft: rgba(79, 94, 199, 0.22);
+  --accent-soft-hover: rgba(79, 94, 199, 0.28);
+  --accent-selection: rgba(79, 94, 199, 0.50);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #101113;
+  --md-code-text: #e6e9f1;
+  --md-inline-code-bg: rgba(120, 131, 224, 0.20);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  /* indigo 在近黑底只有 4.2:1，链接调亮一档（2026-08 进一步提亮到 ~7:1） */
+  --md-link: #a3aaef;
+  --md-link-hover: #b8bef4;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(255, 255, 255, 0.08) 50%, transparent 100%);
+}
+
+[data-theme-palette="default"][data-theme="light"] {
+  --bg-app: #fbfbfc;
+  --bg-toolbar: rgba(255, 255, 255, 0.85);
+  --bg-sidebar: #f4f5f8;
+  --bg-viewer: #fbfbfc;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f7f8f9;
+
+  --fg-primary: #282a30;
+  --fg-secondary: #525968;
+  --fg-tertiary: #676e7d;
+  --fg-muted: #767b83;
+
+  --border-default: rgba(0, 0, 0, 0.07);
+
+  --accent: #5e6ad2;
+  --btn-on-accent: #ffffff;
+  --accent-hover: #4d58bd;
+  --accent-soft: rgba(94, 106, 210, 0.12);
+  --accent-soft-hover: rgba(94, 106, 210, 0.16);
+  --accent-selection: rgba(94, 106, 210, 0.28);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #f4f5f8;
+  --md-code-text: #282a30;
+  --md-inline-code-bg: rgba(94, 106, 210, 0.10);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  /* light 主题的 --md-link 用比 accent 更深的色：modal 卡片底色浅（#eceefa / #e2eff5 / #e6f1ea / #faeae7），
+     直接用 accent 只剩 3.5-4.0:1，不达 WCAG AA（4.5:1）。这里给每个 light 调色板独立加深。 */
+  --md-link: #4244a8;
+  --md-link-hover: #2f3082;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(0, 0, 0, 0.08) 50%, transparent 100%);
+}
+
+/* ---------- Ocean (深海军 + 青绿) ---------- */
+[data-theme-palette="ocean"][data-theme="dark"] {
+  --bg-app: #0b141d;
+  --bg-toolbar: rgba(11, 20, 29, 0.85);
+  --bg-sidebar: rgba(180, 210, 235, 0.04);
+  --bg-viewer: #0b141d;
+  --bg-elevated: #131e2a;
+  --bg-card: #16212e;
+  --bg-card-hover: #1c2837;
+
+  --fg-primary: #e3ecf3;
+  --fg-secondary: #c4d2dc;
+  --fg-tertiary: #96b1c6;
+  --fg-muted: #6c8090;
+
+  --border-default: rgba(180, 210, 235, 0.08);
+
+  --accent: #6cc5e6;
+  --btn-on-accent: #1a232e;
+  --accent-hover: #85d2ee;
+  --accent-soft: rgba(108, 197, 230, 0.20);
+  --accent-soft-hover: rgba(108, 197, 230, 0.26);
+  --accent-selection: rgba(108, 197, 230, 0.48);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #111923;
+  --md-code-text: #cbd6e0;
+  --md-inline-code-bg: rgba(108, 197, 230, 0.18);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #85d2ee;
+  --md-link-hover: #9cdcf2;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(180, 210, 235, 0.08) 50%, transparent 100%);
+}
+
+[data-theme-palette="ocean"][data-theme="light"] {
+  --bg-app: #eef4f8;
+  --bg-toolbar: rgba(255, 255, 255, 0.85);
+  --bg-sidebar: #e5eef5;
+  --bg-viewer: #eef4f8;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #eef4f8;
+
+  --fg-primary: #0f1d2a;
+  --fg-secondary: #34465a;
+  --fg-tertiary: #4f697a;
+  --fg-muted: #6a7d8d;
+
+  --border-default: rgba(15, 40, 70, 0.08);
+
+  --accent: #0e7da8;
+  --btn-on-accent: #ffffff;
+  --accent-hover: #0a688d;
+  --accent-soft: rgba(14, 125, 168, 0.12);
+  --accent-soft-hover: rgba(14, 125, 168, 0.16);
+  --accent-selection: rgba(14, 125, 168, 0.30);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #e7eef4;
+  --md-code-text: #0f1d2a;
+  --md-inline-code-bg: rgba(14, 125, 168, 0.08);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #084060;
+  --md-link-hover: #05304a;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(15, 40, 70, 0.08) 50%, transparent 100%);
+}
+
+/* ---------- Forest (松黑 + 翠玉) ---------- */
+[data-theme-palette="forest"][data-theme="dark"] {
+  --bg-app: #0e1410;
+  --bg-toolbar: rgba(14, 20, 16, 0.85);
+  --bg-sidebar: rgba(180, 210, 190, 0.04);
+  --bg-viewer: #0e1410;
+  --bg-elevated: #16201a;
+  --bg-card: #19251e;
+  --bg-card-hover: #1f2d26;
+
+  --fg-primary: #e6efe8;
+  --fg-secondary: #c4d4ca;
+  --fg-tertiary: #9eb3a4;
+  --fg-muted: #6c7d72;
+
+  --border-default: rgba(180, 210, 190, 0.08);
+
+  --accent: #76c78d;
+  --btn-on-accent: #1a232e;
+  --accent-hover: #8dd4a3;
+  --accent-soft: rgba(118, 199, 141, 0.20);
+  --accent-soft-hover: rgba(118, 199, 141, 0.26);
+  --accent-selection: rgba(118, 199, 141, 0.48);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #141c16;
+  --md-code-text: #cad7ce;
+  --md-inline-code-bg: rgba(118, 199, 141, 0.18);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #8dd4a3;
+  --md-link-hover: #a4e0b9;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(180, 210, 190, 0.08) 50%, transparent 100%);
+}
+
+[data-theme-palette="forest"][data-theme="light"] {
+  --bg-app: #f0f5f1;
+  --bg-toolbar: rgba(255, 255, 255, 0.85);
+  --bg-sidebar: #e6efe9;
+  --bg-viewer: #f0f5f1;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f0f5f1;
+
+  --fg-primary: #102018;
+  --fg-secondary: #34483c;
+  --fg-tertiary: #4f6356;
+  --fg-muted: #6d7e73;
+
+  --border-default: rgba(20, 55, 30, 0.08);
+
+  --accent: #2c8c52;
+  --btn-on-accent: #000000;
+  --accent-hover: #227544;
+  --accent-soft: rgba(44, 140, 82, 0.12);
+  --accent-soft-hover: rgba(44, 140, 82, 0.16);
+  --accent-selection: rgba(44, 140, 82, 0.30);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #e8efe9;
+  --md-code-text: #102018;
+  --md-inline-code-bg: rgba(44, 140, 82, 0.08);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #1a5a30;
+  --md-link-hover: #0f4220;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(20, 55, 30, 0.08) 50%, transparent 100%);
+}
+
+/* ---------- Lavender (茄紫 + 粉紫) ---------- */
+[data-theme-palette="lavender"][data-theme="dark"] {
+  --bg-app: #14101a;
+  --bg-toolbar: rgba(20, 16, 26, 0.85);
+  --bg-sidebar: rgba(200, 180, 220, 0.04);
+  --bg-viewer: #14101a;
+  --bg-elevated: #1d1726;
+  --bg-card: #211a2c;
+  --bg-card-hover: #282034;
+
+  --fg-primary: #ece6f2;
+  --fg-secondary: #d0c5dc;
+  --fg-tertiary: #a99cc0;
+  --fg-muted: #76688c;
+
+  --border-default: rgba(200, 180, 220, 0.08);
+
+  --accent: #c89ce8;
+  --btn-on-accent: #1a232e;
+  --accent-hover: #d4abee;
+  --accent-soft: rgba(200, 156, 232, 0.20);
+  --accent-soft-hover: rgba(200, 156, 232, 0.26);
+  --accent-selection: rgba(200, 156, 232, 0.48);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #1a1423;
+  --md-code-text: #d3cce0;
+  --md-inline-code-bg: rgba(200, 156, 232, 0.18);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #d4abee;
+  --md-link-hover: #e0baf3;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(200, 180, 220, 0.08) 50%, transparent 100%);
+}
+
+[data-theme-palette="lavender"][data-theme="light"] {
+  --bg-app: #f5f0fa;
+  --bg-toolbar: rgba(255, 255, 255, 0.85);
+  --bg-sidebar: #ebe4f3;
+  --bg-viewer: #f5f0fa;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f5f0fa;
+
+  --fg-primary: #1a1228;
+  --fg-secondary: #3d3252;
+  --fg-tertiary: #5d4f7a;
+  --fg-muted: #6c5f86;
+
+  --border-default: rgba(60, 30, 90, 0.08);
+
+  --accent: #7c3aaf;
+  --btn-on-accent: #ffffff;
+  --accent-hover: #6a2f95;
+  --accent-soft: rgba(124, 58, 175, 0.12);
+  --accent-soft-hover: rgba(124, 58, 175, 0.16);
+  --accent-selection: rgba(124, 58, 175, 0.30);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #ebe2f2;
+  --md-code-text: #1a1228;
+  --md-inline-code-bg: rgba(124, 58, 175, 0.08);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #5e1f8a;
+  --md-link-hover: #421560;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(60, 30, 90, 0.08) 50%, transparent 100%);
+}
+
+/* ---------- Sunset (酒红 + 桃粉) ---------- */
+[data-theme-palette="sunset"][data-theme="dark"] {
+  --bg-app: #1a0e14;
+  --bg-toolbar: rgba(26, 14, 20, 0.85);
+  --bg-sidebar: rgba(220, 170, 180, 0.04);
+  --bg-viewer: #1a0e14;
+  --bg-elevated: #261520;
+  --bg-card: #2c1a26;
+  --bg-card-hover: #34212e;
+
+  --fg-primary: #f4e6ea;
+  --fg-secondary: #d8c5cc;
+  --fg-tertiary: #b598a8;
+  --fg-muted: #806878;
+
+  --border-default: rgba(220, 170, 180, 0.08);
+
+  --accent: #ffa091;
+  --btn-on-accent: #1a232e;
+  --accent-hover: #ffb1a4;
+  --accent-soft: rgba(255, 160, 145, 0.20);
+  --accent-soft-hover: rgba(255, 160, 145, 0.26);
+  --accent-selection: rgba(255, 160, 145, 0.48);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #20131a;
+  --md-code-text: #dccdd2;
+  --md-inline-code-bg: rgba(255, 160, 145, 0.18);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #ffb1a4;
+  --md-link-hover: #ffc2b6;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(220, 170, 180, 0.08) 50%, transparent 100%);
+}
+
+[data-theme-palette="sunset"][data-theme="light"] {
+  --bg-app: #fbf2ee;
+  --bg-toolbar: rgba(255, 255, 255, 0.85);
+  --bg-sidebar: #f3e6e1;
+  --bg-viewer: #fbf2ee;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #fbf2ee;
+
+  --fg-primary: #2a121a;
+  --fg-secondary: #48303a;
+  --fg-tertiary: #6b4d58;
+  --fg-muted: #7b636c;
+
+  --border-default: rgba(80, 30, 40, 0.08);
+
+  --accent: #d94f3a;
+  --btn-on-accent: #000000;
+  --accent-hover: #bf3f2d;
+  --accent-soft: rgba(217, 79, 58, 0.12);
+  --accent-soft-hover: rgba(217, 79, 58, 0.16);
+  --accent-selection: rgba(217, 79, 58, 0.30);
+
+  --shadow-glow: 0 0 0 3px var(--accent-soft);
+
+  --md-code-bg: #f1e3dd;
+  --md-code-text: #2a121a;
+  --md-inline-code-bg: rgba(217, 79, 58, 0.08);
+  --md-blockquote-border: var(--accent);
+  --md-blockquote-bg: var(--accent-soft);
+  --md-link: #8e1f10;
+  --md-link-hover: #621208;
+
+  --toolbar-divider: linear-gradient(90deg,
+    transparent 0%, rgba(80, 30, 40, 0.08) 50%, transparent 100%);
+}

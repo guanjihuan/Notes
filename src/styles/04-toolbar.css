@@ -1,0 +1,565 @@
+/* ===========================================================================
+   Toolbar + App Shell
+   自动从 src/styles.css 拆分（Stage 4a）
+   =========================================================================== */
+
+/* ============================================================
+   Toolbar (custom titlebar)
+   ============================================================ */
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--h-toolbar);
+  /* 右侧用更小的内边距，避免在默认 1200px 窗口下按钮组被裁；
+     顶部标题区仍保留 --space-5 的呼吸感 */
+  padding: 0 4px 0 var(--space-5);
+  background: var(--bg-toolbar);
+  /* audit fix (P2)：去掉 backdrop-filter —— toolbar 在 bg-toolbar 实色之上，
+     毛玻璃的 saturate(180%) blur(20px) 强制把整条 1200×40 px 区域放到独立
+     compositor layer，且每帧滚动主内容时 GPU 都要重算这条带覆盖区域的模糊。
+     视觉上完全无差异（实色背景上看不出毛玻璃），但每次滚动都是几十 KB 像素的
+     重复 GPU 工作。 */
+  border-bottom: 1px solid var(--border-subtle);
+  z-index: var(--z-toolbar);
+  position: relative;
+  /*
+    长文件名截断（fix：长文件名导致 toolbar 偏移）：
+    - toolbar 是 body grid 子元素，min-width 默认是 auto = min-content。
+      .app-title-text 的 white-space:nowrap + 长文本让 min-content 极大，
+      toolbar 默认会撑到比视口还宽，把 .toolbar-right（关闭等按钮）挤出视口。
+    - min-width:0 覆盖默认 min-content，让 toolbar 接受 body grid 给它的宽度
+    - overflow:hidden 兜底：万一有其他内容溢出，clip 在 toolbar 内部而不是溢出到 body
+      （body 也是 overflow:hidden，但那是最后一道防线，视觉上能看到 toolbar 自身的偏移）
+  */
+  min-width: 0;
+  overflow: hidden;
+}
+
+.toolbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--toolbar-divider);
+}
+
+.drag-region {
+  -webkit-app-region: drag;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  height: 100%;
+  padding-left: 2px;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* 工具栏分组：将同一类别的按钮聚拢（视觉相邻），组间用 divider 隔开 */
+.toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.toolbar-divider {
+  display: inline-block;
+  width: 1px;
+  height: 18px;
+  /* 用半透明白色渐变，比纯色 border 更精致；亮主题用对应浅色 */
+  background: linear-gradient(180deg,
+    transparent 0%,
+    var(--border-default) 25%,
+    var(--border-default) 75%,
+    transparent 100%);
+  /* 从 6px 减到 5px：默认 1200px 窗口下 6 个分组 + 7 个 divider 累计 84px gap，
+     改 5px 后 70px，让工具栏横向更紧凑 */
+  margin: 0 5px;
+  flex-shrink: 0;
+}
+
+.app-title {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--fg-primary);
+  letter-spacing: var(--tracking-wide);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  /* 选中态：避免拖拽时被高亮 */
+  user-select: none;
+  /*
+    长文件名截断（fix：长文件名导致 toolbar 偏移）：
+    - min-width:0 是关键 —— flex 容器默认 min-content 是整段文本，
+      没有它 .app-title 会拒绝收缩，把 .toolbar-right（按钮组）挤出视口右侧
+    - overflow:hidden 让超出部分不可见，配合 .app-title-text 的 ellipsis 截断
+  */
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+/*
+  长文件名截断（fix：长文件名导致 toolbar 偏移）：
+  - 真正承载文本的子 span —— 直接文本节点在 flex 容器里无法触发 ellipsis
+  - min-width:0 + flex:1 1 auto 让它优先吃光可用空间，超出才走截断
+  - text-overflow:ellipsis + white-space:nowrap 让长文件名从右侧省略
+*/
+.app-title-text {
+  display: block;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-title::before {
+  content: "";
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.18),
+    0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  /* 固定图标尺寸，不参与收缩（flex-shrink:0） */
+  flex: 0 0 auto;
+}
+
+/* 应用图标（来自 icon.ico 的 PNG data URL）：
+   - 20×20 + 6px 圆角，与 .app-title::before 占位形状一致，替换它而不是叠加
+   - draggable="false" 防选中后拖出浏览器（默认 <img> 选中状态可拖）
+   - 与 .app-title 共享同一行（display:flex 在 .toolbar-left） */
+.app-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  flex: 0 0 auto;
+  /* 与 ::before 占位的多层 box-shadow 对齐，亮 / 暗主题下都不漂浮 */
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.18),
+    0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+/* 真图标加载成功 → 隐藏 .app-title::before 占位，避免双图标 */
+body.has-app-icon .app-title::before {
+  display: none;
+}
+
+/* Toolbar 按钮：图标按钮 + 悬浮效果
+   默认色用 secondary（暗色 ~8.5:1, 亮色 ~8:1），
+   旧值 secondary 在暗色仅 ~5.5:1，加上 13px 字号看着发灰，2026-08 统一提亮 */
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-secondary);
+  /* 加 transition 阴影和位移，让 hover 反馈更细腻 */
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    transform var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.btn-icon:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.btn-icon:active {
+  /* scale 从 0.94 减到 0.96：原值 0.94 在 34px 按钮上缩 2px，
+     视觉跳动明显；0.96 只缩 1px，反馈更克制 */
+  background: var(--bg-active);
+  transform: scale(0.96);
+}
+
+.btn-icon.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.btn-icon.is-active:hover {
+  background: var(--accent-soft-hover);
+}
+
+.window-controls {
+  display: flex;
+  align-items: center;
+  margin-left: 4px;
+  /* 让最右侧的关闭按钮贴齐视口右沿（沿用平台常见 UX），但避免裁掉 hover 区；
+     之前用 -8px 时会把按钮裁进视口外 8px。改为 -2px 把贴边视觉压回视口内 */
+  margin-right: -2px;
+  gap: 0;
+  /* 用渐变分隔线替代纯色 —— 比 border 精致，符合 macOS 视觉 */
+  position: relative;
+}
+.window-controls::before {
+  content: "";
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 20px;
+  width: 1px;
+  background: linear-gradient(180deg,
+    transparent 0%,
+    var(--border-default) 25%,
+    var(--border-default) 75%,
+    transparent 100%);
+}
+
+.btn-window {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  /* 同 .btn-icon：用 secondary 替代 tertiary，避免暗色下窗口控制按钮发灰 */
+  color: var(--fg-secondary);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.btn-window:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.btn-window.btn-close:hover {
+  background: var(--danger);
+  color: var(--btn-on-danger, #ffffff);
+}
+
+/* 工具栏按钮组（视图模式三连按钮） */
+.btn-group {
+  display: inline-flex;
+  align-items: center;
+  /* 按钮组之间的间距由 .toolbar-divider 提供，这里去掉额外 margin-left */
+  margin-left: 0;
+  gap: 1px;
+  /* padding: 2px + 按钮 30px = 34px，与外层独立 .btn-icon 同高，保证视觉对齐 */
+  padding: 2px;
+  /* 容器底色比 hover 更轻，避免和单个按钮 hover 态重叠太深 */
+  background: color-mix(in srgb, var(--bg-hover) 70%, transparent);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 0 0 0 1px var(--border-subtle);
+}
+
+.btn-group .btn-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 5px;
+}
+
+.btn-group .btn-icon:hover:not(.is-active) {
+  background: var(--bg-hover);
+}
+
+.btn-group .btn-icon.is-active {
+  background: var(--bg-elevated);
+  color: var(--accent);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* 图标 + 文字按钮（视图模式专用）：
+   让核心交互（预览/编辑/双栏）一眼可识别，
+   同时保留 segmented control 的紧凑感。
+   12px 字号 + secondary（暗色 ~8.5:1）才能保证文字不糊；
+   2026-08 把 secondary 从 ~5.5:1 提到 ~8.5:1 后视图模式按钮显著更清晰 */
+.btn-icon-text {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 5px;
+  color: var(--fg-secondary);
+  font-size: var(--fs-xs-readable);
+  font-weight: 500;
+  letter-spacing: var(--tracking-wide);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    transform var(--transition-fast);
+  white-space: nowrap;
+}
+
+.btn-icon-text:hover:not(.is-active) {
+  background: var(--bg-hover);
+}
+
+.btn-icon-text:active {
+  transform: scale(0.96);
+}
+
+.btn-icon-text .btn-label {
+  line-height: 1;
+  /* 与按钮对齐基线 */
+}
+
+.btn-icon-text.is-active {
+  background: var(--bg-elevated);
+  /* 文字版（--accent-text）：view mode "预览 / 编辑 / 双栏"、autosave "自动保存"
+     这种带字按钮 active 时若用纯 accent，"预览" "自动保存" 在工具栏里整片
+     accent 短词同时亮起来会让眼睛辛苦。降一档后 bg-elevated + inset 1px
+     accent 边框仍清楚表达"按下"，文字不再贴脸 */
+  color: var(--accent-text);
+  font-weight: 600;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* (audit fix Round 9: .toolbar-status-dot / .btn-icon-text > .toolbar-status-dot
+   死 CSS —— 保存按钮改 is-dirty 状态后该指示点彻底弃用，见
+   feedback-save-button-always-visible.md。iOS pill switch 替代品见下) */
+
+/* iOS pill switch —— 替代 .toolbar-status-dot 作为开关语义。
+   26×14px 嵌入 .btn-icon-text，与现有 24px 按钮中线对齐。
+   视觉态由 [aria-pressed="true|false"] 选择器驱动，与项目
+   「aria-pressed 表示开关态」的模式一致（参考 btn-theme）。
+   保留 .btn-icon-text 外壳让按钮仍享有 hover/active 视觉反馈。 */
+.toolbar-toggle .toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 26px;
+  height: 14px;
+  margin-left: 4px;
+  flex: 0 0 auto;
+}
+.toolbar-toggle .toggle-switch-track {
+  position: absolute;
+  inset: 0;
+  background: var(--fg-muted);
+  opacity: 0.5;
+  border-radius: 7px;
+  transition: background var(--transition-fast), opacity var(--transition-fast);
+}
+.toolbar-toggle .toggle-switch-thumb {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 12px;
+  height: 12px;
+  background: var(--bg-elevated);
+  border-radius: 50%;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+  transition: transform var(--transition-fast);
+}
+.toolbar-toggle[aria-pressed="true"] .toggle-switch-track {
+  background: var(--accent);
+  opacity: 1;
+}
+.toolbar-toggle[aria-pressed="true"] .toggle-switch-thumb {
+  transform: translateX(12px);
+}
+/* hover 微微提亮，与其它 btn-icon-text hover 一致 */
+.toolbar-toggle:hover .toggle-switch-track { opacity: 0.85; }
+.toolbar-toggle[aria-pressed="true"]:hover .toggle-switch-track { opacity: 1; }
+/* 关态时整体暗化，与工具栏 fg-tertiary 一致，强调「关闭」语义 */
+.toolbar-toggle[aria-pressed="false"] {
+  color: var(--fg-tertiary);
+}
+/* a11y：prefers-reduced-motion 下关闭 transform 过渡 */
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-toggle .toggle-switch-track,
+  .toolbar-toggle .toggle-switch-thumb { transition: none; }
+}
+
+.btn-icon.is-dirty,
+.btn-icon-text.is-dirty {
+  /* 脏状态：使用 warning 色作为视觉提示，并轻微脉动 */
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  animation: dirty-pulse 1.8s ease-in-out infinite;
+}
+
+.btn-icon.is-dirty:hover,
+.btn-icon-text.is-dirty:hover {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 18%, transparent);
+}
+
+/* 保存中：与 is-dirty 的 warning 区分，用 fg-secondary 中性色 + 微微透明度。
+   cursor: progress 给鼠标用户明确提示（参见 [[feedback-save-button-always-visible]]
+   ——按钮始终可见，这里只是临时视觉变化，不切换 hidden）。 */
+.btn-icon.is-saving,
+.btn-icon-text.is-saving {
+  cursor: progress;
+  opacity: 0.6;
+  color: var(--fg-secondary);
+  background: var(--bg-hover);
+  /* 关掉 dirty-pulse 动画：避免 is-saving + is-dirty 叠加造成闪烁 */
+  animation: none;
+}
+/* a11y：prefers-reduced-motion 下保持稳定视觉，不透明度也保留 */
+@media (prefers-reduced-motion: reduce) {
+  .btn-icon.is-saving,
+  .btn-icon-text.is-saving {
+    opacity: 0.7;
+    cursor: progress;
+  }
+}
+
+/* 主题按钮图标：按当前主题显示"代表当前状态"的那一态——
+   暗色主题下显示月亮，亮色主题下显示太阳（点击图标会切到对侧主题）。
+   两个 SVG 同时存在于 DOM，靠 [data-theme] 切换可见性，免 JS 维护。 */
+#btn-theme .theme-icon {
+  display: none;
+}
+
+body[data-theme="dark"] #btn-theme .theme-icon-moon,
+body[data-theme="light"] #btn-theme .theme-icon-sun {
+  display: block;
+}
+
+/* (audit fix Round 9: .toolbar-status-dot 死 CSS，详见 04-toolbar.css 顶部注释) */
+
+/* dirty-pulse：脉动从 1 → 0.65 太深，warning 色按钮在 50% 帧会瞬间
+   看着像"warning 没了"。改成 1 → 0.78：仍能看出脉动，但始终保持 warning
+   视觉在场，"未保存"语义不中断。1.8s 节奏不变 */
+@keyframes dirty-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.78; }
+}
+
+/* 工具栏图标按钮的 disabled 态（如非 md 文件下 preview/split 按钮）
+   复用 .context-menu-item 的禁用色（fg-tertiary + opacity），保持一致 */
+.btn-icon:disabled,
+.btn-icon[disabled] {
+  color: var(--fg-tertiary);
+  cursor: not-allowed;
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* 图标+文字按钮（视图模式 预览/编辑/双栏）的 disabled 态。
+   非 Markdown 文件打开时 preview/split 按钮会被禁用 —— 这里让灰态视觉一致 */
+.btn-icon-text:disabled,
+.btn-icon-text[disabled] {
+  color: var(--fg-tertiary);
+  cursor: not-allowed;
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* 窄窗口（< 820px）：toolbar 文字标签隐藏，只保留图标。
+   与 sidebar 720px 阈值错开，留出中间过渡区，避免一次性把全部 toolbar 砍塌 */
+@media (max-width: 820px) {
+  .btn-icon-text .btn-label {
+    display: none;
+  }
+  .btn-icon-text {
+    /* 没文字时收紧 padding，让按钮保持图标按钮的紧凑感 */
+    padding: 0 6px;
+  }
+}
+
+/* ============================================================
+   App Shell
+   ============================================================ */
+.app-shell {
+  display: grid;
+  /* 侧栏宽度走 --sidebar-width（运行时可拖拽调整），默认值来自 --w-sidebar；
+     这样改 token 不必同时改 grid 模板，也避免与窄屏媒体查询耦合 */
+  grid-template-columns: var(--sidebar-width) 4px 1fr;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 侧栏拖拽分割条：只在 split / preview / edit 单栏模式下显示。
+   视觉宽度 4px。命中区扩到 ±6px（共 12px）：由 app.js 的 mountSidebarSplitter
+   监听 document mousedown + mousemove，在鼠标距 splitter 中线 ≤6px 时启动拖动，
+   并把光标改成 col-resize 提示可拖。这是 grid track 4px 限制下的标准做法。 */
+.sidebar-splitter {
+  background: var(--border-subtle);
+  cursor: col-resize;
+  position: relative;
+  width: 4px;
+  transition: background var(--transition-fast);
+}
+
+.sidebar-splitter:hover,
+.sidebar-splitter.is-dragging {
+  background: var(--accent-soft);
+}
+
+.sidebar-splitter::after {
+  /* 抓握提示：两条短竖线 */
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 1px;
+  height: 24px;
+  background: var(--border-default);
+  box-shadow: 3px 0 0 var(--border-default);
+}
+
+.sidebar-splitter:hover::after,
+.sidebar-splitter.is-dragging::after {
+  background: var(--accent);
+  box-shadow: 3px 0 0 var(--accent);
+}
+
+/* 侧栏恢复默认宽度按钮（hover splitter 时显形）
+   - 4px splitter 视觉宽度里塞不下按钮，所以按钮是 absolute 定位居中 + 视觉溢出；
+     但 splitter 本身 hover 区域扩到 ±6px（HIT_RADIUS），按钮顺势接管这块区域
+   - 默认 opacity:0 + pointer-events:none → 完全不挡 drag 命中区；
+     hover splitter / 按钮自身 / focus-visible 时显形 */
+.sidebar-splitter-reset {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 18px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+}
+.sidebar-splitter:hover .sidebar-splitter-reset,
+.sidebar-splitter-reset:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.sidebar-splitter-reset:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.sidebar-splitter-reset:active {
+  background: var(--accent);
+  color: var(--bg-card);
+}
+

@@ -1,0 +1,106 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "简洁的 Markdown 阅读器 - Markdown 文件与界面始终一致",
+  "main": "main.js",
+  "scripts": {
+    "start": "node scripts/launch.js",
+    "start:raw": "electron .",
+    "lint": "eslint .",
+    "check": "node scripts/check-syntax.js && node scripts/check-ipc.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "patch-package",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "keywords": [
+    "notes",
+    "markdown",
+    "reader",
+    "electron",
+    "desktop"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/state": "^6.4.1",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "@codemirror/view": "^6.28.0",
+    "codemirror": "^6.0.2",
+    "dompurify": "^3.1.0",
+    "marked": "^12.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "electron": "^44.0.0",
+    "electron-builder": "^26.15.3",
+    "eslint": "^9.39.5",
+    "jsdom": "^25.0.1",
+    "patch-package": "^8.0.1",
+    "vitest": "^2.1.9"
+  },
+  "build": {
+    "appId": "com.notes.app",
+    "productName": "Notes",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "main/**/*",
+      "preload.js",
+      "index.html",
+      "src/**/*",
+      "shared/**/*",
+      "icon.ico",
+      "data/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico"
+    },
+    "mac": {
+      "target": "dir",
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Office",
+      "icon": "icon.ico"
+    }
+  },
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "overrides": {
+    "@noble/hashes": "1.4.0"
+  },
+  "config": {
+    "electron_mirror": "https://registry.npmmirror.com/-/binary/electron/"
+  },
+  "allowScripts": {
+    "electron@44.0.0": true,
+    "electron-winstaller@5.4.0": true,
+    "esbuild@0.21.5": true
+  }
+}

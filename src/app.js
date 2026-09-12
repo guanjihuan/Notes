@@ -356,6 +356,36 @@ function syncDirtyFromEditor() {
 }
 
 /**
+ * AI 修复预览显隐 → 视图模式锁定
+ *
+ * AI 修复预览（中间 diff 面板）出现时：强制编辑器切到「编辑」模式；如果是预览 / 双栏
+ * 状态则一并跳到编辑。同时锁定模式 —— 期间不让切到 preview / split。
+ *
+ * AI 修复预览关闭时：解除模式锁，按当前 isMd 走回正常的 preview/split 禁用逻辑。
+ *
+ * 这是 ai-controller 的 onDiffOpenChange 回调的唯一职责，不在 controller 内做
+ * （controller 不依赖 DOM 视图细节，仅 fire 事件），也不在 syncBodyFlag 内做
+ * （避免 controller 与 DOM 操作耦合）。
+ *
+ * @param {boolean} isOpen
+ */
+function handleAiDiffOpenChange(isOpen) {
+  if (isOpen) {
+    // 锁模式到 edit —— toolbar 的 setModeLock 会让 selectMode / cycle / 外部 setMode
+    // 都被吸到 edit；用户点 preview / split 按钮、状态栏 chip、Ctrl+E 都无效。
+    editorToolbar.setModeLock('edit');
+    // 强制切到 edit（即使当前已经在 edit 也无副作用 —— applyEditorMode 内部走 _setDOM）。
+    // focus: false 避免偷焦点：用户可能在 AI 输入框里编辑 prompt，不应被打断。
+    applyEditorMode('edit', { focus: false });
+  } else {
+    // 解除锁；按持久化的 state.editorMode 走正常的 md/non-md 禁用逻辑
+    // （非 md 文件下 preview / split 仍会被禁用，md 文件恢复可选）。
+    editorToolbar.setModeLock(null);
+    applyEditorMode(state.editorMode, { focus: false });
+  }
+}
+
+/**
  * 同步侧栏底部 AI 按钮的 pressed 态 / hint —— 模块级 helper，被 mountAiPanel
  * 的 click handler 与 bootstrap 的 onToggleAi 快捷键 handler 共享。
  * 单一入口，避免三处（点击 / 快捷键 / MutationObserver）重复更新导致
@@ -1384,6 +1414,9 @@ function mountAiPanel() {
     // 期间手动点 AI 入口（btn-ai / 状态栏 chip / 快捷键）会让 dock 透出 modal 背景后，
     // 视觉重叠 + 误点。controller 用这个 getter 在 togglePanel 里把住开关。
     isSettingsOpen: () => state.settingsDialogOpen,
+    // AI 修复预览面板（中间 diff 面板）显隐 → 视图模式锁定。打开时强制
+    // 切到编辑模式 + 禁用预览 / 双栏切换；关闭时还原。具体逻辑见 handleAiDiffOpenChange。
+    onDiffOpenChange: handleAiDiffOpenChange,
   });
   // 挂载 chat dock + diff 面板到各自的 DOM 容器
   if (els.aiChatDock && els.appAi) {
@@ -3594,6 +3627,21 @@ function mountAiSplitter() {
     return Math.abs(clientX - (r.x + r.width / 2));
   }
 
+  // 拖动起点的方向符号：AI 面板的列位置随模式变（split: AI 在 splitter 左 / 拖右 = AI
+  // 变大；preview/edit + focus: AI 在 splitter 右且贴窗口右边缘 / 拖右 AI 向左扩张、
+  // splitter 视觉左移 → 与鼠标反向）。每次拖动重新比较 getBoundingClientRect：
+  //   splitter.x >= aiPanel.right ⇒ AI 在 splitter 左侧 ⇒ +1（鼠标右移 AI 变大）
+  //   splitter.x <  aiPanel.left  ⇒ AI 在 splitter 右侧 ⇒ -1（鼠标右移 AI 变小）
+  // 两边都不成立（splitter 跟 AI 重叠 / 不可见）兜底 +1，避免异常路径写出 0 宽度。
+  function getDragSign() {
+    if (!els.appAi || !els.aiSplitter) return 1;
+    const ai = els.appAi.getBoundingClientRect();
+    const sp = els.aiSplitter.getBoundingClientRect();
+    if (sp.x >= ai.right - 0.5) return 1;   // AI 在 splitter 左侧
+    if (sp.right <= ai.left + 0.5) return -1; // AI 在 splitter 右侧
+    return 1;
+  }
+
   const splitter = createSplitter({
     handle: els.aiSplitter,
     axis: 'x',
@@ -3601,6 +3649,7 @@ function mountAiSplitter() {
     setSize: applyAiWidth,
     clampSize: clampAiWidth,
     initialSize: getInitialWidth,
+    getDragSign,
     // audit #1：持久化失败要让用户看到 —— 下次启动 AI 面板宽度丢失、用户不知情。
     onDragEnd: () => {
       const finalW = clampAiWidth(getAiPx());

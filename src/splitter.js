@@ -54,6 +54,13 @@
  * @property {Array<{type: string, listener: Function, options?: AddEventListenerOptions|boolean}>} [windowListeners]
  *   额外挂在 window 上的监听器（如 sidebar 的 resize/scroll 用来失效命中区中线缓存）。
  *   dispose() 时一并解除 —— 与 handle / document 监听器同走同一张表，单点真理。
+ * @property {() => (1 | -1)} [getDragSign] - 拖动起点回调，返回 dCoord 的符号：
+ *   +1（默认）= 鼠标右移让目标变大；-1 = 鼠标右移让目标变小。
+ *   用于「目标元素可以在 splitter 两侧」的场景 —— 例如 AI 面板：split 模式下
+ *   AI 在 splitter 左边（鼠标右移 = AI 变大），preview/edit + focus 模式下 AI 在
+ *   splitter 右边且贴着窗口右边缘（鼠标右移 AI 会向左扩张，splitter 视觉上反而
+ *   左移 → 与鼠标反向）。每次 startDrag 时调用一次，结果用于整次拖动。
+ *   不传 = 始终 +1（语义同原 createSplitter，老调用方无需改）。
  */
 
 /**
@@ -93,6 +100,7 @@ export function createSplitter(opts) {
     body = (typeof document !== 'undefined' ? document.body : null),
     hitZone = null,
     windowListeners = null,
+    getDragSign = null,
   } = opts;
 
   if (!handle) throw new Error('[splitter] handle 必须是 DOM 元素');
@@ -119,6 +127,7 @@ export function createSplitter(opts) {
   let pointerId = null;
   let startCoord = 0;
   let startSize = 0;
+  let dragSign = 1; // 当前拖动的 dCoord 符号；getDragSign 在 startDrag 时赋值
 
   function coordOf(eventLike) {
     return eventLike[coordKey];
@@ -130,6 +139,21 @@ export function createSplitter(opts) {
     handle.classList.add('is-dragging');
     startCoord = coord;
     startSize = getSize();
+    // 拖动起点的 dCoord 符号：getDragSign 让调用方按当前布局动态决定（+1 / -1）。
+    // AI 面板这种「目标元素可落在 splitter 任一侧」的场景，必须每次拖动重新检测，
+    // 否则切模式后方向仍按旧符号计算，splitter 视觉上与鼠标反向。
+    // 兜底：getDragSign 抛错或返回非 -1/1 时退化为 +1（默认方向），
+    // 保证一次坏回调不会让整次拖动卡死（用户能继续拖回正常状态）。
+    if (getDragSign) {
+      try {
+        const sign = getDragSign();
+        dragSign = sign === -1 ? -1 : 1;
+      } catch {
+        dragSign = 1;
+      }
+    } else {
+      dragSign = 1;
+    }
     if (body) {
       body.style.cursor = cursor;
       body.style.userSelect = 'none';
@@ -138,7 +162,7 @@ export function createSplitter(opts) {
 
   function applyDrag(coord) {
     const dCoord = coord - startCoord;
-    setSize(clampSize(startSize + dCoord));
+    setSize(clampSize(startSize + dragSign * dCoord));
   }
 
   function endDrag() {

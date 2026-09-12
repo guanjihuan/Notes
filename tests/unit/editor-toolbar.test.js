@@ -227,3 +227,120 @@ describe('EditorToolbar a11y', () => {
     expect(EDITOR_MODES).toEqual(['preview', 'edit', 'split']);
   });
 });
+
+describe('EditorToolbar.setModeLock（AI 修复预览场景）', () => {
+  it('锁到 edit：selectMode(\'preview\') / selectMode(\'split\') 被拒绝', () => {
+    // 场景：AI 修复预览打开，强制编辑器锁在编辑模式；用户点预览 / 双栏按钮无效。
+    const els = setupDOM('preview');
+    const onChange = vi.fn();
+    const tb = new EditorToolbar({ elements: els, onChange });
+
+    tb.setModeLock('edit');
+    // 先把 dataset 落到锁定值（外部通常会接着调 applyEditorMode('edit')）
+    tb.setMode('edit');
+
+    // 尝试切到 preview / split —— selectMode 应当 no-op（拒绝非锁定模式）
+    tb.selectMode('preview');
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+
+    tb.selectMode('split');
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+
+    // 切到锁定值本身：允许（同模式早退，不会触发 onChange）
+    tb.selectMode('edit');
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('锁到 edit：cycle 不切模式，只做一次 DOM 对齐', () => {
+    // 场景：用户按 Ctrl+E 或点状态栏 chip 触发 cycle —— 锁定期间不应跳到 split。
+    const els = setupDOM('split'); // 起始非锁定值，验证 cycle 会把它吸回 edit
+    const onChange = vi.fn();
+    const tb = new EditorToolbar({ elements: els, onChange });
+
+    tb.setModeLock('edit');
+    tb.cycle();
+
+    // cycle 应先把 DOM 对齐到 edit（dataset 改写），但不触发 onChange
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+
+    // 再按一次：保持 edit，仍不触发 onChange
+    tb.cycle();
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('锁到 edit：setMode 强制对齐到 edit（外部误调也能纠正）', () => {
+    // 场景：锁定期间其它路径误调 setMode('preview') —— 仍应落到锁定值 edit。
+    const els = setupDOM('split');
+    const tb = new EditorToolbar({ elements: els, onChange: vi.fn() });
+
+    tb.setModeLock('edit');
+
+    tb.setMode('preview');
+    expect(document.body.dataset.editorMode).toBe('edit');
+
+    tb.setMode('split');
+    expect(document.body.dataset.editorMode).toBe('edit');
+  });
+
+  it('按钮 click 走 selectMode：锁定期间点预览 / 双栏按钮无反应', () => {
+    // 端到端：按钮 click → selectMode → 被锁拒绝。覆盖顶层 use case。
+    const els = setupDOM('preview');
+    const onChange = vi.fn();
+    const tb = new EditorToolbar({ elements: els, onChange });
+
+    tb.setModeLock('edit');
+    tb.setMode('edit');
+
+    els.btnPreview.click();
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+
+    els.btnSplit.click();
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+
+    // 编辑按钮仍然有效（点击 = 当前模式，selectMode 同模式早退，无副作用）
+    els.btnEdit.click();
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('setModeLock(null)：解除锁定后切模式恢复正常', () => {
+    const els = setupDOM('preview');
+    const onChange = vi.fn();
+    const tb = new EditorToolbar({ elements: els, onChange });
+
+    tb.setModeLock('edit');
+    tb.setMode('edit');
+
+    // 锁定期间尝试切到 split —— 被拒
+    tb.selectMode('split');
+    expect(document.body.dataset.editorMode).toBe('edit');
+    expect(onChange).not.toHaveBeenCalled();
+
+    // 解除锁定
+    tb.setModeLock(null);
+
+    // 切到 split 正常生效
+    tb.selectMode('split');
+    expect(document.body.dataset.editorMode).toBe('split');
+    expect(onChange).toHaveBeenCalledWith('split');
+  });
+
+  it('setModeLock 非法值：忽略（保持当前锁状态）', () => {
+    const els = setupDOM();
+    const tb = new EditorToolbar({ elements: els, onChange: vi.fn() });
+
+    tb.setModeLock('edit');
+    tb.setMode('edit');
+
+    // 非法值：保持 edit 锁定
+    tb.setModeLock('wide');
+    tb.selectMode('preview');
+    expect(document.body.dataset.editorMode).toBe('edit');
+  });
+});

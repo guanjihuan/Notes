@@ -73,9 +73,13 @@ function linesToContextRows(content) {
  * @param (() => boolean) [options.isSettingsOpen] - 设置对话框当前是否打开。打开时
  *   togglePanel 会拒绝打开 AI dock 并 toast（双向互斥，避免 AI dock 透过 modal
  *   半透明背景露在设置对话框背后造成视觉重叠 / 误点）。未传则视为永远关闭。
+ * @param {(isOpen:boolean) => void} [options.onDiffOpenChange] - AI 修复预览面板（中间 diff 面板）
+ *   显隐状态变化时回调（true = 面板可见、false = 隐藏）。调用方收到 true 后可
+ *   强制编辑器切到编辑模式并禁用预览 / 双栏切换；收到 false 后还原。回调仅在
+ *   「与上一次状态不同」时触发，避免 setPendingDiff 内部多次刷新造成重复回调。
  */
 export function createAiController({
-  api, editor, state, toast, getSettings, onAfterApply, onOpenSettings, notify, isSettingsOpen,
+  api, editor, state, toast, getSettings, onAfterApply, onOpenSettings, notify, isSettingsOpen, onDiffOpenChange,
 }) {
   if (!api || !api.aiEdit) {
     console.error('[ai-controller] api.aiEdit 不可用；preload 没暴露 AI 桥？');
@@ -92,6 +96,9 @@ export function createAiController({
   let requestGeneration = 0;
   // 防抖 timer：onContentChanged 不再每个 keystroke 都跑 sync DP
   let recomputeTimer = null;
+  // AI 修复预览显隐状态：用于在 syncBodyFlag 检测到状态翻转时回调 onDiffOpenChange。
+  // 初始 false —— pendingDiff 默认 null，面板隐藏。
+  let diffOpenState = false;
 
   // 安全 notify 闭包：notify 可选注入，未传则静默（与 panel 内部 _notify 同款语义）。
   // controller 在 4 处显式调（AI_STATUS.DIFF / AI_STATUS.IDLE），其余走 chatPanel.setStatus 转发。
@@ -205,6 +212,13 @@ export function createAiController({
       (pendingDiff.regions || []).length > 0
     );
     document.body.dataset.aiDiffOpen = has ? 'true' : 'false';
+    // 通知外部「AI 修复预览」显隐状态变化 —— 外部据此强制编辑器切到编辑模式
+    // 并禁用预览 / 双栏切换。仅在状态翻转时回调一次，避免 setPendingDiff 内部
+    // 多次刷新造成重复通知。
+    if (typeof onDiffOpenChange === 'function' && has !== diffOpenState) {
+      diffOpenState = has;
+      try { onDiffOpenChange(has); } catch { /* 不让 UI 异常阻断 AI 流程 */ }
+    }
   }
 
   // 创建面板实例（DOM 必须在 bindMountPoint 之后才能实例化）

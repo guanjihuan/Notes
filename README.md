@@ -2,7 +2,7 @@
 
 桌面端 Markdown 阅读与编辑器。读取指定文件夹里的 `.md` 文件，可就地编辑保存。
 
-![tests](https://img.shields.io/badge/tests-643%2F29%20passing-brightgreen) ![Electron](https://img.shields.io/badge/Electron-44-47848F) ![Node](https://img.shields.io/badge/node-%3E%3D20.18-339933) ![MIT](https://img.shields.io/badge/license-MIT-blue)
+![tests](https://img.shields.io/badge/tests-642%2F28%20passing-brightgreen) ![Electron](https://img.shields.io/badge/Electron-44-47848F) ![Node](https://img.shields.io/badge/node-%3E%3D20.18-339933) ![MIT](https://img.shields.io/badge/license-MIT-blue)
 
 ## 简介
 
@@ -28,7 +28,7 @@ npm start
 
 ```bash
 npm start              # 启动（UTF-8 包装，推荐；中文 Windows 别用 start:raw）
-npm test               # 全部单测（643 用例 / 29 文件）
+npm test               # 全部单测（642 用例 / 28 文件）
 npm run test:watch     # watch 模式
 npm run check          # 语法 + IPC 通道配对
 npm run lint           # ESLint
@@ -114,28 +114,16 @@ npm run build:linux    # Linux   → dist/（AppImage）
 ```
 Notes/
 ├── main.js              # Electron 主进程
-├── main/                # 主进程模块：ai / file-ops / fs-watcher / config-store
+├── main/                # 主进程模块（ai、file-ops、fs-watcher、config-store）
 ├── preload.js           # IPC bridge
 ├── index.html           # UI 框架 + CSP + importmap
-├── src/                 # 渲染端
-│   ├── ai/              # AI 面板（chat / diff / status / controller）
-│   └── styles/          # CSS 分片（tokens / palettes / base / … 12 个）
+├── src/                 # 渲染端（ai/ 面板、styles/ CSS 分片）
 ├── shared/              # 主进程 / preload / 渲染端共享
-│   ├── ai-errors.js
-│   ├── extension-lists.js
-│   ├── friendly-fs-error.js
-│   ├── markdown-diff.js
-│   ├── render-sanitize.js
-│   ├── settings-schema.js
-│   └── slug.js
 ├── data/welcome.md      # 首次启动种子文件
-├── patches/             # patch-package 补丁（app-builder-lib 26.15.3）
-├── scripts/
-│   ├── launch.js        # UTF-8 包装启动
-│   ├── check-syntax.js  # 语法静态检查
-│   └── check-ipc.js     # IPC 通道配对检查
+├── scripts/             # 启动包装（launch.js）+ 静态检查（check-syntax / check-ipc）
 └── tests/
-    └── unit/            # 29 个测试文件，643 用例（vitest）
+    ├── unit/            # 28 个测试文件，642 用例（vitest）
+    └── manual/          # 手工视觉验证产物（不进版本库）
 ```
 
 ## 故障排除

@@ -411,6 +411,11 @@ body.has-app-icon .app-title::before {
   background: var(--bg-hover);
   /* 关掉 dirty-pulse 动画：避免 is-saving + is-dirty 叠加造成闪烁 */
   animation: none;
+  /* Round 13 fix (M22)：正在保存时锁住点击 —— 否则双击 save 会触发两次
+     writeFile，第二次 mtime 比预期新 → FILE_CHANGED_EXTERNALLY 误判。
+     savingCount 防并发应该兜底，但鼠标双击事件触发极快，savingCount 在第二次
+     进入前未必 ++；UI 层锁一道最稳。 */
+  pointer-events: none;
 }
 /* a11y：prefers-reduced-motion 下保持稳定视觉，不透明度也保留 */
 @media (prefers-reduced-motion: reduce) {
@@ -423,14 +428,33 @@ body.has-app-icon .app-title::before {
 
 /* 主题按钮图标：按当前主题显示"代表当前状态"的那一态——
    暗色主题下显示月亮，亮色主题下显示太阳（点击图标会切到对侧主题）。
-   两个 SVG 同时存在于 DOM，靠 [data-theme] 切换可见性，免 JS 维护。 */
+
+   动画：两个 SVG 同位置叠加，靠 opacity + 180° rotate 切换。
+   - opacity 让图形柔和渐入渐出（避免硬切）
+   - rotate 让图形过渡时有"翻转"暗示：从太阳转到月亮是 180° 翻转的语义
+   - 用 position:absolute 把两者钉到 button 中心，flex 自然布局让其中一个盖在另一个之上
+
+   用 [data-theme] 选择器控制「哪一态」当前显示，状态切换由 renderer
+   通过 toggleTheme() 改 body.dataset.theme 完成，CSS 自动追平。 */
+#btn-theme {
+  position: relative;
+}
 #btn-theme .theme-icon {
-  display: none;
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  display: block;
+  opacity: 0;
+  transform: rotate(-90deg) scale(0.6);
+  transition:
+    opacity var(--transition-fast),
+    transform var(--transition-fast);
 }
 
 body[data-theme="dark"] #btn-theme .theme-icon-moon,
 body[data-theme="light"] #btn-theme .theme-icon-sun {
-  display: block;
+  opacity: 1;
+  transform: rotate(0) scale(1);
 }
 
 /* (audit fix Round 9: .toolbar-status-dot 死 CSS，详见 04-toolbar.css 顶部注释) */
@@ -463,8 +487,109 @@ body[data-theme="light"] #btn-theme .theme-icon-sun {
   pointer-events: none;
 }
 
+/* ============================================================
+   Toolbar Search（设计优化 2026-09：从侧栏 header 迁来）
+   ------------------------------------------------------------
+   把搜索文件框从侧栏上移到底部顶栏首位，让侧栏垂直空间专注于文件列表
+   （侧栏同时把「+ 新建笔记」合并进 sort 行 —— 双重省空间）。
+   - flex:0 1 240px：理想宽度 240px，可缩不可涨 —— 窗口变窄时它先缩，
+     不挤右侧按钮组；不抢占侧栏上方视觉重量
+   - min-width:160px：极限窄窗口下保留可用宽度（低于此值键盘用户看不清）
+   - max-width:320px：超宽窗口里也不无止境扩张，避免视觉失衡
+   - 顶栏背景 + 输入框对比：bg-card 让搜索框"沉下去"，与工具栏按钮区分层级
+
+   CSS 顺序说明：base 规则必须放在 media query 之前，否则等特异性下后者
+   会被覆盖。
+   ============================================================ */
+.toolbar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  /* belt-and-suspenders：toolbar-right 已设 no-drag，但显式再标一次，
+     防止未来重构时把 .toolbar-search 误放进 .drag-region */
+  -webkit-app-region: no-drag;
+  flex: 0 1 240px;
+  min-width: 160px;
+  max-width: 320px;
+  height: 30px;
+  /* 与后面按钮组之间留点呼吸 —— 视觉上把搜索框归到"独立区"，不和按钮混在一起 */
+  margin-right: 2px;
+}
+
+.toolbar-search .search-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--fg-secondary);
+  pointer-events: none;
+  transition: color var(--transition-fast);
+}
+
+.toolbar-search .search-input {
+  width: 100%;
+  height: 30px;
+  /* 右侧多 4px 内边距：input[type="search"] 在 Webkit / Chromium 会渲染
+     内置的「×」清除按钮，避开它和占位文字重叠 */
+  padding: 0 30px 0 32px;
+  background: var(--bg-card);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--fg-primary);
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast),
+    box-shadow var(--transition-fast);
+  /* 搜索框是输入区，需要能选中文本。工具栏其余区域 user-select:none（避免拖拽时
+     高亮一片），这里覆盖掉只对输入区解禁 —— 比整个 toolbar 开 selection 干净 */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.toolbar-search .search-input::placeholder {
+  color: var(--fg-tertiary);
+}
+
+.toolbar-search .search-input:hover {
+  border-color: var(--border-default);
+}
+
+.toolbar-search .search-input:focus {
+  /* 鼠标点击不画外圈：键盘 focus-visible 由全局规则接管（见 :focus-visible 基线） */
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-glow);
+  background: var(--bg-elevated);
+}
+@supports (focus-visible) {
+  .toolbar-search .search-input:focus:not(:focus-visible) {
+    box-shadow: none;
+  }
+  .toolbar-search .search-input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+/* 输入框 focus 时把左侧放大镜也跟着亮起来 —— 视觉一致性。
+   用 :focus-within 而不是兄弟选择器（.search-input:focus + .search-icon），
+   因为 DOM 里 icon 在 input 前面，兄弟选择器匹配不到 */
+.toolbar-search:focus-within .search-icon {
+  color: var(--accent);
+}
+
+/*
+  聚焦模式隐藏整个 toolbar 时，搜索框随之隐藏 —— 此时连侧栏都没有，
+  搜索框无处可用。这与 09-misc.css 的 `body[data-focus-mode="true"] .toolbar { ... }`
+  配套，无需单独写规则。
+
+  窄窗口（< 820px）下，工具栏按钮文字隐藏但搜索框保留（核心功能）。
+*/
+
 /* 窄窗口（< 820px）：toolbar 文字标签隐藏，只保留图标。
-   与 sidebar 720px 阈值错开，留出中间过渡区，避免一次性把全部 toolbar 砍塌 */
+   与 sidebar 720px 阈值错开，留出中间过渡区，避免一次性把全部 toolbar 砍塌。
+   CSS 顺序：media query 必须在 base .toolbar-search 之后，等特异性下后者覆盖前者 */
 @media (max-width: 820px) {
   .btn-icon-text .btn-label {
     display: none;
@@ -472,6 +597,23 @@ body[data-theme="light"] #btn-theme .theme-icon-sun {
   .btn-icon-text {
     /* 没文字时收紧 padding，让按钮保持图标按钮的紧凑感 */
     padding: 0 6px;
+  }
+  /* 820px 时所有文字按钮已退化为图标按钮，省下约 100px；
+     搜索框也按比例收紧到 160~200px，给 title 留更多空间 */
+  .toolbar-search {
+    flex: 0 1 200px;
+    min-width: 140px;
+  }
+}
+
+/* 极窄窗口（< 720px）：与侧栏窄屏阈值对齐。搜索框最小化到只保留图标宽度，
+   用户仍能用 Ctrl+F 聚焦输入（即使视觉上更紧凑，键盘可达性不丢）。
+   ::placeholder 无法设 content（浏览器不支持），自然截断即可 —— 输入框太窄时
+   占位文字会被输入框边缘裁掉，但输入体验（点 / Ctrl+F / Esc 清空）都还在 */
+@media (max-width: 720px) {
+  .toolbar-search {
+    flex: 0 1 140px;
+    min-width: 96px;
   }
 }
 

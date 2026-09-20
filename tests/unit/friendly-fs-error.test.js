@@ -52,6 +52,16 @@ describe('friendlyFsError —— 已知 errno 映射', () => {
   it('ENOTEMPTY → 目标文件夹不为空', () => {
     expect(friendlyFsError('ENOTEMPTY')).toBe('目标文件夹不为空');
   });
+
+  it('ENOENT → 目标路径不存在', () => {
+    expect(friendlyFsError('ENOENT')).toMatch(/不存在/);
+  });
+
+  // audit fix (Round 17 H2)：FS_TIMEOUT 是 main withTimeout() 自造 code，
+  // 不是 Node fs 内置 errno。SMB / OneDrive 挂死时透传，renderer 走这里。
+  it('FS_TIMEOUT → 磁盘暂时不可用文案', () => {
+    expect(friendlyFsError('FS_TIMEOUT')).toMatch(/超时|磁盘/);
+  });
 });
 
 describe('friendlyFsError —— fallback 行为', () => {

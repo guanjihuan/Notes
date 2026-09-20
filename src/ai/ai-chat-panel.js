@@ -158,6 +158,14 @@ export class AiChatPanel {
       this._currentRequestId = null;
       this._syncSubmitButton();
     }
+    // 优化 (Round 14)：close 也清 stage 定时器。hung 请求场景下
+    // _triggerSubmit 的 finally 永远不会跑，stageTimer 仍在 fire 调
+    // this._notify，会用 stages[stageIdx].text 覆盖 close() 刚刚写出的
+    // '' / idle chip —— 用户看到关 dock 后 chip 还在升级文案，体验割裂。
+    if (this._stageTimer) {
+      clearInterval(this._stageTimer);
+      this._stageTimer = null;
+    }
     // 关掉 dock 时清掉状态栏 chip —— 否则 chip 会留下上次的"已应用"或"AI 请求失败"
     // 残留，让用户误以为是新请求的结果
     this._notify('', 'idle');
@@ -194,6 +202,13 @@ export class AiChatPanel {
     this._canceling = false;
     this._currentRequestId = null;
     if (this._cancelled) this._cancelled.clear();
+    // 优化 (Round 14)：reset 也清 stage 定时器 —— controller 在
+    // onFileChanged / closeAll 调 reset，旧 panel 残留的定时器 fire 时
+    // 会调过时的 this._notify 覆盖新 panel 已经写出的 chip 文案。
+    if (this._stageTimer) {
+      clearInterval(this._stageTimer);
+      this._stageTimer = null;
+    }
     const input = this.element.querySelector('.ai-chat-input');
     if (input) {
       input.disabled = !this._enabled;
@@ -312,6 +327,34 @@ export class AiChatPanel {
     this._syncSubmitButton();
     if (input) input.disabled = true;
 
+    // 优化 (Round 14)：AI 请求飞行期 chip 文案分阶段升级。
+    // 主进程默认超时 300s，普通网络往返 2~5s 体感就让人焦虑；服务慢时用户
+    // 只能盯着一个静态的「正在发送请求…」 猜后台在干嘛。按 elapsed 时间
+    // 推进 4 个 stage，逐步把"等待"语义升级成"正在处理 / 服务较慢 / 非常慢"，
+    // 配合 running 脉冲（CSS）持续闪烁给视觉反馈，让用户感觉系统在干活。
+    // 单 setInterval 每 2s 推进一次，避免起 4 个 setTimeout 各自清理。
+    // 全部 stage ≤ 60 字（app.js#updateStatusAi 截断保护），保证状态栏窄时不撑爆。
+    const startTs = Date.now();
+    const stages = [
+      { afterMs: 0,    text: '正在发送请求…' },
+      { afterMs: 8000, text: 'AI 正在处理…' },
+      { afterMs: 25_000, text: 'AI 响应较慢，请耐心等待' },
+      { afterMs: 60_000, text: 'AI 响应非常慢，可点取消重试' },
+    ];
+    let stageIdx = 0;
+    const stageTimer = setInterval(() => {
+      if (this._currentRequestId !== requestId) {
+        clearInterval(stageTimer);
+        return;
+      }
+      const elapsed = Date.now() - startTs;
+      while (stageIdx < stages.length - 1 && elapsed >= stages[stageIdx + 1].afterMs) {
+        stageIdx += 1;
+      }
+      this._notify(stages[stageIdx].text, 'running');
+    }, 2000);
+    this._stageTimer = stageTimer;
+
     try {
       const result = await this.onSubmit({ prompt, requestId });
       // 已被新请求顶掉（用户点了"取消"或再次提交）：静默
@@ -341,6 +384,8 @@ export class AiChatPanel {
       console.error('[ai-chat-panel] onSubmit threw:', e);
       this._notify('AI 修改失败，请稍后重试', 'error');
     } finally {
+      clearInterval(stageTimer);
+      if (this._stageTimer === stageTimer) this._stageTimer = null;
       if (this._currentRequestId === requestId) {
         this._submitting = false;
         this._canceling = false;
@@ -449,5 +494,11 @@ export class AiChatPanel {
     this._canceling = false;
     this._currentRequestId = null;
     this._cancelled = null;
+    // 优化 (Round 14)：清掉飞行期 stage 定时器，避免 destroy 后定时器
+    // 还在 fire 调过时的 this._notify（onNotify 闭包可能指向旧 UI 入口）。
+    if (this._stageTimer) {
+      clearInterval(this._stageTimer);
+      this._stageTimer = null;
+    }
   }
 }

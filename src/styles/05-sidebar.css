@@ -15,23 +15,21 @@
   z-index: var(--z-sidebar);
   /* 宽度由 .app-shell 的 grid 模板通过 --sidebar-width 决定；这里不再写死 px */
   min-width: 0;
+  /* container query 锚点：让 .sidebar 内部元素能根据侧栏实际宽度自适应。
+     用途：当侧栏拖到 ~240px 以下时，「新建笔记」内联按钮的"新建笔记"文字
+     自动隐藏、只保留 + 图标，给 sort 按钮（「名称」「修改时间」）腾空间。
+     230px 是经验阈值：sort 文字 + icon + 内边距刚好能完整显示的临界点。
+     命名空间 "sidebar" 与下面 @container 配套，避免与未来其他容器冲突 */
+  container-type: inline-size;
+  container-name: sidebar;
 }
 
-.sidebar-header {
-  /* 紧凑的 header —— 上下 12px、左右 14px，让搜索框有呼吸但不浪费空间 */
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border-subtle);
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
+/* (.sidebar-header 已删除 —— 2026-09 设计优化：搜索框上移到工具栏，
+   侧栏垂直空间让给文件列表 + 排序条。首行直接是 sort + 新建笔记合并行) */
 
-/* 新建笔记行：放在 .sidebar-header 下方、排序条上方的独立主操作行。
-   左右 padding 用 10px（与 .sidebar-sort / .file-list 对齐），
-   让「创建」按钮和它作用的列表视觉上是一组；搜索框保留 14px 更深的内嵌来强调 */
-.sidebar-new-row {
-  padding: 10px 10px 8px;
-}
+/* (.sidebar-new-row 已删除 —— 2026-09 设计优化：把「新建笔记」按钮合并到
+   .sidebar-sort 同一行的右端（用 .sidebar-new-btn--inline + margin-left:auto），
+   节省侧栏首屏的垂直空间。原独立行的顶部呼吸转移到了 .sidebar-sort 的 padding-top） */
 
 /* 「+ 新建笔记」按钮：全宽、带文字的主操作按钮
    ——accent 文字 + 微微的 accent 底色 + 1px accent 边框，hover/active 进一步加深。
@@ -78,77 +76,86 @@
   outline-offset: 1px;
 }
 
-.search-wrap {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-}
-
-.search-icon {
-  position: absolute;
-  left: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-  /* 用 secondary 替代 tertiary：搜索框是核心入口，图标应该一眼看清 */
-  color: var(--fg-secondary);
-  pointer-events: none;
-  transition: color var(--transition-fast);
-}
-
-.search-input {
-  width: 100%;
-  /* 收紧内边距、改为 8px/0/8px/32px；高度由 line-height + 7px*2 padding 决定 ≈ 30px */
-  padding: 7px 10px 7px 32px;
-  background: var(--bg-card);
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+/* 「新建笔记」按钮的紧凑内联变体（.sidebar-new-btn--inline）：
+   与 .sidebar-sort-btn 并排在 .sidebar-sort 行内，靠 margin-left:auto 推到右端。
+   设计目标：
+   1) 与 sort 按钮同高（覆盖 base 的固定 height:34px → 自适应高度），
+     否则 34px 的新建笔记会撑爆整行、视觉上"跳"出来，盖过 sort 按钮；
+   2) 宽度按内容（flex:0 0 auto），不抢 sort 按钮的弹性空间；
+   3) icon 同步缩到 13px（base 是 14px），与 sort 按钮视觉重量一致；
+   4) 保留 accent 文字 + 软底色 + 1px accent 边框的主操作语义不变。
+   —— base 类继续被侧栏底部 AI 按钮（#btn-ai）复用，仍是 34px 全宽语义。 */
+.sidebar-new-btn--inline {
+  flex: 0 0 auto;
+  margin-left: auto;
+  width: auto;
+  height: auto;
+  /* 5/6 padding 与 sort 按钮对齐：整行按钮横向 padding 一致，视觉上"一排"，
+     而不是 sort 紧、新建笔记松。同节奏点击区也更整齐 */
+  padding: 5px 6px;
   font-size: var(--fs-sm);
-  color: var(--fg-primary);
-  transition: border-color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
+  letter-spacing: var(--tracking-wide);
+}
+.sidebar-new-btn--inline svg {
+  width: 13px;
+  height: 13px;
+}
+/* 内联态下取消 base 的 scale 反馈 —— 整行按钮高度统一，按下时整行一起缩更协调；
+   若只缩新建笔记，按下瞬间会显得"错位跳出"，与同行 sort 按钮的 active 态不齐 */
+.sidebar-new-btn--inline:active {
+  transform: none;
 }
 
-.search-input::placeholder {
-  /* 占位符原本用 fg-muted（暗色 ~2:1 几乎看不见），提到 fg-secondary 让"搜索文件..."
-     提示文字可见 —— 用户至少能看清这里有输入框 */
-  color: var(--fg-tertiary);
-}
-
-.search-input:hover {
-  border-color: var(--border-default);
-}
-
-.search-input:focus {
-  /* 鼠标点击不画外圈：键盘 focus-visible 由全局规则接管（见 :focus-visible 基线） */
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: var(--shadow-glow);
-  background: var(--bg-elevated);
-}
-@supports (focus-visible) {
-  .search-input:focus:not(:focus-visible) {
-    box-shadow: none;
+/* 窄侧栏适配：当侧栏 ≤260px 时，「新建笔记」文字隐藏，只显 + 图标，
+   给 sort 按钮腾出 ~50px 空间，「修改时间」能完整显示。
+   container query（而不是 @media viewport）：跟随 .sidebar 实际渲染宽度，
+   跟主窗口大小解耦。@supports 检测兼容性：旧 Chromium 不支持 container
+   query 会跳过规则，回退到全文字（最差也是 ellipsis，不算破图）
+   阈值 260px 是经验值：sort 「修改时间」4 字 + 新建笔记 4 字同时显示需要
+   ~250px+ 侧栏宽度（实测 240px 时 sort 仍被截断），取 260px 给点余量 */
+@supports (container-type: inline-size) {
+  @container sidebar (max-width: 260px) {
+    .sidebar-new-btn--inline span {
+      /* 视觉上隐藏文字，但保留 a11y / 屏幕阅读器朗读「新建笔记」 */
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .sidebar-new-btn--inline {
+      /* 只显图标时，按钮收紧到 icon + 少量水平内边距即可 */
+      padding: 5px 8px;
+    }
   }
-  .search-input:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
 }
 
-.search-input:focus + .search-icon {
-  color: var(--accent);
-}
+/* (search-wrap / search-icon / search-input 已移到 04-toolbar.css —— 2026-09
+   设计优化：搜索框从侧栏上移到工具栏，样式跟随 HTML 一起走) */
 
 /* ============================================================
-   Sidebar 排序工具条
+   Sidebar 排序工具条 + 新建笔记（合并到一行）
    紧贴它作用的 .file-list 上方 —— 这是「列表的工具」，
    不应该埋进三层深的设置对话框（见 [[feedback-prefer-near-affected-area]]）。
    设计目标：紧凑到不抢搜索框注意力，active 态明确但不过重。
+   2026-09 优化：「新建笔记」从独立行合并到右端，
+   margin-left:auto 把新建笔记推到行尾，与左侧 sort 按钮形成「列表的工具 vs 主操作」的层次。
+   gap 同步从 2px → 4px：插入「新建笔记」后与 sort 按钮之间需要稍宽间距，避免视觉粘连。
    ============================================================ */
 .sidebar-sort {
   display: flex;
+  align-items: center;
+  /* gap 2px：sort 按钮之间 2px（连成一组 —— 都是"列表的工具"），
+     margin-left:auto 把"新建笔记"推到最后，自然形成「sort 组」与「主操作」的分组 */
   gap: 2px;
-  /* 顶 header 12px、底 6px —— 让工具条与列表的视觉关联 > 与 header 的关联 */
-  padding: 6px 10px 8px 10px;
+  /* 顶 8px / 底 8px：sort 是侧栏首屏第一行，工具栏底边已经有 ~8px breathing，
+     这里再给 8px 顶距足够拉开层次（10px → 8px 省 2px 给文件列表）；
+     上下对称让 sort 行居中感更强，border-bottom 自然分隔 */
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border-subtle);
 }
 
@@ -159,7 +166,11 @@
   align-items: center;
   justify-content: center;
   gap: 5px;
-  padding: 5px 8px;
+  /* 横向 padding 8px → 6px：sort 标签"修改时间" 4 字 + icon 在默认 220px 侧栏下
+     需要 ~83px，原 5/8 padding + 4px row gap 把每个 sort 按钮挤到 80px，
+     「修改时间」就被截断成「修改时」。收到 6px 后单 sort 按钮宽度降到 76px，
+     省下来的 4×2=8px 让 sort 行整体宽松，可完整显示 4 字标签 */
+  padding: 5px 6px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
@@ -234,7 +245,7 @@
   color: var(--fg-tertiary);
   font-size: var(--fs-sm);
   line-height: var(--lh-relaxed);
-  /* 留点上方间距，与 sidebar-header 拉开 */
+  /* 留点上方间距，与上方 sort/新建笔记行拉开 */
   margin-top: var(--space-2);
   /* 避免一行字过长在窄侧栏里截断为半个字 */
   word-break: break-word;
@@ -315,9 +326,17 @@
   top: 50%;
   transform: translateY(-50%);
   width: 3px;
-  height: 60%;
+  /* 60% → 70%：原 60% 在 13px name + 12px meta 共 31px 行高下占 18px，
+     加上色条本身的圆角显得"瘦长"。提到 70% (22px) 后，与 file-name +
+     meta 二行总高的占比更平衡，色条"贴"住视觉单元，不漂在 item 中央。
+     仍留 30% 上下气口，避免色条顶到 file-name / meta 行边沿 */
+  height: 70%;
   border-radius: 0 2px 2px 0;
   background: var(--accent);
+  /* 加微 box-shadow 让色条在 accent-soft 底色上"浮"起来一点 —
+     纯色 accent 在 #2a325c 类 accent-soft 背景下，RGB 距离很短，
+     加 4px 投影能把色条对比拉高一档 */
+  box-shadow: 0 0 4px color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
 .file-name {
@@ -377,70 +396,14 @@
 }
 
 .sidebar-footer {
+  /* 现在侧栏底部只剩 AI 一个按钮（文件夹管理已搬到状态栏左段，
+     见 [[feedback-folder-actions-to-statusbar]]），padding 收紧到 10px 12px
+     让按钮离文件列表稍近、视觉关系更紧 */
   padding: 10px 12px;
   border-top: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
   gap: 2px;
-}
-
-/* 侧栏底部视觉分隔：把上方"打开/切换数据目录"二级链接和下方 AI 主操作分开。
-   用 1px 细线 + 上下 6px 留白，避免紧贴导致 AI 按钮和文件夹链接"挤成一团" */
-.sidebar-footer-sep {
-  height: 1px;
-  background: var(--border-subtle);
-  margin: 6px 0;
-}
-
-/* AI 主操作按钮在侧栏底部已不再与 footer-sep 紧邻（sep 在 AI 上方），
-   不再需要 margin-bottom: 0 来解耦 gap。 */
-
-.link-subtle {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  /* 11px 字号在低 DPI 上偏糊，提到 12px（fs-xs-readable）保持视觉小但不模糊；
-     颜色已用 secondary（2026-08 提亮后约 8.5:1 on dark） */
-  font-size: var(--fs-xs-readable);
-  color: var(--fg-secondary);
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-  transition: background var(--transition-fast), color var(--transition-fast);
-  font-weight: 500;
-  min-width: 0;  /* 允许 flex item 在窄侧栏（180px）收缩到内容宽度以下 */
-}
-
-/* 文字单行 + 溢出省略号：防止「切换数据文件夹…」在窄侧栏里折成两行 */
-.link-subtle > span {
-  flex: 1;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* link-subtle / footer-action：侧栏底部"打开数据目录 / 切换目录"等
-   二级链接。hover 时给 bg-hover + accent 文字提示"可点"——
-   与全局 a 一致用 --accent-text，让"hover 才出颜色"的反馈也维持文字版。 */
-.link-subtle:hover {
-  background: var(--bg-hover);
-  color: var(--accent-text);
-}
-
-/* <button> 重置：与 .link-subtle 一致的"链接外观"，但语义上是动作按钮 */
-.footer-action {
-  width: 100%;
-  text-align: left;
-  background: transparent;
-  border: 0;
-  cursor: pointer;
-  font: inherit;
-}
-
-/* 键盘 focus 高亮 —— 鼠标点击不画，键盘 Tab 才出现（hover 不等于 focus） */
-.link-subtle:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
 }
 
 /* ============================================================
@@ -507,7 +470,10 @@
   color: var(--accent);
   margin-bottom: var(--space-3);
   position: relative;
-  /* 让 halo 缓慢呼吸，强化「等待/邀请」感 */
+  /* 让 halo 缓慢呼吸，强化「等待/邀请」感。
+     1.04 → 1.02：旧值在 4s 周期下肉眼明显能看出"放大再缩回"，
+     用户长时间停留空状态（常见：刚启动、刚切数据文件夹）会被这个 4% 缩放
+     持续吸引注意力；改 2% 后仍保留"呼吸"暗示，但不再"主动拉视线" */
   animation: empty-halo 4s ease-in-out infinite;
 }
 .empty-state-icon::after {
@@ -528,12 +494,14 @@
 }
 
 @keyframes empty-halo {
+  /* 振幅 1 → 1.02（+2%）：保留"呼吸"质感的同时不抢占视线。
+     透明度仍 0.95 ↔ 1，让 halo 在淡入淡出之间柔和过渡 */
   0%, 100% {
     transform: scale(1);
     opacity: 0.95;
   }
   50% {
-    transform: scale(1.04);
+    transform: scale(1.02);
     opacity: 1;
   }
 }
@@ -574,13 +542,20 @@
 .empty-state .hint.hint-secondary {
   color: var(--fg-tertiary);
   font-size: var(--fs-xs-readable);
-  margin-top: 6px;
+  /* margin-top 6 → 10px：原 6px 让主 hint 与次 hint 之间几乎贴住，
+     加上两行 lh-relaxed (1.7) 后视觉上更挤。提到 10px 让两组 hint
+     之间形成明确的"主 → 次"层次（主是引导、次是补充操作） */
+  margin-top: 10px;
   max-width: 380px;
+  /* 1.55 让次级提示的换行节奏与主 hint（1.6）接近，避免出现"次 hint 文字挤一行"的突兀感 */
+  line-height: 1.55;
 }
 
 .empty-state .hint kbd {
   /* .md 这种代码 chip 用 kbd 标签更语义化 */
-  padding: 2px 7px;
+  /* padding 2/7 → 1/6：在 12px 字号下原 2/7 让 kbd chip 显得"鼓鼓的"，
+     跟相邻的中文小字节奏不齐。收 1px 上下让 chip 更贴字高基线 */
+  padding: 1px 6px;
   background: var(--bg-hover);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
@@ -590,6 +565,8 @@
   color: var(--fg-secondary);
   font-weight: 600;
   box-shadow: 0 1px 0 var(--border-subtle);
+  /* 上下微 margin 让 kbd 与相邻文字垂直居中对齐（默认 baseline 会让 kbd 显得"沉"） */
+  margin: 0 1px;
 }
 
 .empty-state code {
@@ -649,10 +626,11 @@ body[data-editor-mode="split"] .editor-pane {
   flex-direction: column;
 }
 
-/* 让编辑器像 viewer 一样「居中 + 限定行宽」，与预览区域视觉重量一致。
-   max-width 与 .markdown-body 共用 --w-reader-max，保证 gutter + 内容总宽
-   不超过 reader max；margin auto 在更宽的窗口中把编辑器推到中部。
-   窄窗口下 max-width 不再生效，编辑器自然占满全宽（不破坏小屏体验）。 */
+/* 让编辑器与预览区域保持一致的宽度处理：共用 --w-reader-max。
+   默认 token 设为 none（content 完全填满区域，最大限度显示内容），
+   若未来想恢复"最优阅读宽度"上限，把 01-tokens.css 里的 --w-reader-max
+   改回 px 值（如 720px）即可，不用改这里。margin auto 仍保留，方便
+   切回 px 上限后让内容在更宽的窗口里居中。 */
 .editor-pane .cm-editor {
   max-width: var(--w-reader-max);
   margin: 0 auto;

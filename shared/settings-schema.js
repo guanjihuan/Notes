@@ -28,6 +28,18 @@
 'use strict';
 
 /**
+ * 自动保存默认防抖延迟（ms）。停打后多久落盘。
+ * 同时也是旧版 autoSaveIntervalSec (3s / 10s) 的迁移目标 —— 语义从「轮询」变
+ * 「防抖」，所有「开启」档位统一映射到这个值，避免老用户升级后行为突变。
+ * 在 3 处使用：
+ *   - DEFAULT_SETTINGS.autoSaveDebounceMs（首次安装的默认值）
+ *   - coerceLoadedSettings() 迁移旧 autoSaveIntervalSec → autoSaveDebounceMs
+ *   - renderer src/app.js bootstrap fallback（持久化值缺失时）
+ * 抽出来是为了「改默认值只改一处」，三处必须保持一致。
+ */
+const AUTO_SAVE_DEFAULT_DEBOUNCE_MS = 500;
+
+/**
  * 默认值（单一事实源）。所有键都在这里定义，缺一不可。
  * @type {Readonly<Record<string, *>>}
  */
@@ -40,7 +52,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   readerFontSize: 17,      // 阅读字号 (px)，范围 12..24
   readerLineHeight: 1.85,  // 阅读行距，范围 1.4..2.2
   fileListSort: 'name',    // 'name' | 'mtime-desc'
-  autoSaveDebounceMs: 500, // 自动保存防抖延迟（ms）；0 = 关闭；默认 500ms = 「停打后立刻存」
+  autoSaveDebounceMs: AUTO_SAVE_DEFAULT_DEBOUNCE_MS, // 防抖延迟（ms）；0 = 关闭；默认 500ms
   splitRatio: 0.5,         // 双栏模式左侧占比 0.2..0.8
   sidebarWidth: null,       // 侧栏拖拽后的宽度（px）；null = 使用 CSS 默认 --w-sidebar
   aiWidth: null,            // AI 中间面板拖拽后的宽度（px）；null = 使用 CSS 默认 --w-ai
@@ -211,9 +223,24 @@ const SETTINGS_UI_OPTIONS = Object.freeze({
   readerLineHeight: Object.freeze([1.5, 1.7, 1.85, 2.0]),
   // 两个选项都标"兼容"：突出是「按这个协议实现的兼容 API」而不是特定厂商；
   // 用户可填任意走该协议的 baseURL（中转、自部署、官方 API 都行）。
+  //
+  // defaults：当用户切到对应 provider 但 aiBaseUrl / aiModel 为空时，UI 用
+  // 这里给的提示值作为 placeholder（不是写盘默认值 —— 用户不主动保存就
+  // 不会落盘，避免「换 provider 就把 baseURL 改了」的侵入感）。原来散在
+  // src/settings-dialog.js 顶部的 AI_DEFAULTS，迁到这里与 schema 同源。
   aiProvider: Object.freeze([
-    { value: 'openai', label: 'OpenAI 兼容', hint: '/chat/completions · 含 DeepSeek / Moonshot / Azure 等' },
-    { value: 'anthropic', label: 'Anthropic 兼容', hint: '/v1/messages · Claude 系列 · 含第三方中转' },
+    {
+      value: 'openai',
+      label: 'OpenAI 兼容',
+      hint: '/chat/completions · 含 DeepSeek / Moonshot / Azure 等',
+      defaults: Object.freeze({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' }),
+    },
+    {
+      value: 'anthropic',
+      label: 'Anthropic 兼容',
+      hint: '/v1/messages · Claude 系列 · 含第三方中转',
+      defaults: Object.freeze({ baseUrl: 'https://api.anthropic.com', model: 'claude-opus-5' }),
+    },
   ]),
 });
 
@@ -298,6 +325,13 @@ async function validateKey(key, raw, opts = {}) {
       if (raw === null || raw === undefined) {
         return { ok: false, error: `${key} 必须是数字` };
       }
+      // 拒绝 Boolean —— Number(true) === 1, Number(false) === 0；旧异步路径
+      // 漏 typeof 守卫，autoSaveDebounceMs: true 会静默变 1ms（每个 keystroke
+      // 都保存）；splitRatio: false 会变 0（无预览面板）。同步路径 sanitizeSync
+      // 早就修过（Round 4 fix），这里镜像对称。
+      if (typeof raw === 'boolean') {
+        return { ok: false, error: `${key} 必须是数字` };
+      }
       if (typeof raw === 'string' && raw.trim() === '') {
         return { ok: false, error: `${key} 必须是数字` };
       }
@@ -329,13 +363,27 @@ async function validateKey(key, raw, opts = {}) {
       // 但 settings-dialog applySetting 走异步路径）会出现 update() reject / load() accept 的不对称。
       // 现在 undefined 走「视为 null」分支。
       if (raw === null || raw === undefined) return { ok: true, value: null };
+      // 拒绝 Boolean —— 与 'number' 分支对称（Round 13 fix）。
+      if (typeof raw === 'boolean') {
+        return { ok: false, error: `${key} 必须是数字或 null` };
+      }
       if (typeof raw === 'string' && raw.trim() === '') {
         return { ok: false, error: `${key} 必须是数字或 null` };
       }
       const n = Number(raw);
       if (!Number.isFinite(n)) return { ok: false, error: `${key} 必须是数字或 null` };
       let v = n;
+      // Round 13 fix：与同步 sanitizeSync 对称支持 clamp / round —— 否则
+      // 异步路径会拒绝「拖动侧栏到 500」（超 max 480），同步路径静默 clamp；
+      // 同一字段 update() reject / load() accept，UI 行为漂移。
+      if (rule.clamp && (v < rule.min || v > rule.max)) {
+        v = Math.min(Math.max(v, rule.min), rule.max);
+      }
       if (rule.integer) v = Math.round(v);
+      if (typeof rule.round === 'number') {
+        const k = 10 ** rule.round;
+        v = Math.round(v * k) / k;
+      }
       if (v < rule.min || v > rule.max) {
         return { ok: false, error: `${key} 超出范围 [${rule.min}, ${rule.max}]` };
       }
@@ -393,13 +441,13 @@ function coerceLoadedSettings(raw) {
 
   // 旧版 autoSaveIntervalSec (enum: 0/3/10 秒 轮询) → autoSaveDebounceMs (ms 防抖)
   // 语义变了：「每隔 X 秒轮询」变成「停打 X ms 后保存」。所有「开启」档位
-  // （旧 3 秒、10 秒）一律映射到新的 500ms 默认值，避免老用户升级后自动保存
-  // 突然变得非常激进（1s 内反复触发）或太迟（10s 才一次）。
+  // （旧 3 秒、10 秒）一律映射到新的 AUTO_SAVE_DEFAULT_DEBOUNCE_MS，避免老用户
+  // 升级后自动保存突然变得非常激进（1s 内反复触发）或太迟（10s 才一次）。
   if ('autoSaveIntervalSec' in raw) {
     const old = raw.autoSaveIntervalSec;
     if (!('autoSaveDebounceMs' in raw)) {
       const offish = old === 0 || old === '0' || old === false;
-      raw.autoSaveDebounceMs = offish ? 0 : 500;
+      raw.autoSaveDebounceMs = offish ? 0 : AUTO_SAVE_DEFAULT_DEBOUNCE_MS;
     }
     delete raw.autoSaveIntervalSec;
   }
@@ -560,6 +608,7 @@ module.exports = {
   DEFAULT_SETTINGS,
   SETTINGS_SCHEMA,
   SETTINGS_UI_OPTIONS,
+  AUTO_SAVE_DEFAULT_DEBOUNCE_MS,
   validateKey,
   validateAndSanitize,
   coerceLoadedSettings,

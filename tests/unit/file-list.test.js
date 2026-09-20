@@ -80,14 +80,14 @@ describe('FileList 搜索 / 排序行为', () => {
     feed([
       { name: 'alpha.md', path: '/d/alpha.md', mtimeMs: 300 },
       { name: 'beta.md',   path: '/d/beta.md',   mtimeMs: 100 },
-      { name: 'welcome.md', path: '/d/welcome.md', mtimeMs: 50 },
+      { name: 'README.md', path: '/d/README.md', mtimeMs: 50 },
     ]);
-    // 搜 'wel' 应该让 welcome.md 排前，不管它的 mtime 是最旧的
-    searchInput.value = 'wel';
+    // 搜 'read' 应该让 README.md 排前，不管它的 mtime 是最旧的
+    searchInput.value = 'read';
     searchInput.dispatchEvent(new Event('input'));
     // 等 debounce flush（100ms）
     return new Promise((r) => setTimeout(r, 150)).then(() => {
-      expect(renderedNames()[0]).toBe('welcome.md');
+      expect(renderedNames()[0]).toBe('README.md');
     });
   });
 

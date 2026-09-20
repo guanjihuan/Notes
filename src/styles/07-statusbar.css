@@ -136,6 +136,49 @@
   padding: 5px 4px;
 }
 
+/* 文件夹管理按钮（状态栏左段，[[feedback-folder-actions-to-statusbar]]）：
+   icon-only 紧凑按钮（24×24px），不抢 .status-path 的视觉中心；
+   tertiary 文字 + 透明底 → 鼠标 hover 才出"可点"反馈，与右段 count chip 同档
+   "辅助信息"权重。点击由 app.js 的 linkOpenFolder / linkSwitchFolder /
+   btnResetFolder 处理器接管（与旧侧栏底部同 ID 复用，wiring 不用改）。 */
+.status-folder-btn {
+  flex: 0 0 auto;
+  /* 22 → 24：与右侧 .status-chip 的 5+1 padding + 13px 字 ≈ 25px 视觉高度
+     对齐，不再比 chip 矮一档。点击命中区也同步 +2px，22px 在 38px statusbar
+     里偏窄，鼠标移动精度不够容易点偏 */
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--fg-tertiary);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    transform var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+/* hover 补一抹微弱 accent 辉光：folder 按钮当前只有背景+文字色变，
+   在 24×24 的紧凑尺寸下需要更明显的"可点"反馈；用 color-mix 把
+   --accent 透明度压在 12% 避免抢戏，仅作为可点击提示 */
+.status-folder-btn:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.status-folder-btn:active {
+  transform: scale(0.92);
+}
+.status-folder-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* 状态栏 chip：模式 / 字数 / 滚动进度 */
 .status-chip {
   flex: 0 0 auto;

@@ -99,10 +99,34 @@ export class AiDiffPanel {
 
   /**
    * 渲染/更新 diff。diff = null → 显示空状态。
+   *
+   * 优化 (Round 14)：重渲染延后到下一个 requestAnimationFrame + 同帧合并。
+   * 同一帧内的多次 setDiff 调用只渲染最后一次（user typing 时 onContentChanged
+   * 防抖后会连续触发多次 setDiff，合并后只跑一次 innerHTML）。null 也走这条
+   * 路径（关面板有视觉连续性，不在 sync 阶段提前 hide，避免同帧内出现
+   * 「先显示 → 再隐藏」的闪烁）。
+   *
    * @param {object|null} diff
    */
   setDiff(diff) {
     this._diff = diff;
+    // 记下本帧待渲染的目标；下一帧渲染时如果又被覆盖就以最新为准
+    this._pendingDiff = diff;
+    if (this._renderFrame != null) return;
+    this._renderFrame = requestAnimationFrame(() => {
+      this._renderFrame = null;
+      const target = this._pendingDiff;
+      this._pendingDiff = undefined;
+      this._renderNow(target);
+    });
+  }
+
+  /**
+   * 同步渲染路径：setDiff 入队后的真正执行体。
+   * 抽出来让 setDiff 的同帧合并逻辑（rAF + 末值覆盖）单独维护一份。
+   * @param {object|null} diff
+   */
+  _renderNow(diff) {
     // 每次 setDiff 之前先清掉上一轮的 click 监听器，否则重复 setDiff 会泄漏。
     if (this._cleanup) this._cleanup();
     this._cleanup = null;
@@ -264,5 +288,13 @@ export class AiDiffPanel {
   destroy() {
     if (this._cleanup) this._cleanup();
     this._cleanup = null;
+    // 取消挂起的 rAF：避免 destroy 后 _renderFrame 回调 fire 时拿过时的
+    // this.element / onApplyRegion 等闭包渲染到旧 DOM / 调旧回调（用户切文件
+    // / 重新 bind 时新 panel 已经接管，旧 panel 的 rAF 仍在排队）。
+    if (this._renderFrame != null) {
+      cancelAnimationFrame(this._renderFrame);
+      this._renderFrame = null;
+    }
+    this._pendingDiff = undefined;
   }
 }

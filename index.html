@@ -10,17 +10,6 @@
   <!-- viewport meta (Round 12 P1 audit)：桌面 Electron 也有 webview / web mode 兼容场景 -->
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!--
-    Content Security Policy:
-    - default-src 'self' 只允许加载同源资源
-    - style-src 'self' 'unsafe-inline' 允许 inline style（marked 渲染的代码块可能会用到）
-    - script-src 'self' 'unsafe-inline' 允许同源 + 内联脚本（用于 importmap）
-    - img-src 'self' data: file: 允许 markdown 内嵌图片（本地 + base64）
-
-    关于 'unsafe-inline'：本应用唯一的内联脚本是 importmap（用于映射 CodeMirror 包）。
-    渲染端的实际代码全部走 .js 文件加载。Markdown 内容经 DOMPurify 清洗，<script> 会被剥离。
-    在 contextIsolation + nodeIntegration:false 下，加 'unsafe-inline' 不引入额外 XSS 风险。
-  -->
-  <!--
     Content Security Policy (加固版):
     - default-src 'self' 只允许加载同源资源
     - style-src 'self' 'unsafe-inline' 允许 inline style（marked 渲染的代码块可能会用到）
@@ -35,13 +24,29 @@
     在 contextIsolation + nodeIntegration:false 下，加 'unsafe-inline' 不引入额外 XSS 风险。
     未来若改用 nonce 或 hash，可去除 'unsafe-inline'。
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: file:; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: file:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none';">
   <title>Notes</title>
 
   <!--
     Import map: 把 CodeMirror 6 及其传递依赖映射到本地 node_modules。
     浏览器原生 ESM 不解析 package.json 的 exports 字段，所以必须写完整相对路径。
     style-mod 的 ESM 在 src/ 而不是 dist/（dist/ 只有 CJS）—— 这是常见坑。
+    保留的条目是 src/ 直接 import + lang-markdown 间接需要的传递依赖 + basicSetup
+    顶层 import 拉进来的 search/autocomplete/lint：
+      - 直接 import：view / state / theme-one-dark / lang-markdown
+      - lang-markdown 间接（用于 markdown 内嵌 HTML/CSS/JS 代码块高亮）：
+                  lang-html / lang-css / lang-javascript / lezer/{html,css,javascript}
+      - basicSetup 顶层 import（codemirror/dist/index.js:1-8 用到）：
+                  search / autocomplete / lint
+      - 其他：commands / language / lezer/{common,highlight,markdown,lr}
+                  / marijn/find-cluster-break / style-mod / w3c-keyname / crelt
+    审计 T-7 曾把 search/autocomplete/lint + lang-{html,css,javascript} +
+    lezer-{html,css,javascript} 都当作"无引用"删掉 —— 但这些全是 side-effect
+    链：basicSetup 顶层 import 拉 search/autocomplete/lint；lang-markdown
+    顶层 import 拉 lang-html → 继续拉 lang-css / lang-javascript → 继续拉
+    lezer-{html,css,javascript}。markdown-editor.js 用了 basicSetup + lang-markdown，
+    这 9 条 importmap 条目都不能少，缺一个 renderer 立即
+    "Failed to resolve module specifier '@...'"。
   -->
   <script type="importmap">
   {
@@ -52,8 +57,8 @@
       "@codemirror/commands":        "./node_modules/@codemirror/commands/dist/index.js",
       "@codemirror/language":        "./node_modules/@codemirror/language/dist/index.js",
       "@codemirror/lang-markdown":   "./node_modules/@codemirror/lang-markdown/dist/index.js",
-      "@codemirror/lang-css":        "./node_modules/@codemirror/lang-css/dist/index.js",
       "@codemirror/lang-html":       "./node_modules/@codemirror/lang-html/dist/index.js",
+      "@codemirror/lang-css":        "./node_modules/@codemirror/lang-css/dist/index.js",
       "@codemirror/lang-javascript": "./node_modules/@codemirror/lang-javascript/dist/index.js",
       "@codemirror/search":          "./node_modules/@codemirror/search/dist/index.js",
       "@codemirror/autocomplete":    "./node_modules/@codemirror/autocomplete/dist/index.js",
@@ -62,8 +67,8 @@
       "@lezer/common":               "./node_modules/@lezer/common/dist/index.js",
       "@lezer/highlight":            "./node_modules/@lezer/highlight/dist/index.js",
       "@lezer/markdown":             "./node_modules/@lezer/markdown/dist/index.js",
-      "@lezer/css":                  "./node_modules/@lezer/css/dist/index.js",
       "@lezer/html":                 "./node_modules/@lezer/html/dist/index.js",
+      "@lezer/css":                  "./node_modules/@lezer/css/dist/index.js",
       "@lezer/javascript":           "./node_modules/@lezer/javascript/dist/index.js",
       "@lezer/lr":                   "./node_modules/@lezer/lr/dist/index.js",
       "@marijn/find-cluster-break":  "./node_modules/@marijn/find-cluster-break/src/index.js",
@@ -116,6 +121,28 @@
       <span id="app-title" class="app-title"><span id="app-title-text" class="app-title-text">Notes</span></span>
     </div>
     <div class="toolbar-right no-drag">
+      <!--
+        搜索文件入口（设计优化 2026-09）：
+        - 从侧栏上移到底部顶栏首位，腾出侧栏垂直空间给文件列表
+        - 紧贴侧栏上方，视觉上明确"作用于侧栏"
+        - flex:0 1 240px + min-width:160px：窗口过窄时让搜索框先收缩，
+          不挤掉右侧窗口控制按钮
+      -->
+      <div class="toolbar-search">
+        <svg aria-hidden="true" class="search-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input
+          type="search"
+          id="search-input"
+          class="search-input"
+          placeholder="搜索文件..."
+          aria-label="搜索文件"
+        >
+      </div>
+      <span class="toolbar-divider" aria-hidden="true"></span>
+
       <!-- 应用组：主题 + 置顶 -->
       <div class="toolbar-group">
         <div class="btn-group" role="group" aria-label="外观">
@@ -179,8 +206,8 @@
       <div class="toolbar-group">
         <button class="btn-icon" id="btn-reset-layout" title="重置布局（恢复默认侧栏宽度 + 双栏比例）" aria-label="重置布局">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 12a9 9 0 1 0 3-6.7"></path>
-            <polyline points="3 4 3 9 8 9"></polyline>
+            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+            <line x1="12" y1="3" x2="12" y2="21"></line>
           </svg>
         </button>
       </div>
@@ -212,7 +239,7 @@
 
       <span class="toolbar-divider" aria-hidden="true"></span>
 
-      <!-- 操作组：保存 + 设置 -->
+      <!-- 操作组：保存 + 关闭当前文件 + 设置 -->
       <div class="toolbar-group">
         <!--
           保存按钮始终显示在工具栏；需要保存（脏）时进入 is-dirty 提醒态（warning 色 + 脉动）。
@@ -223,6 +250,21 @@
             <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
             <polyline points="17 21 17 13 7 13 7 21"></polyline>
             <polyline points="7 3 7 8 15 8"></polyline>
+          </svg>
+        </button>
+        <!--
+          关闭当前文件：仅清空视图，不删磁盘文件。disabled 态走 .btn-icon 现有规则
+          （fg-tertiary + opacity 0.4 + cursor not-allowed）；无文件时由 syncCloseFileButton
+          切到 disabled，HTML 默认 disabled 保证首帧 FOUC 也对。
+          与右上角窗口 ×（id=btn-close）区分：那个关的是 BrowserWindow，这个关的是「当前打开的文件」。
+        -->
+        <button class="btn-icon" id="btn-close-file" type="button" title="关闭当前文件（无打开文件）" aria-label="关闭当前文件（无打开文件）" aria-disabled="true" disabled>
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <!-- Lucide file-x 风格：文档 + 右上角 × -->
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="9.5" y1="13" x2="14.5" y2="18"></line>
+            <line x1="14.5" y1="13" x2="9.5" y2="18"></line>
           </svg>
         </button>
         <button class="btn-icon" id="btn-settings" title="设置 (Ctrl+,)" aria-label="设置">
@@ -263,33 +305,12 @@
   -->
   <div class="app-shell" id="app">
     <aside class="sidebar" id="sidebar" aria-label="文件与目录">
-      <div class="sidebar-header">
-        <div class="search-wrap">
-          <svg aria-hidden="true" class="search-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="11" cy="11" r="7"></circle>
-            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-          </svg>
-          <input
-            type="search"
-            id="search-input"
-            class="search-input"
-            placeholder="搜索文件..."
-            aria-label="搜索文件"
-          >
-        </div>
-      </div>
-      <!-- 新建笔记：放在搜索框下方的独立主操作行，不再和搜索框挤在同一排抢首屏注意力（见 [[feedback-prefer-near-affected-area]]） -->
-      <div class="sidebar-new-row">
-        <button id="btn-new-file" class="sidebar-new-btn" type="button" title="新建笔记 (Ctrl+N)" aria-label="新建笔记">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <line x1="12" y1="5" x2="12" y2="19"></line>
-            <line x1="5" y1="12" x2="19" y2="12"></line>
-          </svg>
-          <span>新建笔记</span>
-        </button>
-      </div>
-      <!-- 排序工具条：紧贴它作用的列表，避免埋进设置对话框（见 [[feedback-prefer-near-affected-area]]） -->
-      <div class="sidebar-sort" role="group" aria-label="文件列表排序">
+      <!-- 搜索框已上移到工具栏（见 .toolbar-search），侧栏不再保留 header。
+           排序工具条 + 新建笔记合并行作为首屏唯一入口，垂直空间专注于文件列表 -->
+      <!-- 排序工具条 + 新建笔记：紧贴它作用的列表，避免埋进设置对话框（见 [[feedback-prefer-near-affected-area]]）。
+           新建笔记从独立行合并到排序条右端：节省垂直空间，让侧栏首屏只剩「工具条」一行，
+           主操作 + 列表工具就近成组，视觉密度更紧凑 -->
+      <div class="sidebar-sort" role="group" aria-label="文件列表排序与新建">
         <button id="btn-sort-name" type="button" class="sidebar-sort-btn is-active" aria-pressed="true" title="按名称 A → Z 排序">
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M3 6h13M3 12h9M3 18h5"></path>
@@ -303,6 +324,13 @@
             <polyline points="12 7 12 12 15 14"></polyline>
           </svg>
           <span>修改时间</span>
+        </button>
+        <button id="btn-new-file" class="sidebar-new-btn sidebar-new-btn--inline" type="button" title="新建笔记 (Ctrl+N)" aria-label="新建笔记">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          <span>新建笔记</span>
         </button>
       </div>
 
@@ -324,40 +352,10 @@
         <!-- 文件项由 file-list.js 注入 -->
       </ul>
       <div class="sidebar-footer">
-        <button type="button" id="link-open-folder" class="link-subtle footer-action" title="在系统文件管理器中打开数据文件夹">
-          <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-          </svg>
-          <span>打开数据文件夹</span>
-        </button>
-        <button type="button" id="btn-switch-folder" class="link-subtle footer-action" title="切换到其他数据文件夹">
-          <!-- folder + 双向 swap 箭头 (Lucide folder-sync 风格) -->
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1-2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-            <polyline points="16 3 19 3 19 6"></polyline>
-            <polyline points="8 21 5 21 5 18"></polyline>
-            <line x1="19" y1="3" x2="13" y2="9"></line>
-            <line x1="5" y1="21" x2="11" y2="15"></line>
-          </svg>
-          <span>切换数据文件夹</span>
-        </button>
-        <!-- auto-fallback 2026-08：「回到默认」按钮 —— 清空持久化的 dataDir 并切回 ~/Notes。
-             始终显示：用户切到非默认目录后想回到默认不需要先「切换」再选；救命的入口
-             不能藏在条件分支里。当已经在默认文件夹时按钮可点（toast 提示「已在默认」），
-             复用现有 .link-subtle .footer-action 样式，不新增 CSS。 -->
-        <button type="button" id="btn-reset-folder" class="link-subtle footer-action" title="回到默认数据文件夹（~/Notes）">
-          <!-- home + 屋顶（表达「回到原始默认」） -->
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 12l9-9 9 9"></path>
-            <path d="M5 10v10h14V10"></path>
-          </svg>
-          <span>回到默认</span>
-        </button>
-        <!-- 视觉分隔：把上方"打开/切换数据目录"二级链接和下方 AI 主操作分开 -->
-        <div class="sidebar-footer-sep" aria-hidden="true"></div>
-        <!-- AI 入口：放在侧栏最底，与顶部"主操作（新建笔记）→ 列表 → 排序 → 二级链接"形成层次。
-             默认沿用 .sidebar-new-btn 的描边主操作样式；展开后切到实心强调态（见 src/styles/11-ai.css 的 [aria-pressed="true"]）。
-             AI 是「点开就弹，关闭就退」的命令式入口，与 settingsStore 无交集。 -->
+        <!-- AI 入口：侧栏唯一保留的"次级主操作"按钮。
+             文件夹管理（打开/切换/回到默认）已搬到状态栏左段（见 [[feedback-folder-actions-to-statusbar]]），
+             与 status-path 组成「当前位置 + 操作」语义组；状态栏只有 38px 高，
+             文字版挤在侧栏底部会浪费列表空间，现在侧栏更"纯净"。 -->
         <button id="btn-ai" class="sidebar-new-btn" type="button" title="AI 修改 (Ctrl+Shift+A)" aria-label="AI 修改" aria-pressed="false">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 2a4 4 0 0 0-4 4v1H6a3 3 0 0 0-3 3v9a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-9a3 3 0 0 0-3-3h-2V6a4 4 0 0 0-4-4z"></path>
@@ -443,7 +441,10 @@
           把 <code>.md</code> 文件放入数据文件夹后，<br>
           会自动出现在左侧列表。
         </p>
-        <p class="hint hint-secondary">左下角可切换数据文件夹，或在系统文件管理器中打开。</p>
+        <p class="hint hint-secondary">
+          <kbd>Ctrl</kbd>+<kbd>N</kbd> 新建笔记 · <kbd>Ctrl</kbd>+<kbd>F</kbd> 搜索<br>
+          底部状态栏可切换数据文件夹
+        </p>
       </div>
     </main>
   </div>
@@ -475,10 +476,39 @@
   </div>
 
   <!-- 状态栏：3 段式（路径弱化 / 字数核心 / 模式 + 进度 + 文件数）
-       segment 之间用 .status-spacer 推开，让眼睛先扫到核心信息 -->
+       segment 之间用 .status-spacer 推开，让眼睛先扫到核心信息。
+       状态栏左段同时承担「数据文件夹管理」入口（打开/切换/回到默认），
+       见 [[feedback-folder-actions-to-statusbar]] —— icon-only 紧凑按钮，
+       紧贴 status-path，与路径组成「当前位置 + 操作」语义组。 -->
   <footer class="statusbar">
     <div class="status-segment status-segment-left">
       <button id="status-path" class="status-path status-path-clickable" type="button" title="在文件管理器中显示" aria-label="在文件管理器中显示当前文件">—</button>
+      <span class="status-divider"></span>
+      <button type="button" id="link-open-folder" class="status-folder-btn" title="在系统文件管理器中打开数据文件夹" aria-label="在系统文件管理器中打开数据文件夹">
+        <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </svg>
+      </button>
+      <button type="button" id="btn-switch-folder" class="status-folder-btn" title="切换到其他数据文件夹" aria-label="切换到其他数据文件夹">
+        <!-- folder + 双向 swap 箭头 (Lucide folder-sync 风格) -->
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1-2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+          <polyline points="16 3 19 3 19 6"></polyline>
+          <polyline points="8 21 5 21 5 18"></polyline>
+          <line x1="19" y1="3" x2="13" y2="9"></line>
+          <line x1="5" y1="21" x2="11" y2="15"></line>
+        </svg>
+      </button>
+      <!-- auto-fallback 2026-08：「回到默认」按钮 —— 清空持久化的 dataDir 并切回 ~/Notes。
+           始终显示：用户切到非默认目录后想回到默认不需要先「切换」再选；救命的入口
+           不能藏在条件分支里。当已经在默认文件夹时按钮可点（toast 提示「已在默认」）。 -->
+      <button type="button" id="btn-reset-folder" class="status-folder-btn" title="回到默认数据文件夹（~/Notes）" aria-label="回到默认数据文件夹（~/Notes）">
+        <!-- home + 屋顶（表达「回到原始默认」） -->
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 12l9-9 9 9"></path>
+          <path d="M5 10v10h14V10"></path>
+        </svg>
+      </button>
       <span class="status-divider"></span>
       <span id="status-meta" class="status-meta"></span>
     </div>

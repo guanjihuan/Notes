@@ -1,5 +1,5 @@
 // 工具栏组件
-// 绑定主题切换 / 置顶 / 设置 / 窗口控件按钮的事件。
+// 绑定主题切换 / 置顶 / 设置 / 窗口控件 / 关闭当前文件 按钮的事件。
 //
 // 与 Todo List 的 toolbar.js 区别：去掉了「添加 todo」+ 搜索框 + 视图切换，
 // 只留下窗口控制 + 应用级开关。
@@ -15,8 +15,10 @@ export class Toolbar {
    * @param {() => void} options.onMinimize
    * @param {() => void} options.onToggleMaximize
    * @param {() => void} options.onClose
+   * @param {() => void} [options.onCloseFile] - 关闭当前文件按钮（无文件时按钮 disabled，
+   *        这里仍挂 listener；disabled 浏览器层面不触发 click，但与未来 re-enable 行为一致）
    */
-  constructor({ elements, onThemeClick, onPinClick, onSettingsClick, onResetLayoutClick, onMinimize, onToggleMaximize, onClose }) {
+  constructor({ elements, onThemeClick, onPinClick, onSettingsClick, onResetLayoutClick, onMinimize, onToggleMaximize, onClose, onCloseFile }) {
     this.elements = elements;
 
     if (elements.btnTheme && onThemeClick) {
@@ -39,6 +41,11 @@ export class Toolbar {
     }
     if (elements.btnClose && onClose) {
       elements.btnClose.addEventListener('click', onClose);
+    }
+    // 关闭当前文件：独立 onCloseFile（与 btnClose 区分 —— btnClose 关的是窗口，
+    // btnCloseFile 关的是"当前打开的文件"，语义不一样、回调也不一样）。
+    if (elements.btnCloseFile && onCloseFile) {
+      elements.btnCloseFile.addEventListener('click', onCloseFile);
     }
   }
 }

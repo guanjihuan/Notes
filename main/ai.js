@@ -40,6 +40,9 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 // 内容长度硬上限：防止单次请求几 MB 把 LLM 计费用爆、把事件循环卡住。
 // 1.5 MB ≈ 38 万字符 / 10 万行；超过的文档让用户拆分或手动改。
 const MAX_CONTENT_BYTES = 1_500_000;
+// 提示词硬上限：64 KB ≈ 1.6 万中文字。系统提示词另算（settings 上限 200 KB，
+// 拼接后的总输入也由各 API 服务端二次校验）；这里只挡用户 prompt 单字段。
+const MAX_PROMPT_BYTES = 64_000;
 // 响应体大小上限：防止恶意 / 错误配置的服务器返回几百 MB body 把主进程 OOM。
 // 5 MB 对正常 AI 回复（几十 KB 到 1 MB）足够宽松。
 const MAX_RESP_BYTES = 5 * 1024 * 1024;
@@ -56,6 +59,7 @@ const ANTHROPIC_API_VERSION = '2023-06-01';
 // 把同一份 AI_ERROR 暴露到 window.api.aiErrors，main / renderer 永远引用同一对象，
 // 不再靠注释提醒同步。
 const { AI_ERROR } = require('../shared/ai-errors.js');
+const nodeCrypto = require('node:crypto');
 const ERR_NOT_CONFIGURED = AI_ERROR.NOT_CONFIGURED;
 const ERR_TIMEOUT = AI_ERROR.ERR_TIMEOUT;
 const ERR_PROVIDER = AI_ERROR.ERR_PROVIDER;
@@ -205,13 +209,32 @@ function joinUrl(base, path) {
   // M2 fix (audit)：剥掉 baseURL 里可能存在的 userinfo（`https://user:pass@host`）。
   // fetch 会把 userinfo 当 Basic Auth 自动发送，把 API Key 当用户名/密码发给中转服务，
   // 敏感凭据直接泄露到第三方；错误回显里也会暴露凭据。
+  //
+  // M2 follow-up：旧 regex `^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@` 只识别字面 `@`，
+  // 对 percent-encoded `user%40evil.com:pass@host` 会放过（`%40` 走 URL 解析后
+  // 才被还原成 `@`，fetch 仍按 Basic Auth 发送）。统一走 new URL 解析：URL parser
+  // 主动还原 percent-encoding 并暴露 username / password，靠这两个字段判定 /
+  // 剥除更稳。query / fragment 仍由外层 split 拿回。
   const s = String(base || '');
   const m = s.match(/^([^?#]*)(\?[^#]*)?(#.*)?$/);
   if (!m) return s;
-  let b = m[1].replace(/\/+$/, '');
-  b = b.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/, '$1');
+  let originAndPath = m[1].replace(/\/+$/, '');
+  try {
+    const parsed = new URL(originAndPath);
+    // 任何形式的 userinfo（字面 / percent-encoded / IDN punycode 包装）都会
+    // 被 URL parser 还原到 username / password 字段。剥干净再拼回。
+    // 注意：直接把 username/password 置空 + toString() 仍会保留空 userinfo 的
+    // `https://@host` 形式，所以这里走 host + pathname 重组最稳。
+    if (parsed.username || parsed.password) {
+      const port = parsed.port ? `:${parsed.port}` : '';
+      originAndPath = `${parsed.protocol}//${parsed.hostname}${port}${parsed.pathname}`.replace(/\/+$/, '');
+    }
+  } catch {
+    // URL 解析失败：保留原字符串的 regex 兜底（防御旧路径畸形输入）
+    originAndPath = originAndPath.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/, '$1');
+  }
   const p = String(path || '').replace(/^\/+/, '');
-  return `${b}/${p}${m[2] || ''}${m[3] || ''}`;
+  return `${originAndPath}/${p}${m[2] || ''}${m[3] || ''}`;
 }
 
 /**
@@ -256,10 +279,20 @@ function sanitizeDetail(detail) {
  * @returns {string}
  */
 function sanitizeUrl(raw) {
-  return String(raw || '')
-    // M2 fix (audit)：先剥 userinfo（https://user:pass@host），否则 fetch Basic Auth
-    // 凭据会被完整写到错误日志（即使 query/fragment 已剥，userinfo 仍在 host 前）
-    .replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/, '$1')
+  let s = String(raw || '');
+  // M2 follow-up：与 joinUrl 同款 percent-encoded userinfo 防御。
+  // 先用 new URL 解析（字面 / 编码 / punycode 都被还原到 username/password），
+  // 命中则走 host + pathname 重组。否则 fallback 旧 regex 兜底畸形输入。
+  try {
+    const parsed = new URL(s);
+    if (parsed.username || parsed.password) {
+      const port = parsed.port ? `:${parsed.port}` : '';
+      s = `${parsed.protocol}//${parsed.hostname}${port}${parsed.pathname}`;
+    }
+  } catch {
+    s = s.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/, '$1');
+  }
+  return s
     .replace(/[?#].*$/, '')                                       // 去 query / fragment
     .replace(/\/(sk-[A-Za-z0-9_-]{8,})/g, '/[REDACTED]')         // path 段里的 OpenAI key
     .replace(/\/(AIzaSy[A-Za-z0-9_-]{20,})/g, '/[REDACTED]');    // path 段里的 Google key
@@ -288,8 +321,16 @@ async function readBodyWithLimit(res) {
   /** @type {Buffer[]} */
   const chunks = [];
   let total = 0;
+  let readErr = null;
   while (true) {
-    const { value, done } = await reader.read();
+    let value;
+    let done;
+    try {
+      ({ value, done } = await reader.read());
+    } catch (e) {
+      readErr = e;
+      break;
+    }
     if (done) break;
     total += value.byteLength;
     if (total > MAX_RESP_BYTES) {
@@ -297,6 +338,13 @@ async function readBodyWithLimit(res) {
       return { ok: false, message: 'AI 响应体过大（超过 5 MB）' };
     }
     chunks.push(Buffer.from(value));
+  }
+  if (readErr) {
+    // Round 13 fix (M9)：reader.read() 抛错时不 cancel — 流连接资源会被 GC
+    // 最终释放，但 fetch 在 abort 时仍可能持有未读数据；显式 cancel 让对端
+    // 立即知道我们不再消费，提早关连接。
+    try { reader.cancel(); } catch { /* ignore */ }
+    return { ok: false, message: '读取 AI 响应失败' };
   }
   return { ok: true, text: Buffer.concat(chunks).toString('utf8') };
 }
@@ -343,6 +391,14 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
     // C1 (audit)：与 cancel() 一样同步清理 timeout，避免 setTimeout 回调空转
     for (const timer of timers.values()) clearTimeout(timer);
     timers.clear();
+    // 第二阶段代码审查 (Phase 2 review #3)：同步清理 inFlightRequestIds。
+    // 之前只清 pending / timers —— runEdit 的 finally 也会 clear 自己加进 Set
+    // 的 requestId，所以正常路径下 Set 会自然排空。但 cancelAll 在
+    // app.on('will-quit') 调用（main.js:889），与 runEdit finally 之间存在
+    // 竞态窗口：requestId 仍残留在 Set 里时若有新 AI 请求复用同一 requestId
+    // （test harness / HMR / 未来 re-init），cancel(requestId) 会取消错对象。
+    // 显式 clear 让 cancelAll 真正幂等且不留残根。
+    inFlightRequestIds.clear();
   }
 
   /**
@@ -375,6 +431,32 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
       return { ok: false, reason: 'Base URL 不是合法 URL：' + (e && e.message || '') };
     }
     return { ok: true, value: s };
+  }
+
+  /**
+   * Round 13 fix (M6)：抽「明文 HTTP + 非 loopback + 已配 Key → 拒绝」共用检查。
+   * OpenAI / Anthropic 两条分支各复制 30 行同款防御，现在统一走这里。
+   * 本地代理（Ollama / LM Studio / vllm）走 http://localhost / 127.0.0.1 / ::1
+   * 不需要 Key（apiKey 留空即放过），配置 Key 时必须 HTTPS。
+   * @param {string} baseUrl - 已经 validateBaseUrl 通过的 URL
+   * @param {string} apiKey - 当前配置的 API Key（空串 = 未配）
+   * @returns {null | {ok:false, error:string, message:string}} 通过时返回 null
+   */
+  function rejectInsecureKeyTransport(baseUrl, apiKey) {
+    if (!/^http:\/\//i.test(baseUrl) || !apiKey) return null;
+    try {
+      const parsed = new URL(baseUrl);
+      const host = (parsed.hostname || '').toLowerCase();
+      const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+      if (isLoopback) return null;
+      console.warn('[ai] 明文 HTTP + 非loopback + 已配 Key，拒绝请求以防泄露:', sanitizeUrl(baseUrl));
+      return {
+        ok: false,
+        error: ERR_NOT_CONFIGURED,
+        message: '检测到 Base URL 使用明文 HTTP 且已配置 API Key；请改用 https:// 以避免 Key 在网络传输中被窃取。本地代理（localhost / 127.0.0.1）允许明文。',
+      };
+    } catch { /* validateBaseUrl 已校验过 URL，这里兜底 */ }
+    return null;
   }
 
   /**
@@ -434,12 +516,18 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
    */
   function pickAnthropicTokenConfig(model) {
     const m = String(model || '').toLowerCase();
-    // 5 系（opus-5 / sonnet-5 / fable-5 / mythos-5）与 4.6+ → 官方 128k 上限
-    if (/claude-(opus|sonnet|fable|mythos)-5/.test(m)) return 32_000;
+    // 5 系（opus-5 / sonnet-5 / fable-5 / mythos-5 / haiku-5）+ 4.6+ → 官方 128k 上限
+    // Round 13 fix：旧正则漏了 `claude-haiku-5-*`，会落到下一档的 16k；
+    // 同样保留 haiku-5 与其他 5 系在同一档。
+    if (/claude-(opus|sonnet|fable|mythos|haiku)-5/.test(m)) return 32_000;
     if (/claude-(opus|sonnet)-4-(6|7|8)/.test(m)) return 32_000;
     // 其余 4 系（sonnet-4-5 / opus-4-5 / haiku-4-5 / claude-4-*）+ 3-5 / 3-7
     if (/claude-(3-5|3\.5|3-7|sonnet-4|opus-4|haiku-4|4)/.test(m)) return 16_384;
-    if (/claude-3/.test(m)) return 8_192;
+    // Round 13 fix (H2)：claude-3 老家族官方 max output = 4096。
+    // 旧值 8192 在 opus-3 / sonnet-3 / haiku-3 上会被服务端 400 拒绝，
+    // runEdit 走 TRUNCATED_MESSAGE 分支报「AI 修改结果不完整」（实际是
+    // 请求参数越界，不是输出被截断）。claude-3-5 / claude-3-7 由上一档命中。
+    if (/claude-3/.test(m)) return 4_096;
     return 8_192; // 未知模型回退到 8k —— 之前 4096 经常截断长 diff
   }
 
@@ -676,26 +764,13 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
     if (!urlCheck.ok) {
       return { ok: false, error: ERR_NOT_CONFIGURED, message: urlCheck.reason };
     }
-    // audit fix (Round 8 A-2)：明文 HTTP + 非loopback + 已配置 API Key → 拒绝。
+    // audit fix (Round 8 A-2) + Round 13 抽 helper：明文 HTTP + 非loopback + 已配置 API Key → 拒绝。
     // 本地代理（Ollama / LM Studio / vllm）走 http://localhost / 127.0.0.1 / ::1
     // 且不需要 Key —— apiKey 留空就过；这里有 apiKey 意味着第三方 API，必须 HTTPS。
     // 静默放行会让 Key 在网线上裸奔到攻击者嗅探点，错误必须显式。
     // localhost/127.0.0.1/::1 仍然放过：本地抓包门槛远高于公网，本地代理是合法场景。
-    if (/^http:\/\//i.test(urlCheck.value) && apiKey) {
-      try {
-        const parsed = new URL(urlCheck.value);
-        const host = (parsed.hostname || '').toLowerCase();
-        const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
-        if (!isLoopback) {
-          console.warn('[ai] 明文 HTTP + 非loopback + 已配 Key，拒绝请求以防泄露:', sanitizeUrl(urlCheck.value));
-          return {
-            ok: false,
-            error: ERR_NOT_CONFIGURED,
-            message: '检测到 Base URL 使用明文 HTTP 且已配置 API Key；请改用 https:// 以避免 Key 在网络传输中被窃取。本地代理（localhost / 127.0.0.1）允许明文。',
-          };
-        }
-      } catch { /* validateBaseUrl 已校验过 URL，这里兜底 */ }
-    }
+    const insecureReject = rejectInsecureKeyTransport(urlCheck.value, apiKey);
+    if (insecureReject) return insecureReject;
 
     const url = joinUrl(baseURL, 'chat/completions');
     // H1+H2+H5 (audit)：按模型名路由 token 上限，避免 65536 超过多数模型上限被拒；
@@ -767,23 +842,10 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
     if (!urlCheck.ok) {
       return { ok: false, error: ERR_NOT_CONFIGURED, message: urlCheck.reason };
     }
-    // audit fix (Round 8 A-2)：明文 HTTP + 非loopback + 已配置 API Key → 拒绝。
-    // 与 OpenAI 分支共用同样防御，本地代理不需要 Key，留空即可。
-    if (/^http:\/\//i.test(urlCheck.value) && apiKey) {
-      try {
-        const parsed = new URL(urlCheck.value);
-        const host = (parsed.hostname || '').toLowerCase();
-        const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
-        if (!isLoopback) {
-          console.warn('[ai] 明文 HTTP + 非loopback + 已配 Key，拒绝请求以防泄露:', sanitizeUrl(urlCheck.value));
-          return {
-            ok: false,
-            error: ERR_NOT_CONFIGURED,
-            message: '检测到 Base URL 使用明文 HTTP 且已配置 API Key；请改用 https:// 以避免 Key 在网络传输中被窃取。本地代理（localhost / 127.0.0.1）允许明文。',
-          };
-        }
-      } catch { /* validateBaseUrl 已校验过 URL */ }
-    }
+    // audit fix (Round 8 A-2) + Round 13 抽 helper：与 OpenAI 分支共用同样防御，
+    // 本地代理不需要 Key，留空即可。
+    const insecureReject = rejectInsecureKeyTransport(urlCheck.value, apiKey);
+    if (insecureReject) return insecureReject;
 
     const url = joinUrl(baseURL, 'v1/messages');
     // H1 (audit)：Anthropic 各模型 max_tokens 上限不同，超额会 400
@@ -822,6 +884,11 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
     let hasNonTextBlock = false;
     for (const block of json.content) {
       if (block && block.type === 'text' && typeof block.text === 'string') {
+        // Round 13 fix (H7)：Anthropic 不保证 text 块之间有分隔符。
+        // [{text:'A.'}, {text:'B begin.'}] 直接拼接得 'A.B begin.'，
+        // Markdown 渲染会把 `A.B` 误识为 list / 句点边界。块与块之间补
+        // 双换行（Markdown 段落分隔），让多块拼接后渲染保持原意。
+        if (message && !message.endsWith('\n')) message += '\n\n';
         message += block.text;
       } else if (block && block.type !== 'text') {
         // audit fix (shared-M11)：tool_use / tool_result / image 等非文本块
@@ -850,6 +917,14 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
     return { ok: true, id: requestId, content: normalized.content, responseFormat: normalized.responseFormat };
   }
 
+  // Round 13 fix (H3)：从共享 AI_ERROR 引用错误码字面值。原先 4 处裸字面量
+  // ('INVALID_PROMPT' / 'INVALID_CONTENT' / 'CONTENT_TOO_LARGE' / 'PROMPT_TOO_LARGE')
+  // 绕开 AI_ERROR，renderer 端 ai-controller 走通用 toast 而不是本地化提示。
+  const ERR_INVALID_PROMPT = AI_ERROR.INVALID_PROMPT;
+  const ERR_INVALID_CONTENT = AI_ERROR.INVALID_CONTENT;
+  const ERR_CONTENT_TOO_LARGE = AI_ERROR.CONTENT_TOO_LARGE;
+  const ERR_PROMPT_TOO_LARGE = AI_ERROR.PROMPT_TOO_LARGE;
+
   /**
    * 执行一次 AI 修改请求。
    * @param {{ prompt:string, content:string, filename:string, requestId:string }} input
@@ -857,31 +932,33 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
    */
   async function runEdit({ prompt, content, filename, requestId }) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
-      return { ok: false, error: 'INVALID_PROMPT', message: '修改要求不能为空' };
+      return { ok: false, error: ERR_INVALID_PROMPT, message: '修改要求不能为空' };
     }
     if (typeof content !== 'string') {
-      return { ok: false, error: 'INVALID_CONTENT', message: '当前文件内容无效' };
+      return { ok: false, error: ERR_INVALID_CONTENT, message: '当前文件内容无效' };
     }
     // 字节上限用 UTF-8 编码长度近似（中文/emoji 一个字符多字节，会略高估）
     if (Buffer.byteLength(content, 'utf8') > MAX_CONTENT_BYTES) {
       return {
         ok: false,
-        error: 'CONTENT_TOO_LARGE',
+        error: ERR_CONTENT_TOO_LARGE,
         message: `文档过大（超过 ${(MAX_CONTENT_BYTES / 1024 / 1024).toFixed(1)} MB），请拆分后再让 AI 修改`,
       };
     }
-    if (Buffer.byteLength(prompt, 'utf8') > 64_000) {
+    if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) {
       return {
         ok: false,
-        error: 'PROMPT_TOO_LARGE',
-        message: '提示词过长（超过 64 KB），请简化要求',
+        error: ERR_PROMPT_TOO_LARGE,
+        message: `提示词过长（超过 ${MAX_PROMPT_BYTES / 1024} KB），请简化要求`,
       };
     }
     if (typeof filename !== 'string') {
       filename = '';
     }
     if (typeof requestId !== 'string' || !requestId) {
-      requestId = `ai-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      // Round 13 fix (M8)：用 crypto.randomUUID 代替 Math.random；后者在
+      // 高并发（用户连点）下理论碰撞，会让 cancel 误杀新请求。
+      requestId = `ai-${Date.now()}-${nodeCrypto.randomUUID()}`;
     }
 
     const config = (typeof getConfig === 'function' ? getConfig() : {}) || {};

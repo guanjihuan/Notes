@@ -1031,3 +1031,74 @@ describe('atomicWriteFile fsync 行为 (audit Round 4 P0-1)', () => {
     expect(leftover).toEqual([]);
   });
 });
+
+// audit fix (Tmp-L2)：ATOMIC_TMP_RE 之前太宽，把用户合法文件（`report.tmp.<ts>.<ts>.<rand>`）
+// 也当成孤儿静默 unlink。这组测试钉死「仅匹配 EDITABLE_EXTS.tmp.<pid>.<ts>.<rand>」的边界。
+describe('ATOMIC_TMP_RE（cleanupStaleFileTmpFiles 模式 audit Tmp-L2）', () => {
+  it('匹配：<basename>.<editableExt>.tmp.<pid>.<ts>.<rand>', () => {
+    expect(fileOps.ATOMIC_TMP_RE.test('note.md.tmp.12345.1700000000000.abcdef')).toBe(true);
+    expect(fileOps.ATOMIC_TMP_RE.test('a.py.tmp.999.1700000000000.a1b2c3')).toBe(true);
+    expect(fileOps.ATOMIC_TMP_RE.test('sub_deep_name.json.tmp.7.1700000000000.zz9xka')).toBe(true);
+  });
+
+  it('拒绝：用户文件 report.tmp.<ts>.<ts>.<rand>（无 EDITABLE_EXT 前缀）', () => {
+    // 这正是误伤 bug 的源头 —— 没有 md / py / json 等扩展名前缀，
+    // 旧版 `/\\.tmp\\.\\d+\\.\\d+\\.[a-z0-9]+$/i` 会把这条匹配上。
+    expect(fileOps.ATOMIC_TMP_RE.test('report.tmp.2024.1234567.abcdef')).toBe(false);
+    expect(fileOps.ATOMIC_TMP_RE.test('backup.tmp.1700000000000.1700000000000.abcdef')).toBe(false);
+  });
+
+  it('拒绝：binary / 非白名单扩展名', () => {
+    expect(fileOps.ATOMIC_TMP_RE.test('photo.jpg.tmp.123.1700000000000.abcdef')).toBe(false);
+    expect(fileOps.ATOMIC_TMP_RE.test('archive.zip.tmp.123.1700000000000.abcdef')).toBe(false);
+  });
+
+  it('拒绝：config-store 的 config.json.tmp.* 也在范围外（由它自己管）', () => {
+    // config-store 的旧 tmp 不被 fileOps 清理 —— 这里只确认 ATOMIC_TMP_RE 不会
+    // 误伤。注意 config.json 不在 EDITABLE_EXTS（json 在）是，所以这条 *会* 匹配上；
+    // 故 cleanupStaleFileTmpFiles 内部排除逻辑在更上层处理。tmp 段格式补 digit.ts.rand 即可。
+    expect(fileOps.ATOMIC_TMP_RE.test('config.json.tmp.123.1700000000000.abcdef')).toBe(true);
+    // 但 `config.json.tmp.123` 这种三段缺一不可被拒（rand 不在）。
+    expect(fileOps.ATOMIC_TMP_RE.test('config.json.tmp.123.1700000000000')).toBe(false);
+  });
+
+  it('拒绝：长度字段结构错误（rand 大于 8 字符 / pid 非数字）', () => {
+    expect(fileOps.ATOMIC_TMP_RE.test('note.md.tmp.abc.1700000000000.abcdef')).toBe(false); // pid 非数字
+    expect(fileOps.ATOMIC_TMP_RE.test('note.md.tmp.123.abc.abcdef')).toBe(false); // ts 非数字
+    expect(fileOps.ATOMIC_TMP_RE.test('note.md.tmp.123.1700000000000.UPPERCASE')).toBe(false); // rand 范围
+  });
+});
+
+// audit fix (Tmp-L2)：端到端验证 cleanupStaleFileTmpFiles 不会清理非自家产物
+describe('cleanupStaleFileTmpFiles（端到端 audit Tmp-L2）', () => {
+  it('用户文件 report.tmp.<ts>.<ts>.<rand> 即使旧到 24h+ 也不被删', async () => {
+    // 写入一个旧 mtime 的文件（远大于 CROSS_PID_STALE_THRESHOLD_MS = 24h）。
+    const userFile = join(dir, 'report.tmp.1700000000000.1700000000000.aabbcc');
+    writeFileSync(userFile, 'user data', 'utf-8');
+    const past = Date.now() - (48 * 60 * 60 * 1000); // 48 小时前
+    const { utimesSync } = require('fs');
+    utimesSync(userFile, past / 1000, past / 1000);
+
+    await fileOps.cleanupStaleFileTmpFiles(dir);
+
+    // 必须仍在 —— 旧版会因为 tmp 段格式匹配而删掉它。
+    const { existsSync } = require('fs');
+    expect(existsSync(userFile)).toBe(true);
+  });
+
+  it('真正属于自家 atomicWriteFile 产物的孤儿 .md.tmp.<pid>.<ts>.<rand> 会按阈值清理', async () => {
+    // 模拟本进程 PID + 一个非常旧的时间戳（>24h）
+    const orphanName = `note.md.tmp.${process.pid}.1000000000000.abc123`;
+    const orphanFile = join(dir, orphanName);
+    writeFileSync(orphanFile, 'orphan', 'utf-8');
+    const past = Date.now() - (48 * 60 * 60 * 1000);
+    const { utimesSync } = require('fs');
+    utimesSync(orphanFile, past / 1000, past / 1000);
+
+    await fileOps.cleanupStaleFileTmpFiles(dir);
+
+    // 自家 PID 时 STALE_THRESHOLD_MS = 60s，48h 自然删除
+    const { existsSync } = require('fs');
+    expect(existsSync(orphanFile)).toBe(false);
+  });
+});

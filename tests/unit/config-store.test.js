@@ -545,22 +545,22 @@ describe('resolveDataDirOrFallback（auto-fallback 2026-08）', () => {
 });
 
 describe('ensureDefaultDataDir（auto-create + seed 2026-08）', () => {
-  // 用 welcome.md 自己作为「已种子」标记，不再写 .notes-seeded 隐藏文件
+  // 用 README.md 自己作为「已种子」标记，不再写 .notes-seeded 隐藏文件
   // —— 用户数据目录应该只放用户的内容。
 
-  it('welcome.md 已存在 → 跳过（幂等）', async () => {
+  it('README.md 已存在 → 跳过（幂等）', async () => {
     configStore.init();
     const defaultDir = join(mockHomeDir, 'Notes');
     mkdirSync(defaultDir, { recursive: true });
-    writeFileSync(join(defaultDir, 'welcome.md'), '用户改过的内容', 'utf-8');
+    writeFileSync(join(defaultDir, 'README.md'), '用户改过的内容', 'utf-8');
 
     await configStore.ensureDefaultDataDir();
 
-    // welcome.md 存在 → 不重新复制
-    expect(readFileSync(join(defaultDir, 'welcome.md'), 'utf-8')).toBe('用户改过的内容');
+    // README.md 存在 → 不重新复制
+    expect(readFileSync(join(defaultDir, 'README.md'), 'utf-8')).toBe('用户改过的内容');
   });
 
-  it('默认目录已有其它 .md → 不复制 welcome.md，不写隐藏文件', async () => {
+  it('默认目录已有其它 .md → 不复制任何 onboarding，不写隐藏文件', async () => {
     configStore.init();
     const defaultDir = join(mockHomeDir, 'Notes');
     mkdirSync(defaultDir, { recursive: true });
@@ -568,23 +568,25 @@ describe('ensureDefaultDataDir（auto-create + seed 2026-08）', () => {
 
     await configStore.ensureDefaultDataDir();
 
-    // 不复制 welcome.md，也不创建 .notes-seeded（用户数据目录应该干净）
-    expect(existsSync(join(defaultDir, 'welcome.md'))).toBe(false);
+    // 不复制 README.md，也不创建 .notes-seeded（用户数据目录应该干净）
+    expect(existsSync(join(defaultDir, 'README.md'))).toBe(false);
     expect(existsSync(join(defaultDir, '.notes-seeded'))).toBe(false);
   });
 
-  it('默认目录为空 → 复制 welcome.md（不创建隐藏文件）', async () => {
+  it('默认目录为空 → 复制 README.md（不创建隐藏文件）', async () => {
     configStore.init();
     const defaultDir = join(mockHomeDir, 'Notes');
     mkdirSync(defaultDir, { recursive: true });
 
     await configStore.ensureDefaultDataDir();
 
-    expect(existsSync(join(defaultDir, 'welcome.md'))).toBe(true);
+    // README.md 是 sentinel + 唯一 onboarding 文件
+    expect(existsSync(join(defaultDir, 'README.md'))).toBe(true);
+    // 不写隐藏文件
     expect(existsSync(join(defaultDir, '.notes-seeded'))).toBe(false);
   });
 
-  it('默认目录不存在 → 自动创建 + 复制', async () => {
+  it('默认目录不存在 → 自动创建 + 复制 README.md', async () => {
     configStore.init();
     // 不 mkdir，让 ensure 自己去建
 
@@ -592,7 +594,7 @@ describe('ensureDefaultDataDir（auto-create + seed 2026-08）', () => {
 
     const defaultDir = join(mockHomeDir, 'Notes');
     expect(existsSync(defaultDir)).toBe(true);
-    expect(existsSync(join(defaultDir, 'welcome.md'))).toBe(true);
+    expect(existsSync(join(defaultDir, 'README.md'))).toBe(true);
   });
 
   it('用户已设 customDir → 仍种子默认目录（auto-fallback 需要）', async () => {
@@ -606,20 +608,20 @@ describe('ensureDefaultDataDir（auto-create + seed 2026-08）', () => {
 
     const defaultDir = join(mockHomeDir, 'Notes');
     expect(existsSync(defaultDir)).toBe(true);
-    expect(existsSync(join(defaultDir, 'welcome.md'))).toBe(true);
+    expect(existsSync(join(defaultDir, 'README.md'))).toBe(true);
   });
 
-  it('重复调用幂等（welcome.md 命中后第二次不覆盖用户内容）', async () => {
+  it('重复调用幂等（README.md 命中后第二次不覆盖用户内容）', async () => {
     configStore.init();
     const defaultDir = join(mockHomeDir, 'Notes');
     mkdirSync(defaultDir, { recursive: true });
 
     await configStore.ensureDefaultDataDir();
-    // 用户改 welcome.md 后再调一次 ensure → 内容应保留
-    writeFileSync(join(defaultDir, 'welcome.md'), '用户改过的内容', 'utf-8');
+    // 用户改 README.md 后再调一次 ensure → 内容应保留
+    writeFileSync(join(defaultDir, 'README.md'), '用户改过的内容', 'utf-8');
     await configStore.ensureDefaultDataDir();
 
-    expect(readFileSync(join(defaultDir, 'welcome.md'), 'utf-8')).toBe('用户改过的内容');
+    expect(readFileSync(join(defaultDir, 'README.md'), 'utf-8')).toBe('用户改过的内容');
   });
 });
 
@@ -664,7 +666,7 @@ describe('ensureDefaultDataDirSync（sync mkdir）', () => {
 
   it('resolveDataDirOrFallback fallback 路径也自动 ensure 默认目录', async () => {
     // U 盘掉线 → custom 失效 → runtime fallback 到默认。如果默认也从未
-    // 建过/用过，要立刻能列出文件（welcome.md 由异步 ensure 种子）。
+    // 建过/用过，要立刻能列出文件（README.md 由异步 ensure 种子）。
     configStore.init();
     const realDir = mkdtempSync(join(tmpdir(), 'notes-fb-ensure-'));
     await configStore.saveConfig({ dataDir: realDir });
@@ -679,7 +681,7 @@ describe('ensureDefaultDataDirSync（sync mkdir）', () => {
     expect(existsSync(defaultDir)).toBe(true);
     // 异步种子：fire-and-forget，等 in-flight 完成
     await configStore.scheduleEnsureDefaultDataDir();
-    expect(existsSync(join(defaultDir, 'welcome.md'))).toBe(true);
+    expect(existsSync(join(defaultDir, 'README.md'))).toBe(true);
   });
 });
 
@@ -708,7 +710,7 @@ describe('scheduleEnsureDefaultDataDir（fire-and-forget 去重）', () => {
     mkdirSync(defaultDir, { recursive: true });
 
     await configStore.seedDefaultDataDir();
-    expect(existsSync(join(defaultDir, 'welcome.md'))).toBe(true);
+    expect(existsSync(join(defaultDir, 'README.md'))).toBe(true);
   });
 });
 

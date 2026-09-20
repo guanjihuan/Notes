@@ -1,6 +1,6 @@
 // 全局快捷键
 //
-// 10 个常用快捷键（详见下文清单）：
+// 11 个常用快捷键（详见下文清单）：
 //   - Ctrl/Cmd + F           聚焦文件搜索框（编辑器内让给 CM6 查找面板）
 //   - Ctrl/Cmd + S           保存当前编辑的文件（脏状态时）
 //   - Ctrl/Cmd + E           切换视图模式（preview → edit → split）
@@ -10,6 +10,7 @@
 //   - Ctrl/Cmd + Shift+T     切换主题
 //   - Ctrl/Cmd + Shift+F     切换聚焦模式（隐藏工具栏/侧栏/状态栏）
 //   - Ctrl/Cmd + Shift+A     切换 AI 修改面板（编辑器内让给 CM6）
+//   - Ctrl/Cmd + W           关闭当前打开的文件（无文件时 no-op；模态打开时吞掉）
 //   - Esc（搜索框内）        清空搜索
 //
 // 注意：CM6 内部的 keymap 会优先拦截 Mod-s / Mod-f（在编辑器聚焦时），
@@ -46,6 +47,7 @@ function isInsideEditor(e) {
  * @param {() => void} [handlers.onToggleFocusMode] - Ctrl/Cmd+Shift+F
  * @param {() => void} [handlers.onToggleAi] - Ctrl/Cmd+Shift+A（AI 修改面板）
  * @param {() => void} [handlers.onReload]   - Ctrl/Cmd+R（README 之前提到但未注册——audit 补全）
+ * @param {() => void} [handlers.onCloseFile] - Ctrl/Cmd+W（关闭当前打开的文件；无文件时 no-op）
  */
 export function mountKeyboardShortcuts({
   onFocusSearch,
@@ -58,6 +60,7 @@ export function mountKeyboardShortcuts({
   onToggleFocusMode,
   onToggleAi,
   onReload,
+  onCloseFile,
 }) {
   // audit fix (Phase O-M2)：提取命名 handler 让 dispose 能 removeEventListener。
   // 之前匿名函数 addEventListener 后无法解绑，测试 beforeEach 反复 mount
@@ -198,6 +201,29 @@ export function mountKeyboardShortcuts({
     if ((e.key === 'r' || e.key === 'R') && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       if (onReload) onReload();
+      return;
+    }
+
+    // Ctrl/Cmd + W → 关闭当前打开的文件。
+    // 与 Ctrl+R 不同：必须 preventDefault —— 否则 Electron 默认行为是直接
+    // 关闭 BrowserWindow，把应用整个干掉（不是"关文件"）。这也让 SUPPRESS_KEYS
+    // 在模态打开时的 e.preventDefault() 守卫有意义：模态期吞掉 Ctrl+W
+    // （参见 M1 audit 的注释），否则模态连同未保存数据一起被关。
+    // 必须在 modalOpen 分支之前：modalOpen 分支对 'w' 已做 suppress，但仍要走
+    // 到下面这条普通分支（如果模态期被吞就 return 在 modal 分支里；不 return
+    // 则落到这里）。实际效果：模态期被吞、不调 onCloseFile；非模态期调 onCloseFile。
+    if ((e.key === 'w' || e.key === 'W') && !e.shiftKey && !e.altKey) {
+      // audit fix (Modal-L3)：上面 line 101 的 SUPPRESS_KEYS 分支条件是
+      // `modalOpen && !inEditor` —— 当用户在 modal 打开期间点回了编辑器
+      // （modal 与编辑器不互斥），inEditor=true 分支被跳过，Ctrl+W 落到这里
+      // 触发 onCloseFile → 文件被关（脏状态还会问保存/丢弃/取消），modal 仍挂着。
+      // 这条分支独立再补一道 modalOpen 守卫：modal 期间无论焦点在哪都吞掉 Ctrl+W。
+      if (modalOpen) {
+        e.preventDefault();
+        return;
+      }
+      e.preventDefault();
+      if (onCloseFile) onCloseFile();
       return;
     }
   };

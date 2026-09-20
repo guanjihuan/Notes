@@ -367,7 +367,12 @@ export class MarkdownViewer {
       const abs = resolvePath(baseDir, decoded);
       if (!abs) continue; // '../..' 越界
       // 安全边界：解析后的路径必须在数据目录内。越界直接剥 src，不暴露外部文件路径。
-      if (dataDir && !isPathInside(abs, dataDir)) {
+      // audit fix (Sec-M2)：旧版 `if (dataDir && !isPathInside(...))` 在 dataDir
+      // 为 null（getDataDir IPC 失败 / 启动早期 / window.api 被换）时**跳过整段
+      // 边界检查**，任意解析后的绝对路径都会被改写成 file:// URL 喂给浏览器 →
+      // 文件系统枚举 oracle（恶意 md 可以用 `<img src="../victim.png">` 探测
+      // 哪些路径指向合法图片）。改 fail-closed：dataDir 不可用时一律不下发 src。
+      if (!dataDir || !isPathInside(abs, dataDir)) {
         img.removeAttribute('src');
         // 保留视觉占位：把 alt 提到 title，并加一个占位属性让 CSS 可选择
         img.setAttribute('data-blocked', 'external');

@@ -22,6 +22,9 @@ import { showToast } from './feedback.js';
 import { showPromptDialog } from './prompt-dialog.js';
 import { showConfirmDialog } from './confirm-dialog.js';
 import { isMarkdownFile } from './utils.js';
+// 救援工具：与 src/app.js 共享同一份命名 / toast / friendlyFsError 逻辑，
+// 这里只关心「我有 content、想救回」。详见 src/rescue.js 注释。
+import { rescueDirtyContent } from './rescue.js';
 // 审计修复 (Round 11 deep-fix P1-1)：create / delete / rename 三个回调的入口
 // 在读 state.isDirty 之前必须先 syncDirtyFromEditor —— 否则 CJK 用户在 IME
 // 合成期调「新建 / 删除 / 重命名」时，state.isDirty 是 stale false，跳过
@@ -166,22 +169,15 @@ export function createFileOps(ctx) {
           // → 正在编辑的 dirty 内容静默丢失。state.deletingPath 已设，挡住 onFilesChanged
           // rescue 分支的并发救回，但 IPC 返回后由本函数自己救一次，保证不漏。
           if (state.isDirty && state.currentFile && state.currentFile.path === file.path) {
-            const originalName = state.currentFile.name || 'untitled.md';
-            const base = originalName.replace(/\.md$/i, '');
-            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23);
-            const suffix = Math.random().toString(36).slice(2, 6);
-            const rescueName = `${base}-rescued-${stamp}-${suffix}.md`;
-            const rescueContent = (typeof editor.getContent === 'function') ? editor.getContent() : '';
             // 复用 ctx.api 保持 IPC 源一致（与文件其它调用方对齐），不走 window.api。
-            api.createFile(rescueName, rescueContent).then((r) => {
-              if (r && r.ok) {
-                showToast(`文件已不在；未保存内容已救回到「${rescueName}」`, 'warning', 4500);
-              } else {
-                showToast(`文件已不在；未保存内容丢失（救回失败：${window.api.friendlyFsError(r?.code, r?.error)}）`, 'error', 4500);
-              }
-            }).catch((e) => {
-              console.error('[file-ops] delete FILE_NOT_FOUND rescue IPC 异常:', e);
-              showToast('文件已不在；未保存内容丢失', 'error', 4500);
+            // 命名 / toast 文案 / friendlyFsError 错误码 vs message 的判断
+            // 全部收口到 src/rescue.js（之前这里手动传 r?.message || r?.error
+            // 是 audit Round 16 R2 修过的关键 bug —— 业务码不能给用户看）。
+            rescueDirtyContent({
+              api,
+              originalName: state.currentFile.name,
+              content: (typeof editor.getContent === 'function') ? editor.getContent() : '',
+              event: '文件已不在',
             });
           } else {
             showToast('文件已不存在', 'warning');
@@ -255,24 +251,16 @@ export function createFileOps(ctx) {
         // → dirty 内容不能直接 clearCurrentFile 丢。先取 editor.getContent()
         // 救到 rescue 文件，再清。复用 onFilesChanged rescue 的 createFile 模式。
         if (state.isDirty && state.currentFile && state.currentFile.path === file.path) {
-          const originalName = state.currentFile.name || 'untitled.md';
-          const base = originalName.replace(/\.md$/i, '');
-          const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23);
-          const suffix = Math.random().toString(36).slice(2, 6);
-          const rescueName = `${base}-rescued-${stamp}-${suffix}.md`;
-          const rescueContent = (typeof editor.getContent === 'function') ? editor.getContent() : '';
-          // audit fix (Round 4 F6)：与文件其它 IPC 调用对齐用 ctx.api（createFile /
-          // renameFile / deleteFile 都从 ctx 解构），不再直连 window.api。若未来
-          // IPC 桥被换 mock / 拦截器，rescue 路径与主路径走同一来源，行为一致。
-          api.createFile(rescueName, rescueContent).then((r) => {
-            if (r && r.ok) {
-              showToast(`原文件已被删除，未保存内容已救回到「${rescueName}」`, 'warning', 4500);
-            } else {
-              showToast(`原文件已被删除；未保存内容丢失（救回失败：${window.api.friendlyFsError(r?.code, r?.error)}）`, 'error', 4500);
-            }
-          }).catch((e) => {
-            console.error('[file-ops] rename FILE_NOT_FOUND rescue IPC 异常:', e);
-            showToast('原文件已被删除；未保存内容丢失', 'error', 4500);
+          // 与文件其它 IPC 调用对齐用 ctx.api（createFile / renameFile / deleteFile
+          // 都从 ctx 解构），不再直连 window.api。命名 / 写盘 / toast 收口到
+          // src/rescue.js，自动处理 friendlyFsError 错误码 vs message 的语义
+          // （之前这里是漏掉 `r?.message ||` 的 bug —— 用户会看到「救回失败：
+          // INVALID_NAME」这种原始业务码而不是中文提示）。
+          rescueDirtyContent({
+            api,
+            originalName: state.currentFile.name,
+            content: (typeof editor.getContent === 'function') ? editor.getContent() : '',
+            event: '原文件已被删除',
           });
         } else {
           showToast('文件已不存在', 'warning');

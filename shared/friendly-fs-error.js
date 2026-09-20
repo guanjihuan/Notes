@@ -69,6 +69,12 @@ function friendlyFsError(code, fallback) {
     // 目录」要 main 端自己抛业务码，不该让 errno mapping 揣测）。
     case 'ENOENT':
       return '文件或目录不存在（可能已被移动、重命名或删除）';
+    // audit fix (Round 17 H2)：FS_TIMEOUT 不是 Node fs 内置 errno，是 main
+    // withTimeout() 包装层超时自造的 code。30s 内 fs 操作没完成（SMB 挂死 /
+    // 杀毒持锁 / 用户挂起后唤醒）→ 文案明确告诉用户是「磁盘暂时不可用」
+    // 而不是含糊的「未知错误」。
+    case 'FS_TIMEOUT':
+      return '磁盘暂时不可用（操作超时），请稍后重试或检查网络 / 移动硬盘连接';
     default:
       return fallback || '未知错误';
   }

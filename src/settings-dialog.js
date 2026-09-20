@@ -29,12 +29,41 @@ const READER_LINE_HEIGHTS = SETTINGS_UI_OPTIONS.readerLineHeight ?? [];
 const THEME_PALETTES = SETTINGS_UI_OPTIONS.themePalette ?? [];
 const AI_PROVIDERS = SETTINGS_UI_OPTIONS.aiProvider ?? [];
 
-// 默认 baseURL / model：按 provider 切换「placeholder」提示用户
-// OpenAI 兼容：baseURL 含 /v1；Anthropic：baseURL 不含 /v1
-const AI_DEFAULTS = {
-  openai:    { baseUrl: 'https://api.openai.com/v1',  model: 'gpt-4o-mini' },
-  anthropic: { baseUrl: 'https://api.anthropic.com',  model: 'claude-opus-5' },
-};
+/**
+ * 取 provider 对应的「占位符默认值」（baseURL + model）。当用户切到对应
+ * provider 但 aiBaseUrl / aiModel 仍为空时，UI 把这里给的字符串渲染成
+ * placeholder —— 不是写盘默认值，用户不主动保存就不会落盘，避免
+ * 「换 provider 就把 baseURL 改了」的侵入感。
+ *
+ * 数据来源：shared/settings-schema.js#SETTINGS_UI_OPTIONS.aiProvider[*].defaults
+ * （原 src/settings-dialog.js 顶部的 AI_DEFAULTS，迁到 schema 与 label/hint 同源）。
+ *
+ * @param {string} providerValue - 'openai' | 'anthropic'
+ * @returns {{baseUrl: string, model: string}}
+ */
+function getAiProviderDefaults(providerValue) {
+  const match = AI_PROVIDERS.find((p) => p?.value === providerValue);
+  const defaults = match?.defaults;
+  if (defaults && typeof defaults.baseUrl === 'string' && typeof defaults.model === 'string') {
+    return defaults;
+  }
+  // schema 桥断 / defaults 字段缺失：兜底成 openai 那套，避免 UI 抛错。
+  // 这里不抛 —— placeholder 缺失最多显示空白，用户主动填才是真值。
+  return AI_PROVIDERS.find((p) => p?.value === 'openai')?.defaults
+    || { baseUrl: '', model: '' };
+}
+
+// 行距数值格式化：去掉 JS 的浮点尾巴，但整数也补上 .0 让 "2" → "2.0"。
+// 旧版 lh.toFixed(2).replace(/0$/, '') 在 2.0 时输出 "2."（先去掉一个尾 0，
+// 留下 "2.0"，再匹配尾部 "0" 去掉 → "2."）。统一走这个函数，保证卡片标签
+// 和右上角数值芯片显示一致。
+function formatLineHeight(n) {
+  if (!Number.isFinite(n)) return String(n);
+  return Number.isInteger(n) ? n.toFixed(1) : String(n);
+}
+
+// 默认 baseURL / model：迁到 shared/settings-schema.js#SETTINGS_UI_OPTIONS.aiProvider[*].defaults
+// （与 provider 的 label / hint 同源），取数走 getAiProviderDefaults()。
 
 // 配色 swatch 用 CSS 自定义属性渲染真实色块，避免硬编码颜色导致配色变更时不一致。
 // 每个 palette 的 strip 由 bg + accent + fg 三段组成，给用户直观的视觉印象。
@@ -80,19 +109,55 @@ const CHECK_SVG = `
   </svg>
 `;
 
+/**
+ * 把 API Key input 的 dataset.defaultValue 属性删掉。
+ *
+ * 为什么必删（Sec-M3 修复）：reveal flow 会先把真 Key 写进 input 的
+ * `data-default-value` 属性，再用 `.value = dataset.defaultValue` 暴露给用户。
+ * 关 dialog 时如果不删，XSS / DevTools / 截图 / 复制粘贴都能
+ * `document.querySelector('#settings-ai-api-key').dataset.defaultValue`
+ * 直接读出真 Key —— 绕过 arm/reveal 的 5 秒窗口防护。
+ *
+ * 抽成单独函数是为了单测（settings-dialog 没有专门的测试文件，类 mount 路径
+ * 太重，但这个纯函数可以脱 DOM 测）。null-safe：不传 / 传非元素 都静默 no-op。
+ *
+ * @param {HTMLInputElement|{dataset?:DOMStringMap}|null|undefined} input
+ */
+export function clearAiKeyDefaultValue(input) {
+  if (!input || !input.dataset) return;
+  delete input.dataset.defaultValue;
+}
+
 export class SettingsDialog {
   /**
    * @param {object} options
    * @param {object} options.api - window.api
    * @param {object} options.settingsStore - SettingsStore 实例
    * @param {(changes: object) => void|Promise<void>} options.onChanged - 保存后回调
+   * @param {(changes: object) => void} [options.onPreview] - 视觉实时预览回调。
+   *   外观段 picker（配色 / 字号 / 行距）每次切换都同步调用一次，把对应字段
+   *   立刻应用到全局 UI（CSS / dataset），不走 store、不持久化。
+   *   失败/缺失时静默降级——预览失败不应阻塞用户在设置里的交互。
+   * @param {(baseline: object) => void} [options.onPreviewRevert] - 取消预览时
+   *   把视觉回滚到打开对话框瞬间的基线。仅在用户取消（Esc / × / 背景 / [取消]）
+   *   时被调用；保存路径不动视觉（settingsStore.update + onChanged 已把新值落定）。
    */
-  constructor({ api, settingsStore, onChanged }) {
+  constructor({ api, settingsStore, onChanged, onPreview, onPreviewRevert }) {
     this.api = api;
     this.settingsStore = settingsStore;
     this.onChanged = onChanged;
+    this.onPreview = typeof onPreview === 'function' ? onPreview : null;
+    this.onPreviewRevert = typeof onPreviewRevert === 'function' ? onPreviewRevert : null;
     this.modal = null;
     this._saving = false;
+    // 视觉预览基线：打开对话框瞬间的 {themePalette, readerFontSize, readerLineHeight}。
+    // 取消时把视觉回滚到这个值；保存时清掉（不再回滚，新值已落盘）。
+    this._previewBaseline = null;
+    // 视觉预览累计态：用户逐次改 picker 时，每次 firePreview 都基于这个快照——
+    // 不是只发「刚刚变化的字段」。原因见 _bindAppearancePickers 里的注释：
+    // 单发 fs 不带 lh 会让 app.applyReaderSettings 在 lh 维度回退到 settingsStore，
+    // 但 store 没被预览路径更新，所以 lh（以及任何未累计的字段）会闪回旧值。
+    this._previewState = null;
   }
 
   /**
@@ -130,6 +195,23 @@ export class SettingsDialog {
 
     this._opening = true;
     const initial = this.settingsStore.getAll();
+
+    // 视觉预览基线：用户点开对话框瞬间的配色/字号/行距。
+    // 取消路径（Esc / × / 背景 / [取消] 按钮）需要把视觉回滚到这里 —— 用户
+    // 在 picker 里改了一通但没保存，应该看到 app 还原到打开前的状态而不是
+    // 留在「试过的某个中间值」。
+    // 只覆盖视觉字段，不含 AI / 表单输入等配置型字段——后者没有「实时预览」
+    // 语义，回滚反而会让用户失去填写中的内容。
+    this._previewBaseline = {
+      themePalette: initial.themePalette,
+      readerFontSize: initial.readerFontSize,
+      readerLineHeight: initial.readerLineHeight,
+    };
+    // 视觉预览累计态：以基线为起点，每次 picker 切换都更新对应字段。
+    // 见构造函数注释 —— 必须三个维度都携带，否则单维度 partial 会让
+    // app.applyReaderSettings 在未携带维度上回退到 settingsStore，
+    // 而 store 在预览期未被更新，导致「在设置里改两下、字号被回弹」的诡异现象。
+    this._previewState = { ...this._previewBaseline };
 
     // 拿到 config.json 的文件名 + 所在目录名 —— API Key hint 用，
     // 让用户知道数据存在哪个文件、能一键打开核对。
@@ -228,6 +310,17 @@ export class SettingsDialog {
   }
 
   _render(initial, resolve) {
+    // 「外观」段的 schema 默认值 —— 单一事实源。reset-appearance 按钮、按钮
+    // disabled 联动、click 处理器都从这里取，避免 3 处字面量漂移。
+    // 桥缺失时兜底成字面量（与 DEFAULT_SETTINGS 中标注的默认值对齐）。
+    const schemaDefaults = (typeof window !== 'undefined'
+      && window.api?.settingsSchema?.DEFAULT_SETTINGS) || {};
+    this._appearanceDefaults = {
+      palette: schemaDefaults.themePalette || 'default',
+      fs: schemaDefaults.readerFontSize || 17,
+      lh: schemaDefaults.readerLineHeight || 1.85,
+    };
+
     const bodyHtml = [
       this._renderAppearanceSection(initial),
       this._renderAiSection(initial),
@@ -295,6 +388,79 @@ export class SettingsDialog {
     // 外观段：3 个视觉选择器（配色 / 字号 / 行距）+ 实时预览
     this._bindAppearancePickers(overlay, signal);
 
+    // 「外观」段：「恢复默认」按钮
+    //
+    // 把 3 个视觉字段（配色 / 字号 / 行距）一次性复位到 schema 默认值。
+    // 行为对齐已有「清空 AI 配置」按钮：只改 UI 状态、不直接保存 —— 用户仍要点
+    // [保存] 才落盘；取消时 onPreviewRevert 把视觉回滚到 baseline。
+    //
+    // 实现策略：仅勾选「当前未选中」的 radio 然后 dispatch change，由
+    // _bindAppearancePickers 里已有的 change 监听器统一负责后续副作用（同步
+    // .is-selected / 更新 value label / 改 .md-preview CSS 变量 / 累加
+    // _previewState / firePreview）。不在这里另写一套同步逻辑，避免双路径漂移。
+    const resetAppearanceBtn = overlay.querySelector('[data-action="reset-appearance"]');
+    if (resetAppearanceBtn) {
+      const { palette: dPalette, fs: dFs, lh: dLh } = this._appearanceDefaults;
+
+      // 按 name + value 字面量找 radio —— 不依赖 CSS.escape，schema 值都在
+      // enum 白名单内可控；万一边界值（如 themePalette 未来带特殊字符）也安全。
+      const findRadio = (name, value) => {
+        const radios = overlay.querySelectorAll(`input[name="${name}"]`);
+        for (const r of radios) if (r.value === String(value)) return r;
+        return null;
+      };
+
+      // picker 切换后刷新按钮 disabled 态：当前 3 个字段已全部为默认值时禁用，
+      // 避免「点了没反应」的体感。也挂在 this 上供 _bindAppearancePickers 的
+      // change 监听器回调（picker 切换后立即重算）。
+      const updateResetBtnState = () => {
+        const curPalette = overlay.querySelector('input[name="theme-palette"]:checked')?.value;
+        const curFs = parseInt(overlay.querySelector('input[name="reader-font-size"]:checked')?.value || '0', 10);
+        const curLh = parseFloat(overlay.querySelector('input[name="reader-line-height"]:checked')?.value || '0');
+        const atDefault = curPalette === dPalette
+          && curFs === dFs
+          && Math.abs(curLh - dLh) < 1e-9;
+        resetAppearanceBtn.disabled = atDefault;
+        if (atDefault) resetAppearanceBtn.setAttribute('aria-disabled', 'true');
+        else resetAppearanceBtn.removeAttribute('aria-disabled');
+      };
+
+      resetAppearanceBtn.addEventListener('click', () => {
+        // 与「清空 AI 配置」同款 IME 守卫：picker 区域里若有 input 处于 IME
+        // 合成期（用户按拼音未 commit），先 blur 让候选词落地，避免直接改
+        // radio 把 IME 中间态吞掉、键盘焦点丢失到 picker 之外。
+        const active = document.activeElement;
+        if (active && active instanceof Element
+          && active.closest('.picker-grid')
+          && typeof active.blur === 'function') {
+          active.blur();
+        }
+
+        const paletteRadio = findRadio('theme-palette', dPalette);
+        const fsRadio = findRadio('reader-font-size', dFs);
+        const lhRadio = findRadio('reader-line-height', dLh);
+
+        // 仅勾选「当前未选中」的 radio + dispatch change；已选中跳过（避免
+        // 不必要的监听器触发）。change 监听器是单一通道：syncSelectedClass、
+        // label 更新、预览 CSS、_previewState 累加、firePreview 全在那里跑。
+        [paletteRadio, fsRadio, lhRadio].forEach((r) => {
+          if (r && !r.checked) {
+            r.checked = true;
+            r.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+
+        // 3 个 radio 都已是默认值时按钮应禁用 —— click 后立即重算。
+        updateResetBtnState();
+        showToast('已恢复外观默认值，点保存后生效', 'info', 1800);
+      }, { signal });
+
+      // 暴露给 _bindAppearancePickers 的 change 监听器：用户改 picker 后实时
+      // 联动「恢复默认」按钮的 disabled 态（例如从默认改成非默认要立即解禁，
+      // 反之回到默认要立即禁用）。
+      this._updateResetAppearanceBtn = updateResetBtnState;
+    }
+
     // audit fix (H13)：textarea 不能用模板里的 escapeAttr(systemPrompt) 注入内容——
     // escapeAttr 把 < > & 转成 &lt; &gt; &amp;，再次打开设置时用户看到的是字面
     // &amp;lt;b&amp;gt; 这种"双重转义"内容。现在 textarea 模板里只渲染空 body，
@@ -303,7 +469,23 @@ export class SettingsDialog {
     if (aiSystemPromptEl) aiSystemPromptEl.value = initial.aiSystemPrompt || '';
 
     // AI Key 显示/隐藏
+    // Round 13 fix (H10)：API Key 不能写到模板 HTML 的 value 属性 —— DevTools /
+    // 截图 / 共享屏幕能读到（已经存在共享屏幕泄漏风险）。模板里只放
+    // data-default-value 占位，mount 后用 DOM property .value 赋值。
+    // 关闭 modal 时再清空 input.value，磁盘上 Key 不会被 innerHTML 重新序列化泄漏。
+    //
+    // audit fix (Sec-M3)：旧版「写到 dataset 后用 JS 拷到 .value」依然把 Key
+    // 留在 DOM 属性里 —— 已存在的 XSS（恶意 .md 笔记通过 marked / DOMPurify
+    // 漏过）可以 `document.querySelector('#settings-ai-api-key').dataset.defaultValue`
+    // 直接读出来。这绕过了 arm/reveal 的 5 秒窗口防护。
+    // 修：消费完立即 `delete dataset.defaultValue` —— DOM attribute 不留任何 Key 痕迹。
     const aiKeyInput = overlay.querySelector('#settings-ai-api-key');
+    if (aiKeyInput) {
+      aiKeyInput.value = aiKeyInput.dataset.defaultValue || '';
+      // 把占位从 DOM 里去掉，防止任何后续 XSS / DevTools 嗅探读到。
+      // 同步也清 .value —— 关闭 modal 时同样清一遍，双保险。
+      clearAiKeyDefaultValue(aiKeyInput);
+    }
     const aiKeyToggle = overlay.querySelector('[data-action="toggle-ai-key"]');
     if (aiKeyInput && aiKeyToggle) {
       aiKeyToggle.addEventListener('click', () => {
@@ -324,7 +506,12 @@ export class SettingsDialog {
     // 对话框关闭时立即清空 API Key input，避免被 DevTools / 截图 / 复制粘贴泄露
     if (typeof modal.setOnClose === 'function') {
       modal.setOnClose(() => {
-        if (aiKeyInput) aiKeyInput.value = '';
+        if (aiKeyInput) {
+          // 双保险：清 value 同时清 dataset 属性（Sec-M3 修复）。
+          // 关 dialog 后属性仍可能停留在 DOM 上被 XSS 读走。
+          aiKeyInput.value = '';
+          clearAiKeyDefaultValue(aiKeyInput);
+        }
       });
     }
 
@@ -336,7 +523,7 @@ export class SettingsDialog {
     const aiBaseUrlHint = overlay.querySelector('#settings-ai-base-url-hint');
     if (aiProviderRadios.length && aiBaseUrlInput && aiModelInput) {
       const applyHint = (providerValue) => {
-        const defaults = AI_DEFAULTS[providerValue] || AI_DEFAULTS.openai;
+        const defaults = getAiProviderDefaults(providerValue);
         aiBaseUrlInput.placeholder = defaults.baseUrl;
         aiModelInput.placeholder = defaults.model;
         // 句式统一：只讲协议路径是否含 /v1 前缀。"兼容"信息已经在卡片 label 表达。
@@ -443,6 +630,45 @@ export class SettingsDialog {
     }
 
     modal.setOnClose((value) => {
+      // Round 13 fix (H10)：关闭 modal 前把 AI Key input 的 value 清空，
+      // 防止 modal.overlay 节点残留期间 DevTools / 截图能读到 API Key。
+      // data-default-value 是占位字符串，下次开 dialog 时 _render 会重新赋值。
+      // audit fix (Sec-M3)：dataset 占位属性也会携带 Key 文本 —— 关 dialog 时
+      // 同步 delete，任何后续 XSS 都不能再 `dataset.defaultValue` 读出来。
+      // 下次开 dialog 由 _render 重新写入 dataset，再次 mount 后立刻 delete（见上）。
+      try {
+        const aiKeyEl = overlay.querySelector('#settings-ai-api-key');
+        if (aiKeyEl) {
+          aiKeyEl.value = '';
+          clearAiKeyDefaultValue(aiKeyEl);
+        }
+      } catch { /* overlay 已 unmount 时 querySelector 会抛，走忽略即可 */ }
+
+      // 视觉预览回滚：用户取消（Esc / × / 背景 / [取消] 按钮 → value !== 'save'）
+      // 时把当前视觉状态退回打开对话框瞬间的基线。否则用户在 picker 里试了几种
+      // 配色/字号又不想保存，会发现 app 留在「中间值」上。
+      //
+      // 保存路径（value === 'save'）：settingsStore.update 已经把最终值落盘并
+      // 触发 onChanged，DOM 状态与落盘值一致，**不要**回滚 —— 否则就会出现
+      // 「已保存但视觉又回到旧值」的灵异现象。
+      //
+      // 同步 / 异步两种形态都接住：onPreviewRevert 形如 `applyPalette(baseline.x)`
+      // 是同步的，但保留 async 接口给未来扩展（比如要等待主题过渡动画再 resolve）。
+      if (value !== 'save' && this._previewBaseline && this.onPreviewRevert) {
+        const baseline = this._previewBaseline;
+        try {
+          const ret = this.onPreviewRevert(baseline);
+          if (ret && typeof ret.then === 'function') ret.catch((e) => {
+            console.warn('[settings-dialog] onPreviewRevert 失败（视觉可能未回滚）：', e);
+          });
+        } catch (e) {
+          console.warn('[settings-dialog] onPreviewRevert 同步抛错（视觉可能未回滚）：', e);
+        }
+      }
+      this._previewBaseline = null;
+      // 累计态也清掉：避免二次注册 / 重复 close 路径误触发 firePreview。
+      this._previewState = null;
+
       this.modal = null;
       // 关闭即重置：成功路径（modal.close('save')）和用户取消（Esc / × / 背景）
       // 都会走这里，不重置的话下次开 dialog 时 _saving=true 会让保存按钮永远禁用。
@@ -459,6 +685,13 @@ export class SettingsDialog {
     const paletteLabel = THEME_PALETTES.find(p => p.value === palette)?.label || palette;
     const fs = READER_FONT_SIZES.includes(initial.readerFontSize) ? initial.readerFontSize : 17;
     const lh = READER_LINE_HEIGHTS.includes(initial.readerLineHeight) ? initial.readerLineHeight : 1.85;
+
+    // 「恢复默认」按钮的初始 disabled 态：当前 3 个视觉字段都已经是 schema 默认值时禁用。
+    // 默认值在 _render 入口已统一计算到 this._appearanceDefaults。
+    const { palette: dPalette, fs: dFs, lh: dLh } = this._appearanceDefaults;
+    const appearanceAtDefault = palette === dPalette
+      && fs === dFs
+      && Math.abs(lh - dLh) < 1e-9;
 
     // 配色卡片：5 列横排，每张展示该 palette 的 bg + accent 二色条
     const paletteCards = THEME_PALETTES.map((p) => {
@@ -498,7 +731,7 @@ export class SettingsDialog {
         <label class="picker-card lineheight-card ${isSelected ? 'is-selected' : ''}" data-picker="lineheight" data-value="${n}" style="--sample-lh:${n}">
           <input type="radio" name="reader-line-height" value="${n}" ${isSelected ? 'checked' : ''}>
           <span class="lineheight-preview" aria-hidden="true">行距预览<br>第二行示例<br>第三行示例</span>
-          <span class="lineheight-card-label">${n.toFixed(2).replace(/0$/, '')}</span>
+          <span class="lineheight-card-label">${formatLineHeight(n)}</span>
           <span class="picker-card-check" aria-hidden="true">${CHECK_SVG}</span>
         </label>
       `;
@@ -517,6 +750,13 @@ export class SettingsDialog {
             <h3 class="settings-section-title">外观</h3>
             <p class="settings-section-subtitle">配色风格、阅读字号与行距</p>
           </div>
+          <button
+            type="button"
+            class="btn-link settings-section-action"
+            data-action="reset-appearance"
+            title="把配色 / 阅读字号 / 阅读行距恢复到默认设置"
+            ${appearanceAtDefault ? 'disabled aria-disabled="true"' : ''}
+          >恢复默认</button>
         </header>
         <div class="form-row">
           <div class="picker-group">
@@ -584,7 +824,7 @@ print('hello')</code></pre>
     // 直接给 textarea.value 赋值（绕过 entity 编解码，保留用户输入的原貌）。
     // initial.aiSystemPrompt || '';
 
-    const currentHints = AI_DEFAULTS[provider] || AI_DEFAULTS.openai;
+    const currentHints = getAiProviderDefaults(provider);
 
     // AI 服务卡片：整宽单列堆叠（grid 1fr），每张只显示 icon + 名称 + hint。
     //
@@ -657,10 +897,10 @@ print('hello')</code></pre>
               id="settings-ai-api-key"
               class="form-input form-input-mono"
               type="password"
-              value="${escapeAttr(apiKey)}"
               placeholder="sk-..."
               autocomplete="off"
               spellcheck="false"
+              data-default-value="${escapeAttr(apiKey)}"
             >
             <button
               class="btn btn-secondary btn-with-icon"
@@ -807,6 +1047,31 @@ print('hello')</code></pre>
       }
     };
 
+    // 把视觉字段实时推给 app —— picker 切到哪个，整个 app 立刻是哪个；
+    // 取消由 modal.setOnClose 里调 onPreviewRevert 回滚。
+    //
+    // **必须传累计态**：dialog 内 _previewState 跟踪 3 个维度（palette/fs/lh）
+    // 当前最新的值，firePreview 永远把全部 3 个字段一起发出去。原因是 app 端
+    // applyReaderSettings(partial) 在 partial 缺字段时会回退到 settingsStore
+    // 当前值；但「预览」路径不走 store，store 在预览期不更新 —— 单发 fs 不带
+    // lh 时，app 就会拿 store 里的旧 lh 覆盖掉前一次预览的 lh，用户切两下
+    // picker 会看到字号/行距互相「吃掉」。改成累计态后三个维度都基于一个
+    // 一致的快照，不会再撞这个 race。
+    //
+    // 失败兜底：onPreview 抛错时记 warn，绝不阻断 picker 后续交互（设置还能用）。
+    const firePreview = () => {
+      if (!this.onPreview || !this._previewState) return;
+      const snapshot = { ...this._previewState };
+      try {
+        const ret = this.onPreview(snapshot);
+        if (ret && typeof ret.then === 'function') ret.catch((e) => {
+          console.warn('[settings-dialog] onPreview 失败（不影响对话框使用）：', e);
+        });
+      } catch (e) {
+        console.warn('[settings-dialog] onPreview 同步抛错（不影响对话框使用）：', e);
+      }
+    };
+
     // 同步切 .is-selected：找到 radio 所在的 picker-grid，
     // 把所有卡片的 .is-selected 重新对一次 :checked 状态
     const syncSelectedClass = (radio) => {
@@ -833,6 +1098,14 @@ print('hello')</code></pre>
           const opt = THEME_PALETTES.find((p) => p.value === target.value);
           valueLabel.textContent = opt ? opt.label : target.value;
         }
+        if (this._previewState) this._previewState.themePalette = target.value;
+        firePreview();
+        // picker 切换后立即刷新「恢复默认」按钮的 disabled 态（用户改了一档
+        // 就解禁；改回默认值就禁用）。_updateResetAppearanceBtn 由 _render
+        // 在 _bindAppearancePickers 之后挂上，初次挂载时未设置亦无副作用。
+        if (typeof this._updateResetAppearanceBtn === 'function') {
+          this._updateResetAppearanceBtn();
+        }
       } else if (name === 'reader-font-size') {
         syncSelectedClass(target);
         const fs = parseInt(target.value, 10);
@@ -840,17 +1113,33 @@ print('hello')</code></pre>
         if (valueLabel) valueLabel.textContent = `${fs} px`;
         const lh = parseFloat(overlay.querySelector('input[name="reader-line-height"]:checked')?.value || '1.85');
         updatePreviewStyle(fs, lh);
+        if (this._previewState && Number.isFinite(fs)) {
+          this._previewState.readerFontSize = fs;
+          firePreview();
+        }
+        if (typeof this._updateResetAppearanceBtn === 'function') {
+          this._updateResetAppearanceBtn();
+        }
       } else if (name === 'reader-line-height') {
         syncSelectedClass(target);
         const lh = parseFloat(target.value);
         const valueLabel = overlay.querySelector('#lineheight-value-label');
-        if (valueLabel) valueLabel.textContent = String(lh);
+        if (valueLabel) valueLabel.textContent = formatLineHeight(lh);
         const fs = parseInt(overlay.querySelector('input[name="reader-font-size"]:checked')?.value || '17', 10);
         updatePreviewStyle(fs, lh);
+        if (this._previewState && Number.isFinite(lh)) {
+          this._previewState.readerLineHeight = lh;
+          firePreview();
+        }
+        if (typeof this._updateResetAppearanceBtn === 'function') {
+          this._updateResetAppearanceBtn();
+        }
       } else if (name === 'ai-provider') {
         // AI provider 的 is-selected 同样需要同步（picker 通用）
         syncSelectedClass(target);
         // placeholder / hint 的更新在 aiProviderRadios 的 change 里处理
+        // AI 不走 onPreview —— 模型配置是「会发出去的请求参数」类，不是「视觉偏好」，
+        // 实时预览它会让人误以为已经把请求发出去了。
       }
     }, { signal });
   }

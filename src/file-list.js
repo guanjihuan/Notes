@@ -269,7 +269,13 @@ export class FileList {
    */
   setActive(filePath) {
     const next = filePath || null;
-    if (next === this.activePath) return;
+    // audit fix (Case-M1)：上一版用 === —— Windows / macOS 路径大小写不敏感，
+    // `next`（IPC 回来的 canonical case）与 `this.activePath`（先前设置的 case）
+    // 不一致时早返回生效，per-li classList 更新被跳过，旧激活项残留 .is-active。
+    // 改走 pathsEqual：与下面 per-li 匹配用同一份 case-fold 实现，
+    // 「早返回条件」与「实际高亮条件」天然对齐，不会再出现「activePath 已换、
+    // DOM 高亮还停在上一项」的撕裂状态。
+    if (pathsEqual(next, this.activePath)) return;
     this.activePath = next;
     if (!this.element) return;
     // audit fix：Windows 路径大小写不敏感；state.currentFile.path 可能是用户输入
@@ -319,7 +325,7 @@ export class FileList {
    *         1) searchTerm 存在 → fuzzy 排序覆盖 sortMode（用户明确在搜）
    *         2) searchTerm 为空 → 走 sortMode
    *
-   * 这样 "wel" 仍能在 mtime-desc 模式下把 welcome.md 排前，而不是按修改时间硬排。
+   * 这样 "readme" 仍能在 mtime-desc 模式下把 README.md 排前，而不是按修改时间硬排。
    */
   applyFilter() {
     const term = this.searchTerm;

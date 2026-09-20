@@ -103,6 +103,11 @@ const DANGEROUS_STYLE_PATTERNS = [
   /-moz-binding\s*:/i,
   // CSS @import（外链资源加载 / CSP 绕过）
   /@import/i,
+  // Round 13 fix (M1)：「@font-face { src: url(...) }」可远程加载任意字体。
+  // 浏览器加载字体时会把当前页面的 UA / Referer / 来源 URL 一并发出，
+  // 形成 IP 泄露 / 指纹面；恶意字体还能触发已知 CVE（如 TrueType 解析器
+  // 历史 bug）。Markdown 不需要自定义字体，命中则整条 style 属性剥掉。
+  /@font-face/i,
 ];
 
 // audit fix (Round 13 / Sec-M)：CSS 属性 denylist —— 阻止攻击者把整窗当画布。

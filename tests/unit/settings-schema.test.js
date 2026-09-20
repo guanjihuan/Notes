@@ -445,3 +445,49 @@ describe('nullable-number typeof 守卫对称（Round 4 P2-3）', () => {
     expect(r.sidebarWidth).toBe(null);
   });
 });
+
+describe('SETTINGS_UI_OPTIONS.aiProvider[*].defaults (audit T-4)', () => {
+  // T-4 把原本散在 src/settings-dialog.js 顶部的 AI_DEFAULTS（baseURL + model
+  // 占位符）迁到这里与 label / hint 同源。settings-dialog 通过
+  // getAiProviderDefaults(value) 查表，schema 是唯一事实源。
+  //
+  // 这里保护：
+  //   1. 两个 provider 都必须有 defaults 字段（不能让 placeholder 退化成空串）
+  //   2. defaults 必须含 baseUrl + model 两个 string 字段
+  //   3. 默认 baseUrl 必须与 provider 的协议约定一致 —— OpenAI 含 /v1，
+  //      Anthropic 不含；否则用户在空白字段看到错误提示就会按 placeholder 填错。
+  const { SETTINGS_UI_OPTIONS } = schema;
+  const providers = SETTINGS_UI_OPTIONS.aiProvider;
+
+  it('OpenAI 兼容项的 defaults 含 /v1 + model', () => {
+    const p = providers.find((x) => x.value === 'openai');
+    expect(p?.defaults, 'openai 项必须有 defaults 字段').toBeDefined();
+    expect(typeof p.defaults.baseUrl).toBe('string');
+    expect(typeof p.defaults.model).toBe('string');
+    expect(p.defaults.baseUrl.endsWith('/v1'), 'OpenAI 兼容默认 baseURL 必须以 /v1 结尾').toBe(true);
+  });
+
+  it('Anthropic 兼容项的 defaults 不含 /v1', () => {
+    const p = providers.find((x) => x.value === 'anthropic');
+    expect(p?.defaults).toBeDefined();
+    expect(p.defaults.baseUrl.endsWith('/v1'), 'Anthropic 默认 baseURL 不能含 /v1 后缀').toBe(false);
+    expect(p.defaults.baseUrl.length).toBeGreaterThan(0);
+    expect(p.defaults.model.length).toBeGreaterThan(0);
+  });
+
+  it('所有 aiProvider 项都覆盖 defaults（新增 provider 时强制填齐）', () => {
+    for (const p of providers) {
+      expect(p.defaults, `${p.value} 缺 defaults`).toBeDefined();
+      expect(typeof p.defaults.baseUrl, `${p.value}.defaults.baseUrl 不是 string`).toBe('string');
+      expect(typeof p.defaults.model, `${p.value}.defaults.model 不是 string`).toBe('string');
+    }
+  });
+
+  it('defaults 字段被 Object.freeze 保护（防运行时突变）', () => {
+    const p = providers.find((x) => x.value === 'openai');
+    // Object.freeze 在严格模式写入会抛错；非严格模式静默失败（settings-dialog 是
+    // ESM 在 module top-level 加载时是 strict，但 try/catch 包住更稳）。
+    expect(() => { p.defaults.baseUrl = 'http://evil'; }).toThrow();
+    expect(p.defaults.baseUrl).toBe('https://api.openai.com/v1');
+  });
+});

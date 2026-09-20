@@ -47,6 +47,12 @@ const LOCAL_AI_ERROR_FALLBACK = Object.freeze({
   ERR_PROVIDER: 'AI_PROVIDER_ERROR',
   ERR_FORMAT: 'AI_BAD_RESPONSE',
   ERR_CANCELLED: 'AI_CANCELLED',
+  // Round 13 fix (H3)：与 shared/ai-errors.js 对齐的本地副本，单测 / preload
+  // 注入失败时使用。tests/unit/ai-errors.test.js 会校验两边字面量一致。
+  INVALID_PROMPT: 'AI_INVALID_PROMPT',
+  INVALID_CONTENT: 'AI_INVALID_CONTENT',
+  CONTENT_TOO_LARGE: 'AI_CONTENT_TOO_LARGE',
+  PROMPT_TOO_LARGE: 'AI_PROMPT_TOO_LARGE',
 });
 
 export const AI_ERROR = SHARED_AI_ERROR || LOCAL_AI_ERROR_FALLBACK;
@@ -67,6 +73,10 @@ export function aiErrorMessage(code, fallback) {
     case AI_ERROR.ERR_PROVIDER: return 'AI 服务返回异常';
     case AI_ERROR.ERR_FORMAT: return 'AI 响应格式无法解析';
     case AI_ERROR.ERR_CANCELLED: return '已取消 AI 请求';
+    case AI_ERROR.INVALID_PROMPT: return '修改要求不能为空';
+    case AI_ERROR.INVALID_CONTENT: return '当前文件内容无效';
+    case AI_ERROR.CONTENT_TOO_LARGE: return '文档过大，请拆分后再让 AI 修改';
+    case AI_ERROR.PROMPT_TOO_LARGE: return '提示词过长，请简化要求';
     default: return fallback || 'AI 修改失败';
   }
 }

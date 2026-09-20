@@ -76,7 +76,7 @@
   --w-sidebar: 220px;
   --sidebar-width: var(--w-sidebar);
   --w-sidebar-narrow: 200px;
-  --w-reader-max: 720px;
+  --w-reader-max: none;
 
   /* 阅读排版：默认值与现有 --fs-lg / --lh-loose 同步；
      在 <html> 行内 style 上由 renderer 动态覆盖，切主题不会重置 */

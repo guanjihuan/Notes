@@ -542,6 +542,57 @@ describe('createAiProxy.runEdit —— API Key 脱敏 + URL 清洗', () => {
     expect(httpErrLog.data.url).toMatch(/^https:\/\/api\.example\.com/);
   });
 
+  // M2 follow-up (Round 14)：percent-encoded userinfo 也必须剥。
+  // 旧 regex `^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@` 不接受 `%` 之外的字符，但
+  // percent-encoded 形式 `user%40evil.com:pass@host` 字面上没有 `@` —— fetch
+  // 在解析 URL 时把 `%40` 还原成 `@`，再按 Basic Auth 发送，等于把
+  // "user%40evil.com:pass" 整段写到 Authorization 头，敏感凭据直发中转。
+  it('M2 percent-encoded：baseURL 含 %40 编码的 userinfo → 实际 fetch 的 URL 已剥 userinfo', async () => {
+    let captured = null;
+    const fetchImpl = async (url) => {
+      captured = url;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"content":"ok"}' }, finish_reason: 'stop' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    const proxy = createAiProxy({
+      getConfig: () => ({
+        aiProvider: 'openai',
+        aiBaseUrl: 'https://hunter2%40evil.com:secret@relay.example.com/v1',
+        aiApiKey: 'k', aiModel: 'm',
+      }),
+      fetchImpl,
+    });
+    const r = await proxy.runEdit({ prompt: 'p', content: 'c', filename: 'f', requestId: 'm2pct' });
+    expect(r.ok).toBe(true);
+    // 剥 userinfo 之后只剩 host + path，不能再含 hunter2 / secret 字样
+    expect(captured).toBe('https://relay.example.com/v1/chat/completions');
+    expect(captured).not.toMatch(/hunter2/);
+    expect(captured).not.toMatch(/secret/);
+  });
+
+  // M2 follow-up (Round 14)：sanitizeUrl 也走 new URL 解析路径，percent-encoded
+  // userinfo 在错误日志里也必须被遮罩（与 fetch URL 行为一致）。
+  it('M2 percent-encoded：sanitizeUrl 输出（HTTP 错误日志）已剥 percent-encoded userinfo', async () => {
+    const logs = [];
+    const proxy = createAiProxy({
+      getConfig: () => ({
+        aiProvider: 'openai',
+        aiBaseUrl: 'https://user%40evil.com:pass@api.example.com/v1',
+        aiApiKey: 'k', aiModel: 'm',
+      }),
+      fetchImpl: async () => new Response('oops', { status: 500 }),
+      log: (event, data) => logs.push({ event, data }),
+    });
+    const r = await proxy.runEdit({ prompt: 'p', content: 'c', filename: 'f', requestId: 'm2pctlog' });
+    expect(r.ok).toBe(false);
+    const httpErrLog = logs.find((l) => l.event === 'ai:http_error');
+    expect(httpErrLog).toBeDefined();
+    expect(httpErrLog.data.url).not.toMatch(/user/);
+    expect(httpErrLog.data.url).not.toMatch(/pass/);
+    expect(httpErrLog.data.url).toMatch(/^https:\/\/api\.example\.com/);
+  });
+
   // M3 fix：HTTP 错误回显里出现 JSON 风格的 `"authorization": "Bearer xxx"` 文本
   // （错误信息里把 header 序列化成字符串，AI proxy / 网关常见），旧 regex 遇到 `"`
   // 就停，只盖到开引号，剩下 `xxx` 全部漏出。新增的 JSON 包装 pattern 一次性吃完整段。
@@ -733,10 +784,13 @@ describe('max_tokens 上限按模型路由', () => {
   }
 
   // ---- Anthropic：5 系与 4.6+ 拿到 32k ----
+  // Round 13 fix (H4)：新增 claude-haiku-5-*（旧正则漏命中落到 16k 档）。
   it.each([
     'claude-opus-5',
     'claude-sonnet-5',
     'claude-fable-5',
+    'claude-haiku-5',
+    'claude-haiku-5-20251001',
     'claude-opus-4-8',
     'claude-opus-4-7',
     'claude-sonnet-4-6',
@@ -757,13 +811,16 @@ describe('max_tokens 上限按模型路由', () => {
     expect(body.max_tokens).toBe(16_384);
   });
 
-  // ---- Anthropic：claude-3 老家族与未知模型保守 8k ----
+  // ---- Anthropic：claude-3 老家族 4k（官方上限），未知模型 8k ----
+  // Round 13 fix (H2)：claude-3 老家族官方 max output = 4096。旧值 8192
+  // 会让 opus-3 / sonnet-3 / haiku-3 被服务端 400 拒绝。
   it.each([
     'claude-3-opus-20240229',
     'claude-3-haiku-20240307',
-  ])('Anthropic %s（claude-3 老家族）→ max_tokens 8192', async (model) => {
+    'claude-3-sonnet-20240229',
+  ])('Anthropic %s（claude-3 老家族）→ max_tokens 4096', async (model) => {
     const body = await capturedBody('anthropic', model);
-    expect(body.max_tokens).toBe(8_192);
+    expect(body.max_tokens).toBe(4_096);
   });
 
   it('Anthropic 未知模型（自部署 / 中转）→ max_tokens 8192，最大限度兼容', async () => {

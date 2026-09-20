@@ -343,6 +343,58 @@ let rendererDirty = false; // 渲染端是否有未保存改动
 // quitConfirmInFlight 模式。
 let closeConfirmInFlight = false;
 
+// audit fix (Round 17 H2)：fs 操作 30s 超时包裹。SMB / 坚果云 / OneDrive 在
+// 网络抖动 / 杀毒持锁 / 用户挂起电脑后重新唤醒时，fs.read / fs.write / fs.stat
+// / fs.rename 可能挂死几分钟甚至永久。renderer 这边 `await window.api.xxx()`
+// 永远 resolve 不出来，UI 无 loading、无错误提示，用户只能强杀进程。
+//
+// 设计要点：
+//   - 用 Promise.race 而非 AbortController —— Node fs.* 没有内置 abort 语义，
+//     注入 abort signal 在不同版本兼容差；race 超时后底层 promise 仍会跑完，
+//     但其结果已被丢弃，不会影响调用方。
+//   - 超时错误带 code='FS_TIMEOUT'，handler catch 块透传到 renderer；
+//     renderer 看到 FS_TIMEOUT 走「磁盘暂时不可用，请稍后重试」友好文案。
+//   - 30s 是经验值：原子写 + fsync + rename 在 SMB 上实测 1-3s，30s 给 10x
+//     余量；超过这个值基本就是磁盘真的没了，再等也没意义。
+//   - timeout Timer 必须 .unref()，否则 fs 操作 hang 时主进程不会自然退出。
+const FS_OP_TIMEOUT_MS = 30000;
+
+function withTimeout(promise, ms = FS_OP_TIMEOUT_MS, label = 'fs') {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label} 操作超过 ${ms}ms 未完成`);
+      err.code = 'FS_TIMEOUT';
+      reject(err);
+    }, ms);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, timeout])
+    .finally(() => { clearTimeout(timer); });
+}
+
+/**
+ * 安全向渲染端发送 IPC。
+ *
+ * mainWindow 已被销毁时（isDestroyed() true）会直接返回；
+ * 但还有一种时序：BrowserWindow 对象还活着、webContents 已被拆毁
+ * （例如关窗时 did-finish-load / resize 事件晚到一步），
+ * 此时 webContents.send 会同步抛 throw，没有调用方能接住 → unhandledException。
+ * main\fs-watcher.js:145 safeSend 用了同款防御；这里共用一份语义。
+ *
+ * 参数名故意避开 channel：check-ipc.js 的静态扫描按变量名匹配 webContents.send
+ * 与 const 字面量，channel 已被 promptRendererSave 的局部 const 占走同名，全局共用
+ * 会被错配。改用 eventName 避开冲突。
+ */
+function safeSendToRenderer(eventName, payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.webContents.send(eventName, payload);
+  } catch (e) {
+    console.warn(`[main] send ${eventName} 失败:`, e && e.message);
+  }
+}
+
 // 渲染进程崩溃计数器（防止 reload 死循环）
 let renderGoneCount = 0;
 const MAX_RENDER_GONE_RELOADS = 3;
@@ -716,7 +768,10 @@ function buildTrayMenu() {
         configStore.saveConfig({ alwaysOnTop: item.checked }).catch((e) => {
           console.error('[main] tray alwaysOnTop 保存失败:', e?.error || e?.message || e);
         });
-        mainWindow?.webContents.send('always-on-top:changed', item.checked);
+        // audit fix (H3)：走 safeSendToRenderer —— mainWindow 已被 destroyed
+        // 但引用还在的极小窗口里 .send() 同步抛 TypeError，托盘 click 处理器
+        // 没 try/catch → unhandledException 主进程侧崩溃。
+        safeSendToRenderer('always-on-top:changed', item.checked);
       }
     },
     { type: 'separator' },
@@ -781,7 +836,7 @@ app.whenReady().then(async () => {
   configStore.init();
   // auto-fallback 2026-08 + auto-create 默认目录：currentDataRoot() 内部走
   // resolveDataDirOrFallback，customDir 失效时回退到默认；返回 DEFAULT_DATA_DIR
-  // 时还会 sync mkdir（确保 fsWatcher 启动时不撞 ENOENT）+ 异步种子 welcome.md
+  // 时还会 sync mkdir（确保 fsWatcher 启动时不撞 ENOENT）+ 异步种子 README.md
   // （fire-and-forget，下次 fsWatcher 第一次扫描大概率就绪）。
   // 之前用 resolveDataDir() 不做 stat、不 mkdir —— 用户首次启动默认目录还没建、
   // 或 U 盘掉线 fallback 路径下默认目录也从未被用过，都会让 fsWatcher.startWatchingDir
@@ -792,18 +847,26 @@ app.whenReady().then(async () => {
   console.log('[main] 已加载配置');
   console.log('[main] 数据目录:', currentDataDir);
 
-  // 等欢迎文档就绪再启动 fsWatcher —— 默认目录刚创建的情况下，先把 welcome.md
+  // 等欢迎文档就绪再启动 fsWatcher —— 默认目录刚创建的情况下，先把 README.md
   // 写好再让 fsWatcher 开始监听，避免「fsWatcher 第一次扫描拿到空目录、几秒
-  // 后 welcome.md 突然冒出侧栏」的 UX 撕裂。resolveDataDirOrFallback 内部已
+  // 后 README.md 突然冒出侧栏」的 UX 撕裂。resolveDataDirOrFallback 内部已
   // fire-and-forget 异步种子一次，这里 await 的是同一份 in-flight promise。
   await configStore.scheduleEnsureDefaultDataDir();
+
+  // audit fix (Round 16 R2)：清理数据目录里残留的 `*.tmp.<pid>.<ts>.<rand>`
+  // 孤儿文件。atomicWriteFile 失败路径会 unlink，但「进程被 kill -9 / 断电」
+  // 不会走那条路。configStore 自己的 `config.json.tmp.*` 在 configStore.init()
+  // 内部已经处理；这里只覆盖 fileOps 这一组。fire-and-forget，不阻塞启动。
+  fileOps.cleanupStaleFileTmpFiles(currentDataDir).catch((e) => {
+    console.warn('[main] 清理数据目录残留 tmp 失败:', e && e.message);
+  });
 
   console.log('[main] app ready');
   buildMenu();
   createTray();
   createWindow();
 
-  // 启动目录监听器（默认目录已 sync mkdir + welcome.md 已 async 种子完毕）
+  // 启动目录监听器（默认目录已 sync mkdir + README.md 已 async 种子完毕）
   fsWatcher.startWatchingDir(currentDataDir);
 
   app.on('activate', () => {
@@ -877,7 +940,22 @@ app.on('window-all-closed', () => {
 //  IPC: 渲染端脏状态同步 + 触发保存
 // ============================================
 
-ipcMain.handle('renderer:set-dirty', (_event, isDirty) => {
+ipcMain.handle('renderer:set-dirty', (event, isDirty) => {
+  // audit fix (L5)：sender 校验。rendererDirty 是退出路径上 confirmDiscardIfDirty
+  // 决定「是否弹未保存确认框」的唯一开关。若 XSS 拿到 window.api.setDirty
+  // （preload.js 暴露的 contextBridge API，渲染端任意 JS 都能调）就能把
+  // rendererDirty 强写为 false → 用户关窗时直接跳过保存确认 → 未保存内容静默
+  // 丢失。校验 event.sender 是 mainWindow.webContents、senderFrame 是顶级
+  // frame —— 拒掉所有来自子 frame / devtools / 其它 BrowserWindow 的调用。
+  if (!event?.sender || !mainWindow || event.sender !== mainWindow.webContents) {
+    console.warn('[main] renderer:set-dirty 拒绝：sender 不是主窗口 webContents');
+    return false;
+  }
+  const senderFrame = event.senderFrame;
+  if (senderFrame && senderFrame.parent) {
+    console.warn('[main] renderer:set-dirty 拒绝：来自子 frame');
+    return false;
+  }
   // 仅同步标志位，供 confirmDiscardIfDirty 在退出路径上判断「是否弹未保存确认框」。
   // 不在此处刷新托盘菜单 —— dirty 状态与托盘菜单项（始终置顶、显示主窗口）无关。
   rendererDirty = !!isDirty;
@@ -909,7 +987,13 @@ function promptRendererSave() {
     const settle = (value) => {
       if (settled) return;
       settled = true;
-      clearTimeout(hardTimer);
+      // audit fix (M2)：hardTimer 已被删（见下方），这里不再 clearTimeout(hardTimer)。
+      // 旧 hardTimer(10s) 的 callback 是空，只给 settle 一个 handle 来 clear —— 但
+      // settle 在 0-10s 之间必然先 fire（renderer 几乎总是 1-3s 内回结果），到 10s 时
+      // hardTimer 已 clearTimeout 掉，never fires；10s 后仍未 settle 的极小窗口里，
+      // hardTimer fires 是个 no-op（listener 自身由 graceTimer 的 settle(false) 移除，
+      // 或被任意 settle(ok) 移除）。删 hardTimer 后语义不变，注释中「进入宽限窗口」
+      // 的解释改为「10s 这一刻只是渲染承诺过期，监听器照常保留到 graceTimer」。
       clearTimeout(graceTimer);
       try { ipcMain.removeAllListeners(channel); } catch { /* ignore */ }
       // Phase N M1 fix：早退路径（IPC 收到结果 / 窗口 destroyed / send 失败）清掉
@@ -933,7 +1017,12 @@ function promptRendererSave() {
     // 保存的诡异状态。
     const HARD_DEADLINE_MS = 10000;
     const GRACE_PERIOD_MS = 15000;
-    let hardTimer = setTimeout(() => { /* 进入宽限窗口：监听器保留 */ }, HARD_DEADLINE_MS);
+    // audit fix (M2)：硬期限改成「软」语义 —— 没有任何 settle，10s 后 renderer 没
+    // 回结果只代表渲染侧可能慢（大文件 / 慢盘），监听器不摘、graceTimer 继续守。
+    // 旧版 hardTimer 是空 callback + 只为让 settle 能 clearTimeout 的 dead timer；
+    // 删掉后行为完全一致：0-15s 之间晚到的 renderer 结果照样被 settle(ok) 接受，
+    // 15s graceTimer 仍未回 → settle(false)。每次 quit attempt 少一个 timer。
+    void HARD_DEADLINE_MS; // 仅作注释常量保留（其它模块若想对齐可参考）
     let graceTimer = setTimeout(() => settle(false), GRACE_PERIOD_MS);
 
     ipcMain.once(channel, (_event, result) => {
@@ -985,7 +1074,14 @@ async function _confirmDiscardIfDirtyBounded(depth) {
 
 async function confirmDiscardIfDirty(depth = MAX_CONFIRM_RECURSION) {
   if (!rendererDirty) return true;
-  if (!mainWindow || mainWindow.isDestroyed()) return true;
+  // 旧实现：mainWindow 缺失/被销毁时直接 return true（"允许丢弃"）。
+  // 这会让 rendererDirty=true 但窗口在弹框前就被拆掉的极端时序下
+  // 默默把未保存改动丢进黑洞 —— close/quit 路径在 call site `if (!proceed) return;`
+  // 直接吞掉，等价于「不确认就退出」。
+  // 修复：拿不到窗口就拒绝（return false），call site 收到 false 后中止
+  // close/quit；用户重启 / 重新打开窗口时仍能拿到 promptRendererSave 流程
+  // 继续问「保存 / 丢弃 / 取消」。
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
 
   // 窗口可能已经隐藏到托盘了，先显示出来，否则原生框会挂在看不见的窗口上
   if (!mainWindow.isVisible() || mainWindow.isMinimized()) {
@@ -1078,7 +1174,7 @@ function currentDataRoot() {
 function broadcastDataDirResolved() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const info = configStore.resolveDataDirOrFallback();
-  mainWindow.webContents.send('data-dir:resolved', {
+  safeSendToRenderer('data-dir:resolved', {
     dir: info.dir,
     defaultDir: configStore.getDefaultDataDir(),
     fellBack: info.fellBack,
@@ -1209,7 +1305,7 @@ ipcMain.handle('file:watch-dir', async (_event, relDir) => {
   }
 });
 
-ipcMain.handle('file:read', async (event, filePath) => {
+ipcMain.handle('file:read', async (_event, filePath) => {
   if (typeof filePath !== 'string' || !filePath) {
     // audit fix (Round 7 IPC-1)：补齐 message 字段。renderer 走
     // `result.message || result.error || '未知错误'` 兜底，没 message 会退到
@@ -1244,7 +1340,10 @@ ipcMain.handle('file:read', async (event, filePath) => {
     return { ok: false, error: ancestorCheck.error, code: ancestorCheck.code, message: ancestorCheck.message };
   }
   try {
-    const st = await fs.stat(filePath);
+    // audit fix (Round 17 H2)：stat / readFile 走 withTimeout —— SMB / OneDrive
+    // 挂死时 renderer 不会无 loading 一直等；超时错误带 FS_TIMEOUT 透传到
+    // renderer 走「磁盘暂时不可用」文案。
+    const st = await withTimeout(fs.stat(filePath), undefined, 'file:read.stat');
     if (!st.isFile()) {
       return { ok: false, error: 'NOT_A_FILE', code: 'NOT_A_FILE', message: '不是普通文件' };
     }
@@ -1256,7 +1355,7 @@ ipcMain.handle('file:read', async (event, filePath) => {
         message: `文件过大（${(st.size / 1024 / 1024).toFixed(1)} MB），已超过 ${(MAX_FILE_SIZE / 1024 / 1024).toFixed(0)} MB 上限`
       };
     }
-    const content = await fs.readFile(filePath, 'utf-8');
+    const content = await withTimeout(fs.readFile(filePath, 'utf-8'), undefined, 'file:read.read');
     // audit fix (Phase L3-FS 2A)：去掉 UTF-8 BOM（Notepad 等 Windows 工具会带
     // 字节序标记存 UTF-8）。BOM 在第一行 heading 之前渲染成零宽字符，会让
     // 文内锚点的 slug 偏移 / 复制粘贴时污染 / DOMPurify 把它当成不可见字符
@@ -1312,7 +1411,7 @@ ipcMain.handle('file:read', async (event, filePath) => {
  *
  * 不传 expectedMtimeMs（老调用 / 强写场景）则跳过校验。
  */
-ipcMain.handle('file:write', async (event, filePath, content, expectedMtimeMs = null) => {
+ipcMain.handle('file:write', async (_event, filePath, content, expectedMtimeMs = null) => {
   if (typeof filePath !== 'string' || !filePath) {
     // audit fix (Round 7 IPC-3)：补齐 code + message，对齐其它 file:* handler 的
     // 字段集。renderer 一律 `result.code / result.message` 取值，没这两个字段
@@ -1374,7 +1473,8 @@ ipcMain.handle('file:write', async (event, filePath, content, expectedMtimeMs = 
   try {
     // mtime 校验（audit #2）
     if (Number.isFinite(expectedMtimeMs)) {
-      const stNow = await fs.stat(filePath);
+      // audit fix (Round 17 H2)：stat 走 withTimeout —— 挂死磁盘不挡 IPC 响应。
+      const stNow = await withTimeout(fs.stat(filePath), undefined, 'file:write.mtimeCheck');
       // Math.floor 兼容 sub-ms 浮点误差
       if (Math.floor(stNow.mtimeMs) !== Math.floor(expectedMtimeMs)) {
         return {
@@ -1389,8 +1489,24 @@ ipcMain.handle('file:write', async (event, filePath, content, expectedMtimeMs = 
     }
     // audit fix (C1 file-IO)：原子写（tmp + fsync + rename），防止进程在
     // writeFile 中途崩溃导致文件内容半截（用户丢失全部编辑）。
-    await fileOps.atomicWriteFile(filePath, content);
-    const st = await fs.stat(filePath);
+    // audit fix (Round 17 H2)：原子写整体包裹 —— renameWithRetry 的总耗时
+    // （fs.open + writeFile + sync + rename + 父目录 sync）在 SMB 上可能
+    // 超 30s 时基本就是磁盘掉了。
+    await withTimeout(
+      fileOps.atomicWriteFile(filePath, content),
+      undefined,
+      'file:write.atomic',
+    );
+    const st = await withTimeout(fs.stat(filePath), undefined, 'file:write.stat');
+    // audit fix (Round 16 M1)：self-write filter —— 慢盘（SMB / OneDrive）下
+    // atomicWriteFile 触发 fs.watch 事件的时刻可能早于本 IPC 响应回到 renderer，
+    // renderer 没拿到 mtimeMs 就收 files:changed → 误判外部修改 → 弹 reload
+    // 对话框。告诉 fsWatcher 「这个文件接下来 500ms 内的变更是我自己」，让
+    // dirWatcher 跳过对应 emit。
+    if (fsWatcher && typeof fsWatcher.markExpectedWrite === 'function') {
+      try { fsWatcher.markExpectedWrite(filePath, st.mtimeMs); }
+      catch (e) { console.warn('[main] markExpectedWrite 失败:', e?.message); }
+    }
     return { ok: true, mtimeMs: st.mtimeMs, size: st.size };
   } catch (e) {
     if (e.code === 'ENOENT') {
@@ -1483,43 +1599,62 @@ ipcMain.handle('file:create', async (_event, rawName, opts) => {
     };
   }
 
-  const r = await resolveFileName(rawName, targetDir);
-  // audit fix (Round 7 IPC-2)：补齐 code + message 字段，与其它 file:* handler
-  // 对齐。resolveFileName 返回的 r.error 已经是中文明文消息（"文件名不能为空"
-  // / "文件名包含 Windows 保留字符" 等），把它同时塞 message 让 renderer 走
-  // friendlyFsError(code, message) 时不再兜底到 result.error 字符串。
-  if (!r.ok) {
-    return {
-      ok: false,
-      error: 'INVALID_NAME',
-      code: 'INVALID_NAME',
-      message: r.error,
-    };
+  // audit fix (2026-09-21)：标记是否新建了子目录，用于失败路径下清理空目录。
+  // 之前 mkdir 成功后任何下游失败（resolveFileName / isWithinDataDir / symlink
+  // 防护 / atomicWriteFile）都会留下 targetDir 这个空子目录 —— 数据目录里
+  // 出现不可见的垃圾文件夹，下次扫描会列入文件列表。targetDir === dataRoot
+  // 时不需要清理（root 早就在）。
+  const didMkdirSubdir = targetDir !== dataRoot;
+  // best-effort 清理函数：仅当目录为空时移除（已含文件的不动，避免误删）。
+  async function cleanupEmptySubdir() {
+    if (!didMkdirSubdir) return;
+    try {
+      const entries = await fs.readdir(targetDir);
+      if (entries.length === 0) {
+        await fs.rmdir(targetDir);
+      }
+    } catch (cleanupErr) {
+      // 清理本身失败不抛 —— 让原始错误的响应路径主导。
+      console.warn('[main] file:create 清理空子目录失败:', _redactPath(targetDir), cleanupErr.code || cleanupErr.message);
+    }
   }
 
-  // audit fix (1.1)：与其他 file:* handler 对称地做 isWithinDataDir 防御 + symlink 防护。
-  // 理论上是新文件不会有 symlink，但 resolveFileName 已过滤路径分隔符 / '..'，
-  // 这层只为了与 read/write/rename/delete 保持对称，且挡住未来可能的边界输入。
-  if (!isWithinDataDir(r.path, dataRoot)) {
-    return { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '路径不在数据目录内' };
-  }
-  const linkCheck = await assertNotSymlink(r.path);
-  if (!linkCheck.ok) {
-    return { ok: false, error: linkCheck.error, code: linkCheck.code, message: linkCheck.message };
-  }
-
-  // audit fix：与 file:read/write/rename/delete 对称做 assertNoSymlinkAncestor。
-  // file:create 的 targetDir 上面只 lstat 了自己（如果非根），但 r.path 落在某个
-  // 中间是 symlink 的目录下时（如 dataRoot/links/sub/foo.md，其中 links 是
-  // 指向外部的 symlink），atomicWriteFile 会跟随 symlink 把文件写到外部，
-  // 绕过 isWithinDataDir 的字符串前缀边界。assertNotSymlink 只判 r.path 本身
-  // （不存在 → 放过），挡不住中间路径是 symlink 的场景。
-  const ancestorCheck = await assertNoSymlinkAncestor(r.path, dataRoot);
-  if (!ancestorCheck.ok) {
-    return { ok: false, error: ancestorCheck.error, message: ancestorCheck.message };
-  }
-
+  // 把 mkdir 之后的所有失败路径统一收到一个 catch 里，方便清理逻辑只写一份。
+  // 早期错误（resolveFileName / isWithinDataDir / symlink 防护）抛带 _early
+  // 标记的结构化对象；atomicWriteFile 抛原始 Error。catch 里按标记分流。
+  let resolvedName = null;
   try {
+    const r = await resolveFileName(rawName, targetDir);
+    // audit fix (Round 7 IPC-2)：补齐 code + message 字段，与其它 file:* handler
+    // 对齐。resolveFileName 返回的 r.error 已经是中文明文消息（"文件名不能为空"
+    // / "文件名包含 Windows 保留字符" 等），把它同时塞 message 让 renderer 走
+    // friendlyFsError(code, message) 时不再兜底到 result.error 字符串。
+    if (!r.ok) {
+      throw Object.assign(new Error(r.error), { _early: { error: 'INVALID_NAME', code: 'INVALID_NAME', message: r.error } });
+    }
+
+    // audit fix (1.1)：与其他 file:* handler 对称地做 isWithinDataDir 防御 + symlink 防护。
+    // 理论上是新文件不会有 symlink，但 resolveFileName 已过滤路径分隔符 / '..'，
+    // 这层只为了与 read/write/rename/delete 保持对称，且挡住未来可能的边界输入。
+    if (!isWithinDataDir(r.path, dataRoot)) {
+      throw Object.assign(new Error('路径不在数据目录内'), { _early: { error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '路径不在数据目录内' } });
+    }
+    const linkCheck = await assertNotSymlink(r.path);
+    if (!linkCheck.ok) {
+      throw Object.assign(new Error(linkCheck.message || 'symlink 防护拒绝'), { _early: linkCheck });
+    }
+
+    // audit fix：与 file:read/write/rename/delete 对称做 assertNoSymlinkAncestor。
+    // file:create 的 targetDir 上面只 lstat 了自己（如果非根），但 r.path 落在某个
+    // 中间是 symlink 的目录下时（如 dataRoot/links/sub/foo.md，其中 links 是
+    // 指向外部的 symlink），atomicWriteFile 会跟随 symlink 把文件写到外部，
+    // 绕过 isWithinDataDir 的字符串前缀边界。assertNotSymlink 只判 r.path 本身
+    // （不存在 → 放过），挡不住中间路径是 symlink 的场景。
+    const ancestorCheck = await assertNoSymlinkAncestor(r.path, dataRoot);
+    if (!ancestorCheck.ok) {
+      throw Object.assign(new Error(ancestorCheck.message || '祖先链 symlink 防护拒绝'), { _early: ancestorCheck });
+    }
+
     // 初始内容默认为 `# 标题\n\n` —— 哪怕空字符串也保证文件可读
     // 2026-08-28 反馈：resolveFileName 不再强制补 .md，所以这里按最后一个 .
     // 剥除任意扩展名（foo.md → foo；foo.txt → foo；无扩展名 → 原样）。
@@ -1529,20 +1664,36 @@ ipcMain.handle('file:create', async (_event, rawName, opts) => {
       : `# ${baseForTitle}\n\n`;
     // audit fix (C2 file-IO)：原子写，与 file:write 对齐。
     // 即便 create 失败也不该留半截文件——磁盘要么没这个文件，要么是完整的。
-    await fileOps.atomicWriteFile(r.path, content);
-    const st = await fs.stat(r.path);
+    // audit fix (Round 17 H2)：包裹 withTimeout —— 与 file:write 同源。
+    await withTimeout(
+      fileOps.atomicWriteFile(r.path, content),
+      undefined,
+      'file:create.atomic',
+    );
+    resolvedName = r.name;
+    const st = await withTimeout(fs.stat(r.path), undefined, 'file:create.stat');
+    // audit fix (Round 16 M1)：self-write filter —— 与 file:write 同源（见
+    // 上方 file:write 的注释）。新建文件的 fs.watch 事件同样会在 IPC 响应
+    // 之前到达 renderer，导致侧栏触发不必要的重渲染 / 「文件已存在」误判。
+    if (fsWatcher && typeof fsWatcher.markExpectedWrite === 'function') {
+      try { fsWatcher.markExpectedWrite(r.path, st.mtimeMs); }
+      catch (e) { console.warn('[main] markExpectedWrite 失败:', e?.message); }
+    }
     return { ok: true, path: r.path, name: r.name, mtimeMs: st.mtimeMs, size: st.size };
   } catch (e) {
-    // audit fix (1.1)：补齐 code / message 字段，与 file:read/write 对齐，
-    // renderer 的 friendlyWriteError 才能按 errno 给中文提示。
-    // audit fix (B-2)：这里之前直接返回 e.message（英文 + 含完整路径），与 file:write
-    // 不一致。按 errno 翻译成中文提示，路径走 _redactPath 防泄露到 tmp 日志。
-    console.error('[main] file:create 失败:', _redactPath(r.path), e.code || e.message);
+    // 失败路径：先清理可能新建的空子目录，再按错误类型返回响应。
+    await cleanupEmptySubdir();
+    if (e && e._early) {
+      // 早期错误（resolveFileName / isWithinDataDir / symlink 防护）：直接透传结构化字段。
+      return { ok: false, error: e._early.error, code: e._early.code, message: e._early.message };
+    }
+    // atomicWriteFile 错误：按 errno 翻译成中文提示，路径走 _redactPath 防泄露到 tmp 日志。
+    console.error('[main] file:create 失败:', _redactPath(targetDir + '/' + rawName), e.code || e.message);
     return {
       ok: false,
       error: e.code || 'CREATE_FAILED',
       code: e.code,
-      message: _friendlyCreateError(e, r.name),
+      message: _friendlyCreateError(e, resolvedName || rawName),
     };
   }
 });
@@ -1653,9 +1804,18 @@ ipcMain.handle('file:rename', async (_event, oldPath, newName) => {
     };
   }
   try {
-    await fs.rename(oldPath, r.path);
+    // audit fix (Round 17 H2)：rename 走 withTimeout —— SMB / OneDrive 持锁时
+    // rename 可能挂死数分钟；超时透传 FS_TIMEOUT 让 renderer 弹友好提示。
+    await withTimeout(fs.rename(oldPath, r.path), undefined, 'file:rename.rename');
     // 重新 stat 拿到新 mtime/size（audit #4：之前漏掉，renderer 状态栏会短暂无日期）
-    const st = await fs.stat(r.path);
+    const st = await withTimeout(fs.stat(r.path), undefined, 'file:rename.stat');
+    // audit fix (Round 16 M1)：self-write filter —— rename 触发 fs.watch 两个
+    // 事件（oldPath 消失 + r.path 出现）。只要新路径上 500ms 内是 self-write 就
+    // 拦住后续 emit，避免 renderer 把「自己刚重命名」当成外部修改触发侧栏闪烁。
+    if (fsWatcher && typeof fsWatcher.markExpectedWrite === 'function') {
+      try { fsWatcher.markExpectedWrite(r.path, st.mtimeMs); }
+      catch (e) { console.warn('[main] markExpectedWrite 失败:', e?.message); }
+    }
     return { ok: true, path: r.path, name: r.name, mtimeMs: st.mtimeMs, size: st.size };
   } catch (e) {
     // audit fix (K1-H1)：console 走 _redactPath（之前 e.message 直接打到日志，
@@ -1739,7 +1899,10 @@ ipcMain.handle('file:delete', async (_event, filePath) => {
 //   - 文件在外部存储 / 网络盘等 trash 不可达的位置
 // 现在：trashItem 失败时直接报错，让 UI 提示用户（而不是悄悄 unlink 把文件抹掉）。
 try {
-  await shell.trashItem(filePath);
+  // audit fix (Round 17 H2)：trashItem 也走 withTimeout —— 网络盘 trash 不可达时
+  // Electron 内部可能挂死（直到 trash 处理超时才会 reject）。30s 强制让
+  // renderer 拿到结果。
+  await withTimeout(shell.trashItem(filePath), undefined, 'file:delete.trash');
   return { ok: true, path: filePath, recycled: true };
 } catch (e) {
   // audit fix (K1-L2)：之前 message 拼 e.message（英文 errno + 路径）回到 renderer
@@ -1854,7 +2017,10 @@ ipcMain.handle('app:open-path', async (_event, target) => {
 });
 
 ipcMain.handle('app:choose-data-dir', async () => {
-  if (!mainWindow) return null;
+  // audit fix (H5)：补 isDestroyed() —— !mainWindow 只能挡 null/undefined，
+  // 异步窗口销毁的窗口期（mainWindow 引用还在但 isDestroyed===true）会进
+  // showOpenDialog 抛错。X 紧接菜单点「选择数据目录」的场景能复现。
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
   const result = await dialog.showOpenDialog(mainWindow, {
     title: '选择数据文件夹',
     properties: ['openDirectory', 'createDirectory'],
@@ -1886,12 +2052,12 @@ ipcMain.handle('app:reset-data-dir', async () => {
       return { ok: false, error: saveResult.error || '配置保存失败' };
     }
     // 走 currentDataRoot 而不是 resolveDataDir —— 内部会 sync mkdir（默认目录可能
-    // 从未被用过）+ 异步种子 welcome.md，让 fsWatcher 启动时不撞 ENOENT、侧栏里
+    // 从未被用过）+ 异步种子 README.md，让 fsWatcher 启动时不撞 ENOENT、侧栏里
     // 立刻有欢迎文档可见。
     const newDir = currentDataRoot();
     currentDataDir = newDir;
     // 等欢迎文档就绪再重启 fsWatcher，避免「fsWatcher 启动时拿到空目录、
-    // 几秒后 welcome.md 突然冒出侧栏」的 UX 撕裂。
+    // 几秒后 README.md 突然冒出侧栏」的 UX 撕裂。
     await configStore.scheduleEnsureDefaultDataDir();
     // 重启目录监听：旧监听在缺失的 custom 路径上，新监听切到默认
     try {
@@ -2070,7 +2236,10 @@ ipcMain.handle('shell:open-dir', async (_event, dirPath) => {
   }
   const resolved = path.resolve(dirPath);
   if (!isWithinDataDir(resolved, currentDataRoot())) {
-    return { ok: false, error: 'PATH_NOT_ALLOWED', message: '路径不在数据目录内' };
+    // audit fix (Round 7 IPC-4 风格补齐)：与 file:read/write 等对齐 error + code + message。
+    // renderer 走 friendlyFsError(code, message) 没 code 字段会落到 error 字符串，
+    // 文案与其它通道不一致。
+    return { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '路径不在数据目录内' };
   }
   try {
     // audit fix：用 lstat 拒绝 symlink 目录（与 file:scan-dir 对齐）。
@@ -2165,8 +2334,7 @@ ipcMain.handle('window:close', () => {
 });
 
 function broadcastMaximizeState() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send('window:maximize-state', mainWindow.isMaximized());
+  safeSendToRenderer('window:maximize-state', mainWindow?.isMaximized?.() ?? false);
 }
 
 // ============================================
@@ -2337,10 +2505,16 @@ ipcMain.handle('app:open-config-dir', async () => {
 ipcMain.handle('app:save-settings', async (event, partial) => {
   if (!partial || typeof partial !== 'object') return { ok: true, settings: configStore.getConfig() };
 
-  // 目录存在性校验（schema 里用 opts.resolveDir 注入，因为要异步 fs.stat + access）
+  // 目录存在性校验（schema 里用 opts.resolveDir 注入，因为要异步 fs.lstat + access）
+  // audit fix (Security-L4)：旧版用 fs.stat 会跟随 symlink —— 用户 / 同步盘 /
+  // 配置注入可以塞一个 symlink 指到任意目录，本会话内该 symlink 目标就成了 active
+  // dataDir，违反「dataDir 不得是 symlink」的不变量（resolveDataDirOrFallback 是
+  // 用 lstat 拒的；本入口是同一不变量，必须对齐）。改用 fs.lstat 后 isSymbolicLink
+  // 即拒。
   const resolveDir = async (p) => {
     try {
-      const st = await fs.stat(p);
+      const st = await fs.lstat(p);
+      if (st.isSymbolicLink()) return { ok: false, error: '不允许将符号链接作为数据目录' };
       if (!st.isDirectory()) return { ok: false, error: '路径不是一个目录' };
       await fs.access(p, fsSync.constants.R_OK);
       return { ok: true };
@@ -2392,13 +2566,21 @@ ipcMain.handle('app:save-settings', async (event, partial) => {
     // audit fix：直接比较字符串会因为尾斜杠 / 大小写 / `..` 残留而误判。
     // 用 path.resolve 归一化后再比；Windows 上大小写不敏感。
     const newResolved = path.resolve(newDirRaw);
-    const curResolved = path.resolve(currentDataDir);
+    // audit fix (M3)：currentDataDir === null 兜底 —— 当前总是非 null（whenReady
+    // 已先 set），但 app:save-settings 的早期触发 / future splash 路径可能命中。
+    // TypeError: path.resolve(null) 会把整个 settings 保存流程打挂。
+    const curResolved = path.resolve(currentDataDir || newDirRaw);
     const same = process.platform === 'win32'
       ? newResolved.toLowerCase() === curResolved.toLowerCase()
       : newResolved === curResolved;
     if (!same) {
       currentDataDir = newDirRaw;
-      fsWatcher.startWatchingDir(newDirRaw);
+      // audit fix (H4)：与 app:reset-data-dir 同款 try/catch —— startWatchingDir
+      // 同步路径可能 ENOENT / EACCES（旧目录已被删 / 权限收紧），失败也不应该
+      // 让 IPC 抛回 renderer（磁盘已 saveConfig 成功）。失败只丢 watcher，配置
+      // 与数据目录写入照常生效；下次启动会自然拉起。
+      try { fsWatcher.startWatchingDir(newDirRaw); }
+      catch (e) { console.warn('[main] restart fsWatcher 失败:', e?.message || e); }
       if (tray) {
         tray.setContextMenu(buildTrayMenu());
       }
@@ -2438,13 +2620,15 @@ function buildMenu() {
         {
           label: '切换主题',
           accelerator: 'CmdOrCtrl+Shift+T',
-          click: () => mainWindow?.webContents.send('menu:toggle-theme')
+          // audit fix (H3)：应用菜单 click 走 safeSendToRenderer —— 关闭中窗口
+          // 的 webContents.send 同款 TypeError 风险。
+          click: () => safeSendToRenderer('menu:toggle-theme')
         },
         { type: 'separator' },
         {
           label: '设置...',
           accelerator: 'CmdOrCtrl+,',
-          click: () => mainWindow?.webContents.send('menu:settings')
+          click: () => safeSendToRenderer('menu:settings')
         },
         { type: 'separator' },
         {

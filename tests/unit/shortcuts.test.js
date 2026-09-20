@@ -49,6 +49,7 @@ describe('shortcuts 基本派发', () => {
       onToggleFocusMode: vi.fn(),
       onToggleAi: vi.fn(),
       onReload: vi.fn(),
+      onCloseFile: vi.fn(),
     };
     detach = mountKeyboardShortcuts(handlers);
   });
@@ -109,6 +110,26 @@ describe('shortcuts 基本派发', () => {
     // 大写 R 也应命中（Shift 不会被按，但 key.toLowerCase() 仍可工作）
     fireKey({ key: 'R', ctrlKey: true });
     expect(handlers.onReload).toHaveBeenCalledTimes(2);
+  });
+
+  // 关闭当前文件：Ctrl+W。无文件时调 onCloseFile 也安全 —— app.js 的
+  // closeCurrentFile() 内部对 !state.currentFile 直接 return，handler 失活无副作用。
+  it('Ctrl+W → onCloseFile', () => {
+    fireKey({ key: 'w', ctrlKey: true });
+    expect(handlers.onCloseFile).toHaveBeenCalledTimes(1);
+    fireKey({ key: 'W', ctrlKey: true });
+    expect(handlers.onCloseFile).toHaveBeenCalledTimes(2);
+  });
+
+  it('Ctrl+W 必须 preventDefault（防止 Electron 默认关闭 BrowserWindow）', () => {
+    const ev = fireKey({ key: 'w', ctrlKey: true });
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it('Ctrl+Shift+W / Ctrl+Alt+W 不应触发 onCloseFile（避免误触）', () => {
+    fireKey({ key: 'w', ctrlKey: true, shiftKey: true });
+    fireKey({ key: 'w', ctrlKey: true, altKey: true });
+    expect(handlers.onCloseFile).not.toHaveBeenCalled();
   });
 
   it('非修饰键 → 不触发任何 handler', () => {
@@ -271,6 +292,7 @@ describe('shortcuts handler 缺失时静默', () => {
       fireKey({ key: 'n', ctrlKey: true });
       fireKey({ key: 'O', ctrlKey: true, shiftKey: true });
       fireKey({ key: 'A', ctrlKey: true, shiftKey: true });
+      fireKey({ key: 'w', ctrlKey: true });
     }).not.toThrow();
   });
 });
@@ -313,6 +335,19 @@ describe('shortcuts IME 合成期间（C3 audit）', () => {
     fireKey({ key: 'e', ctrlKey: true, isComposing: false });
     expect(handlers.onToggleEditorMode).toHaveBeenCalledTimes(1);
   });
+
+  // Ctrl+W 在 IME 合成期也应被吞：用户在 CJK 拼音中途按 Ctrl+W 不应该
+  // 立即关文件，IME buffer 还在编辑器里。
+  it('isComposing=true 时 Ctrl+W 不触发 onCloseFile', () => {
+    const handlers2 = { onCloseFile: vi.fn() };
+    const detach2 = mountKeyboardShortcuts(handlers2);
+    try {
+      fireKey({ key: 'w', ctrlKey: true, isComposing: true });
+      expect(handlers2.onCloseFile).not.toHaveBeenCalled();
+    } finally {
+      detach2();
+    }
+  });
 });
 
 describe('shortcuts 模态打开时 Ctrl+W 抑制（M1 audit）', () => {
@@ -338,12 +373,18 @@ describe('shortcuts 模态打开时 Ctrl+W 抑制（M1 audit）', () => {
     expect(ev.defaultPrevented).toBe(true);
   });
 
-  it('模态未开时 Ctrl+W 不在抑制列表里（normal 行为：不被 preventDefault）', () => {
+  it('模态未开时 Ctrl+W 仍 preventDefault（挡 Electron 关窗口），但不在 SUPPRESS 列表里', () => {
     if (modalApi) modalApi.close('test-no-modal');
     modalApi = null;
+    const closeHandler = vi.fn();
+    const detachNoModal = mountKeyboardShortcuts({ onCloseFile: closeHandler });
     const ev = fireKey({ key: 'w', ctrlKey: true });
-    // 不被任何 handler 拦截 → defaultPrevented 应该是 false（由浏览器处理关窗口）
-    expect(ev.defaultPrevented).toBe(false);
+    // Ctrl+W 必须 preventDefault：否则 Electron 默认行为是直接关 BrowserWindow，
+    // 整个应用被干掉，与"关闭当前文件"语义不符。这是 2026-09 设计优化引入
+    // 的新行为（之前测试期望 defaultPrevented=false 是旧语义）。
+    expect(ev.defaultPrevented).toBe(true);
+    expect(closeHandler).toHaveBeenCalled();
+    if (detachNoModal && typeof detachNoModal.dispose === 'function') detachNoModal.dispose();
   });
 });
 

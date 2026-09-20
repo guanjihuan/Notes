@@ -3,7 +3,7 @@
 // 职责：
 //   - 加载 / 保存用户配置（userData/config.json）
 //   - 解析「实际生效」的数据目录（用户自定义 vs 默认 ~/Notes）
-//   - 首次启动把 data/welcome.md 种子化到默认数据目录
+//   - 首次启动把 data/README.md 种子化到默认数据目录
 //
 // 设计：
 //   - 本模块自给自足：不读 mainWindow / tray / IPC 等任何 main.js 状态。
@@ -102,7 +102,15 @@ function loadConfig() {
 
 /**
  * 删除数据目录里残留的 config.json.tmp.* 文件。
- * 只删自己 pid 的（其它进程残留不碰，避免多开实例互相影响）。
+ * 两层阈值：
+ *   - 自己 pid + 60s 前 → 必删（防止本进程崩溃留下永久孤儿）
+ *   - 非自己 pid + 24h 前 → 必删（清理上一次 Notes 实例崩溃的孤儿，
+ *     24h 长到不会误删正在运行的其它 Notes 实例）
+ *
+ * audit fix (Round 16 R2)：旧版只覆盖「自己 pid + 60s」一层。Notes
+ * 进程被 kill / 断电时，tmp 文件用的是当时进程的 pid；下次启动时本进程
+ * pid 不同，60s 阈值永远不命中，孤儿永久残留。`scripts/_archive/` 下
+ * 9 个一次性 repro 脚本的历史足以说明这种崩溃/中断场景不是理论风险。
  */
 function cleanupStaleTmpFiles() {
   try {
@@ -110,16 +118,19 @@ function cleanupStaleTmpFiles() {
     const files = fsSync.readdirSync(dir);
     const myPid = process.pid;
     const now = Date.now();
-    const STALE_THRESHOLD_MS = 60_000; // 60s 之前留下的才视为残留（避免误删正在写的）
+    const STALE_THRESHOLD_MS = 60_000;            // 自己 pid：60s
+    const CROSS_PID_STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 跨 pid：24h
     for (const f of files) {
       if (!/^config\.json\.tmp\./.test(f)) continue;
       const full = path.join(dir, f);
       try {
         const st = fsSync.statSync(full);
-        // 自己的 pid + 超过 60s 前 → 视为残留；跨 pid 不动（不归本进程管）
         const isMine = f.includes(`.${myPid}.`);
         const ageMs = now - st.mtimeMs;
-        if (isMine && ageMs > STALE_THRESHOLD_MS) {
+        const shouldRemove = isMine
+          ? ageMs > STALE_THRESHOLD_MS
+          : ageMs > CROSS_PID_STALE_THRESHOLD_MS;
+        if (shouldRemove) {
           fsSync.unlinkSync(full);
         }
       } catch { /* 单个文件 stat/unlink 失败不影响整体 */ }
@@ -178,7 +189,12 @@ function saveConfig(next) {
       _invalidateResolveCache();
     }
     const cfgPath = getConfigPath();
-    const tmpPath = `${cfgPath}.tmp.${process.pid}.${Date.now()}`;
+    // audit fix (Round 16 P0)：追加 6 位 base36 随机后缀。pid + Date.now() 只保证
+    // 跨进程 / 跨毫秒唯一，同进程同毫秒并发（典型场景：saveQueue 中 p1 与后续 task
+    // 在 await 后进入 fs.open）会算出相同 tmpPath，后到的 rename 因源文件已被消费
+    // 而失败（ENOENT），上层捕获后返回 {ok:false}。random 后缀 ~36^6 ≈ 21 亿组合，
+    // 同毫秒冲突概率可忽略。main/file-ops.js#atomicWriteFile 也做了对称修复。
+    const tmpPath = `${cfgPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
     let fh = null;
     try {
       await fs.mkdir(path.dirname(cfgPath), { recursive: true });
@@ -337,12 +353,19 @@ function resolveDataDirOrFallback() {
   // 重新 stat
   let exists = true;
   try {
-    const st = fsSync.statSync(custom);
-    // statSync 在普通文件 / 符号链接上不会抛 ENOTDIR —— ENOTDIR 只在「当目录用」时
-    // 才会报。这里额外检查「不是目录」：dataDir 字段意外指向了一个文件路径
-    // （用户在设置对话框里手填、或 config.json 被改坏），仍应 fallback，否则
-    // 上层 scanDir / watchDir 立刻 ENOTDIR 报上来，体验割裂。
-    if (!st.isDirectory()) exists = false;
+    // audit fix (H1 / symlink elevation)：用 lstat 而非 stat —— stat 会 follow
+    // 符号链接，让一个被外部指向敏感目录的 symlink 当作「合法数据目录」通过
+    // 校验，随后 file:read/write/fsWatcher 都会跑在外部目录上，用户完全无感。
+    // 这里先 lstat，再显式拒绝 symlink；普通目录 / 文件路径走原逻辑。
+    const st = fsSync.lstatSync(custom);
+    if (st.isSymbolicLink()) {
+      exists = false;
+    } else if (!st.isDirectory()) {
+      // dataDir 字段意外指向了一个文件路径（用户在设置对话框里手填、或
+      // config.json 被改坏），仍应 fallback，否则上层 scanDir / watchDir
+      // 立刻 ENOTDIR 报上来，体验割裂。
+      exists = false;
+    }
   } catch (e) {
     if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
       exists = false;
@@ -381,25 +404,34 @@ function getConfig() {
 }
 
 /**
- * 首次启动把 data/welcome.md 种子化到默认数据目录。
+ * 首次启动把 data/README.md 种子化到默认数据目录。
  *
  * 触发条件（任一为真则跳过）：
- *   - 默认目录里已有 welcome.md（已种子过）→ 直接 return
+ *   - 默认目录里已有 README.md（已种子过）→ 直接 return
  *   - 默认目录里有其它 .md 文件（用户笔记）→ 不覆盖
  *
- * 用 welcome.md 自己作为「已种子」的隐式标记，不再写 .notes-seeded 隐藏文件
+ * 用 README.md 自己作为「已种子」的隐式标记，不再写 .notes-seeded 隐藏文件
  * —— 用户数据目录应该只放用户的内容。
  *
  * 不再守卫「用户没设 dataDir」：auto-fallback 路径下用户设了 dataDir 但路径失效，
- * 也会 runtime 回退到默认目录 —— 这时默认目录可能是空的，要种子化 welcome.md
+ * 也会 runtime 回退到默认目录 —— 这时默认目录可能是空的，要种子化 README
  * 让用户立刻看到内容（而不是打开一个空侧栏）。
  *
  * 失败仅 console.warn，不弹窗；用户用「打开数据文件夹」按钮可以自己补救。
  */
+
+/**
+ * 种子文件清单 —— 顺序就是侧栏显示顺序（README 是首页）。
+ * 新增 onboarding 文档时只在这里加一行 + 在 data/ 下放对应源文件，无需改 IPC / 主流程。
+ */
+const ONBOARDING_SEED_FILES = [
+  'README.md',
+];
+
 async function ensureDefaultDataDir() {
   if (!DEFAULT_DATA_DIR) return;
   const targetDir = DEFAULT_DATA_DIR;
-  const welcomeDst = path.join(targetDir, 'welcome.md');
+  const sentinelDst = path.join(targetDir, 'README.md');
 
   try {
     // 先确保目录存在（mkdir recursive 不存在就建、存在 no-op）。
@@ -409,15 +441,15 @@ async function ensureDefaultDataDir() {
     // 或之后（启动 bootstrap），所以这里再保险一次。
     await fs.mkdir(targetDir, { recursive: true });
 
-    // welcome.md 已存在 → 已经种子过（或用户改过），跳过
+    // README.md 已存在 → 已经种子过（或用户改过），跳过整个 onboarding 集合
     try {
-      await fs.stat(welcomeDst);
+      await fs.stat(sentinelDst);
       return;
     } catch (e) {
       if (e.code !== 'ENOENT') throw e;
     }
 
-    // 已有其它 .md → 用户笔记，不覆盖 welcome 也不打扰用户
+    // 已有其它 .md → 用户笔记，不种子化也不打扰用户
     const dirEntries = await fs.readdir(targetDir).catch((err) => {
       if (err.code === 'ENOENT') return [];
       throw err;
@@ -426,12 +458,25 @@ async function ensureDefaultDataDir() {
       return;
     }
 
-    // 种子化 welcome.md
-    const src = path.join(__dirname, '..', 'data', 'welcome.md');
-    await fs.copyFile(src, welcomeDst);
-    console.log('[config-store] 已种子 welcome.md 到默认数据目录:', welcomeDst);
+    // 种子化整套 onboarding 文件。每个文件独立 copyFile —— 中途某一份失败
+    // 不影响其他（部分种子优于全失败，符合"让用户立刻看到内容"的目标）。
+    const seeded = [];
+    for (const fileName of ONBOARDING_SEED_FILES) {
+      try {
+        const src = path.join(__dirname, '..', 'data', fileName);
+        const dst = path.join(targetDir, fileName);
+        await fs.copyFile(src, dst);
+        seeded.push(fileName);
+      } catch (fileErr) {
+        // 单文件失败（最常见：data/ 里漏放新文件源）仅 warn，不中断剩余文件
+        console.warn(`[config-store] 种子 ${fileName} 失败:`, fileErr.message);
+      }
+    }
+    if (seeded.length > 0) {
+      console.log(`[config-store] 已种子 onboarding 到默认数据目录（${seeded.length} 个）:`, targetDir);
+    }
   } catch (e) {
-    console.warn('[config-store] welcome 种子失败:', e.message);
+    console.warn('[config-store] onboarding 种子失败:', e.message);
   }
 }
 
@@ -445,7 +490,7 @@ async function seedDefaultDataDir() {
 
 /**
  * fire-and-forget 异步种子 —— resolveDataDirOrFallback 内每次返回 DEFAULT_DATA_DIR
- * 都会调它，确保在 IPC handler 同步返回之后异步把 welcome.md 种子进去。
+ * 都会调它，确保在 IPC handler 同步返回之后异步把 README.md 种子进去。
  *
  * 用 _ensureInFlight Promise 去重：同一时间多次触发只跑一次（fsWatcher 启动后
  * 第一次 IPC scanDir 触发 fallback + renderer 启动后的 resetDataDir + 启动自身

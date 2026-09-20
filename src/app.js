@@ -13,6 +13,10 @@ import { SettingsDialog } from './settings-dialog.js';
 import { showToast } from './feedback.js';
 import { decideSaveToast } from './save-toast.js';
 import { syncDirtyFromEditor as syncDirtyFromEditorPure } from './dirty-sync.js';
+// 救援文件工具：5 处独立复制的「生成救援名 + 写盘 + toast」逻辑
+// 集中到一处，命名规则 / 错误文案（特别是 friendlyFsError 传 r.message
+// 而非 r.error 业务码）只改一处即可。详见 src/rescue.js 注释。
+import { rescueDirtyContent } from './rescue.js';
 import { showConfirmDialog } from './confirm-dialog.js';
 import { isOpen as modalIsOpen } from './modal-stack.js';
 import { mountKeyboardShortcuts } from './shortcuts.js';
@@ -157,6 +161,7 @@ const els = {
   statusMeta: document.getElementById('status-meta'),
   statusCount: document.getElementById('status-count'),
   statusMode: document.getElementById('status-mode'),
+  statusModeLabel: document.getElementById('status-mode-label'),
   statusStats: document.getElementById('status-stats'),
   statusScroll: document.getElementById('status-scroll'),
   statusHeading: document.getElementById('status-heading'),
@@ -170,6 +175,9 @@ const els = {
   btnTheme: document.getElementById('btn-theme'),
   btnPin: document.getElementById('btn-pin'),
   btnSave: document.getElementById('btn-save'),
+  // 关闭当前文件（仅清空视图，磁盘文件不动）：放工具栏「操作组」紧邻保存按钮，
+  // 语义上「保存」与「关闭」是相邻操作。沿用 .btn-icon，disabled 态走现有规则。
+  btnCloseFile: document.getElementById('btn-close-file'),
   btnModePreview: document.getElementById('btn-mode-preview'),
   btnModeEdit: document.getElementById('btn-mode-edit'),
   btnModeSplit: document.getElementById('btn-mode-split'),
@@ -310,6 +318,34 @@ function syncSaveButton() {
   // 修复：syncSaveButton 内联调一次 updateWindowTitle，让标题/按钮/状态栏三处
   // 反馈始终同步。lastSentDirtyToMain 已在 helper 内部去重 IPC，这里只刷 DOM。
   updateWindowTitle();
+  // 「关闭当前文件」按钮的 disabled 态跟 state.currentFile 走 —— 把它和
+  // syncSaveButton 串到同一出口，openFile / clearCurrentFile 不必各自记得再调一次。
+  // 这条调用非常便宜（几个 DOM 属性），不影响 hot path。
+  syncCloseFileButton();
+}
+
+/**
+ * 同步「关闭当前文件」按钮的 disabled 态：无文件可关时置灰，避免误导用户。
+ * 不需要 pressed 态（这是命令式入口，不是 toggle），不需要 IPC 通知。
+ * 走 .btn-icon 的现有 :disabled 样式（fg-tertiary + opacity:0.4 + cursor not-allowed）。
+ *
+ * 调用方：syncSaveButton / openFile / clearCurrentFile 末尾（与 syncSaveButton 复用同一
+ * 触发点 —— 任何"当前文件"变化都会经由它们之一）。
+ */
+function syncCloseFileButton() {
+  if (!els.btnCloseFile) return;
+  const hasFile = !!state.currentFile;
+  els.btnCloseFile.disabled = !hasFile;
+  els.btnCloseFile.setAttribute('aria-disabled', hasFile ? 'false' : 'true');
+  // title / aria-label 同步：屏幕阅读器对 disabled 按钮仍会读 aria-label；
+  // 无文件时明确说「无打开文件」，避免读屏用户听到「关闭当前文件」后去按一个禁用的按钮。
+  if (hasFile) {
+    els.btnCloseFile.title = '关闭当前文件 (Ctrl+W)';
+    els.btnCloseFile.setAttribute('aria-label', '关闭当前文件');
+  } else {
+    els.btnCloseFile.title = '关闭当前文件（无打开文件）';
+    els.btnCloseFile.setAttribute('aria-label', '关闭当前文件（无打开文件）');
+  }
 }
 
 /**
@@ -377,6 +413,9 @@ function handleAiDiffOpenChange(isOpen) {
     // 强制切到 edit（即使当前已经在 edit 也无副作用 —— applyEditorMode 内部走 _setDOM）。
     // focus: false 避免偷焦点：用户可能在 AI 输入框里编辑 prompt，不应被打断。
     applyEditorMode('edit', { focus: false });
+    // AI 修改预览打开时重置面板宽度 = 可用区 50%
+    // —— 用户每次打开都默认对半分，drag 比例仅在本次会话内有效
+    resetAiPanelWidthToHalf();
   } else {
     // 解除锁；按持久化的 state.editorMode 走正常的 md/non-md 禁用逻辑
     // （非 md 文件下 preview / split 仍会被禁用，md 文件恢复可选）。
@@ -920,6 +959,59 @@ function clearCurrentFile() {
 }
 
 /**
+ * 关闭当前打开的文件（视图回到 empty-state，但磁盘文件保持不变）。
+ *
+ * 与 clearCurrentFile 的区别：本函数处理"用户主动关闭"的脏状态对话框，
+ * 把「保存 / 放弃 / 取消」三选一决策交给用户。clearCurrentFile 内部已经
+ * 处理了状态清理（currentFile=null / viewer/editor unload / 高亮清除），
+ * 所以 closeCurrentFile 只做"是否允许清空"的判断 + 复用 clearCurrentFile。
+ *
+ * 不弹「文件已关闭」toast：用户主动点的关闭按钮，给 toast 是噪音
+ * （与 clearCurrentFile 的"无 toast"约定一致 —— 见 line 887）。
+ *
+ * dirty 检查复用 openFile 的"同步 editor.isDirty() → state.isDirty"
+ * 守门（IME 合成期间 state.isDirty 可能 stale，导致 CJK 用户按 Ctrl+W
+ * 跳过脏对话框静默丢失 IME 字符）。
+ *
+ * 调用方：工具栏「关闭文件」按钮 + Ctrl+W 快捷键 + （未来）文件列表右键。
+ */
+async function closeCurrentFile() {
+  if (!state.currentFile) return; // 已经没打开文件 → 静默 no-op
+  // IME 合成期同步 state.isDirty，与 openFile / save 走同一守门。
+  syncDirtyFromEditor();
+  if (state.isDirty) {
+    const choice = await showConfirmDialog({
+      title: '未保存的改动',
+      message: `当前文件「${state.currentFile.name}」有未保存的改动。\n\n关闭前请选择如何处理。`,
+      icon: 'warning',
+      buttons: [
+        { value: 'cancel', label: '取消' },
+        { value: 'discard', label: '放弃改动', variant: 'danger' },
+        { value: 'save_and_close', label: '保存并关闭', variant: 'primary' },
+      ],
+    });
+    // 用户取消 / 关闭对话框 → 不关文件，原样保留
+    if (choice === 'cancel' || choice == null) return;
+    if (choice === 'save_and_close') {
+      // 走 save() 主路径：拿到失败原因（冲突 / IME / 文件没了），让用户
+      // 看到完整反馈；save() 失败时不关闭（避免编辑器被清空后又没保存上）
+      const ok = await save();
+      if (!ok) return;
+    } else {
+      // 'discard'：复位脏态 + editor 基线 + 保存按钮（与 openFile 的
+      // save_and_open/discard 分支同款：避免 auto-save 飞行期拿旧
+      // lastSavedMtimeMs 误判为「外部修改」、或 syncSaveButton 没刷 UI）
+      cancelScheduledAutoSave();
+      state.isDirty = false;
+      state.lastSavedMtimeMs = null;
+      editor.markSaved();
+      syncSaveButton();
+    }
+  }
+  clearCurrentFile();
+}
+
+/**
  * 从磁盘重新读取并替换当前文件的内容（外部修改覆盖本地）。
  *
  * 把读盘 + 替换编辑器内容 + 替换 viewer 内容 + 同步 mtime 基线
@@ -1065,6 +1157,9 @@ const editorToolbar = new EditorToolbar({
   },
   onChange: (mode) => {
     settingsStore.update({ editorMode: mode });
+    // 注意：splitRatio=0.5 的重置在 applyEditorMode 内部做（visualMode 闸），
+    // 这里不需要重复写 —— onChange / bootstrap / reload / AI lock 都会走 applyEditorMode，
+    // 单点维护。
     applyEditorMode(mode);
   },
 });
@@ -1113,6 +1208,25 @@ function applyEditorMode(mode, opts) {
   // 非 md 文件：把视觉模式强制回落到 'edit'，但不写 state.editorMode。
   const isMd = state.currentFileIsMarkdown;
   const visualMode = isMd ? mode : 'edit';
+
+  // 视觉模式从非 split 切到 split 时重置 splitRatio=0.5 —— 用户期待「双栏」= 50/50
+  // （每次进入双栏都从默认比例起步，drag 只在本次会话内有效）。
+  // 用 DOM 上的 prevVisualMode（document.body.dataset.editorMode）而不是 state.editorMode：
+  //   - state.editorMode 会在 AI 打开时被覆盖为 'edit'（handleAiDiffOpenChange(true) →
+  //     applyEditorMode('edit')），与用户真正看到的视觉模式可能脱节；
+  //   - DOM 是 CSS 渲染的唯一依据，在 _setDOM 同步写入；这里在 setMode 之前读，正好是
+  //     「进入前的视觉状态」，符合「看到双栏的瞬间重置」语义。
+  // 这同时覆盖 md ↔ non-md 重命名场景：把 .md 改 .txt 时视觉退回 edit，再改回 .md 时
+  // 视觉从 edit 重新进入 split，闸触发重置。
+  // bootstrap 时 currentFile=null → isMd=false → visualMode='edit'，闸不触发（视觉不显示 split）；
+  // 用户打开第一个 md 文件时 applyEditorMode 触发，visualMode='split'，DOM 之前是 'edit'，
+  // 闸触发 —— 视觉上用户看到 split 的瞬间就是 50/50。
+  // settingsStore.update 是乐观写盘（缓存同步更新、IPC 异步），MutationObserver 作为
+  // microtask 在当前同步块之后才 drain；reset 写在这里是先于 _setDOM，便于阅读。
+  if (visualMode === 'split' && document.body.dataset.editorMode !== 'split') {
+    settingsStore.update({ splitRatio: 0.5 });
+  }
+
   // editorToolbar.setMode 内部已 _setDOM 写 body[data-editor-mode] + 高亮按钮；
   // 不要再单独 dataset，否则两边写同一属性会产生「两次 setAttribute」的
   // MutationObserver 噪音，调试时易误以为有别的代码在动 DOM。
@@ -1125,8 +1239,13 @@ function applyEditorMode(mode, opts) {
   // 切到 edit / split 时聚焦编辑器 —— 但外部 reload 路径不希望被 focus 偷走
   const wantFocus = opts ? opts.focus !== false : true;
   if (wantFocus && (visualMode === 'edit' || visualMode === 'split')) {
-    // 异步聚焦：等 DOM 更新后再 focus，否则可能焦点丢失
-    requestAnimationFrame(() => editor.focus());
+    // 异步聚焦：等 DOM 更新后再 focus，否则可能焦点丢失。
+    // 与 scrollFrame 同款风格：track 住 handle，连按 Ctrl+E 时只 focus 一次。
+    if (editorFocusFrame) cancelAnimationFrame(editorFocusFrame);
+    editorFocusFrame = requestAnimationFrame(() => {
+      editorFocusFrame = null;
+      editor.focus();
+    });
   }
 
   // 模式按钮可用性：非 md 文件禁用 preview / split（edit 仍可用）
@@ -1163,8 +1282,7 @@ function updateStatusMode() {
     || 'split';
   const labels = { preview: '预览', edit: '编辑', split: '双栏' };
   // 文字写到 #status-mode-label 子 span（chip 内的 SVG 图标保留）
-  const labelEl = document.getElementById('status-mode-label');
-  if (labelEl) labelEl.textContent = labels[mode] || mode;
+  if (els.statusModeLabel) els.statusModeLabel.textContent = labels[mode] || mode;
   els.statusMode.dataset.mode = mode;
   // audit M (a11y)：SR 只读 aria-label 不读 textContent；同步让屏幕阅读器用户
   // 听到「切换视图模式（当前：预览）」，与可见 chip 文字一致。
@@ -1260,6 +1378,10 @@ function updateStatusStats() {
  * - split：viewer 的进度（双栏同步滚动，两边值一致，读者视角）
  */
 let scrollFrame = null;
+// 切模式（Ctrl+E / 点 mode chip）后用 rAF 等 DOM 更新完再 focus 编辑器；
+// 与 scrollFrame 同款：track 住 handle，连续切模式时丢弃上一个未 fire 的帧，
+// 避免多次 focus() 在同帧内排队、最后一帧执行多次（audit F1）。
+let editorFocusFrame = null;
 function updateStatusScroll() {
   if (!els.statusScroll) return;
   els.statusScroll.hidden = false;
@@ -1316,6 +1438,7 @@ new Toolbar({
     btnMin: els.btnMin,
     btnMax: els.btnMax,
     btnClose: els.btnClose,
+    btnCloseFile: els.btnCloseFile,
   },
   onThemeClick: () => cycleTheme(),
   onPinClick: async () => {
@@ -1334,14 +1457,21 @@ new Toolbar({
   onMinimize: () => window.api.minimizeWindow(),
   onToggleMaximize: () => window.api.toggleMaximizeWindow(),
   onClose: () => window.api.closeWindow(),
+  // 关闭当前文件：与窗口关闭按钮（btnClose → onClose → closeWindow）区分。
+  // 这里走 closeCurrentFile()：内部有"未保存改动"对话框；无文件时按钮 disabled
+  // 不触发（disabled 浏览器层面 click 不派发）。
+  onCloseFile: () => closeCurrentFile(),
 });
 
 /**
  * 保存按钮（手动保存入口）
  */
 if (els.btnSave) {
+  // Round 13 fix (LOW app.js #1)：原 `return save()` 在箭头函数里把 save()
+  // 的 Promise 返回给 addEventListener 回调——返回值被 listener 忽略，是
+  // 误导性表达。改成显式调用 + 让 listener 返回 void。
   els.btnSave.addEventListener('click', () => {
-    return save();
+    save();
   });
 }
 
@@ -1390,6 +1520,12 @@ if (els.statusPath) {
  */
 function mountAiPanel() {
   if (!els.btnAi) return;
+  // audit fix (M1)：重复 mount 时先拆旧实例 —— createAiController 持有 chat
+  // panel 7 listener + diff panel + recomputeTimer + IPC 订阅，覆盖引用会让旧
+  // 实例变孤儿，等 GC 期间旧监听器仍响应事件（看到的是「AI 点了没反应」）。
+  if (ai && typeof ai.destroy === 'function') {
+    try { ai.destroy(); } catch { /* ignore */ }
+  }
   // 创建控制器（在 settings 加载完后）
   ai = createAiController({
     api: window.api,
@@ -1713,6 +1849,10 @@ async function save(opts = {}) {
                   state.currentFile = { ...state.currentFile, mtimeMs: reloadResult.mtimeMs, size: reloadResult.size };
                   state.isDirty = false;
                   syncSaveButton();
+                  // Round 13 fix (M17)：discard_local 与 reloadCurrentFileFromDisk
+                  // 对称调 applyEditorMode —— 不调会让 editor 仍处于 IME 合成期
+                  // / 用户切到 edit-mode 之前的视图状态，与 state.editorMode 漂移。
+                  applyEditorMode(state.editorMode, { focus: false });
                   // audit fix (Round 9)：和 reloadCurrentFileFromDisk 一致，丢弃本地
                   // 切换到外部版本后必须通知 AI controller 清 pendingDiff —— 否则 AI
                   // 可能基于 baseContent（本地）算 diff 后 setExternalContent 把本地内容
@@ -1785,11 +1925,6 @@ async function save(opts = {}) {
             // 注意：先 clearCurrentFile 也意味着 UI 立刻清空（编辑器 / viewer
             // 卸载），用户看到「文件没了」+ 一条「正在救回」toast，几秒后 toast
             // 变「已救回到 xxx」或「救回失败」。这比「脏内容静默丢失」好得多。
-            const originalName = targetName || 'untitled.md';
-            const base = originalName.replace(/\.md$/i, '');
-            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23); // 含 .mmm
-            const suffix = Math.random().toString(36).slice(2, 6);
-            const rescueName = `${base}-rescued-${stamp}-${suffix}.md`;
             // Phase 2 audit 修复 (P2 Bug #2)：必须在 clearCurrentFile **之前**
             // 取最新内容 —— clearCurrentFile 会 unload editor view，之后
             // editor.getContent() 返回 ''。flight 期间用户输入的字符都在
@@ -1803,15 +1938,13 @@ async function save(opts = {}) {
             showToast('文件已被删除；正在救回未保存内容…', 'warning', 3000);
             // 异步救回（fire-and-forget：不阻塞 save() 返回；race 安全因为
             // state.currentFile 已是 null，后续 onFilesChanged 不会再走 rescue 分支）
-            window.api.createFile(rescueName, latestContent).then((rescueResult) => {
-              if (rescueResult && rescueResult.ok) {
-                showToast(`未保存内容已救回到「${rescueName}」`, 'success', 4500);
-              } else {
-                showToast(`未保存内容丢失（救回失败：${window.api.friendlyFsError(rescueResult?.code, rescueResult?.error)}）`, 'error', 4500);
-              }
-            }).catch((e) => {
-              console.error('[app] save FILE_NOT_FOUND 救回异常:', e);
-              showToast('未保存内容丢失（救回异常）', 'error', 4500);
+            // 命名 / toast 文案 / friendlyFsError 错误码传递逻辑全部交给 rescue.js，
+            // 这里只关心「我有 content、想救回」一件事。
+            rescueDirtyContent({
+              api: window.api,
+              originalName: targetName,
+              content: latestContent,
+              event: '文件已被删除',
             });
             return { ok: false, reason: 'FILE_NOT_FOUND' };
           }
@@ -1847,12 +1980,18 @@ async function save(opts = {}) {
         //   - 不等（飞行期用户敲了新字符，半步保存）→ state.isDirty = true，
         //     走 Phase N-A1 的「半步保存」兜底：用户主动 Ctrl+S 补刀 / 关窗走
         //     main.js confirmDiscardIfDirty 的 rendererDirty re-check
-        const currentDoc = editor.view.state.doc.toString();
-        state.isDirty = (currentDoc !== content);
-        editor.markSaved();
-        state.lastSavedMtimeMs = result.mtimeMs;
-        state.lastWriteMtimeMs = result.mtimeMs; // P1-2：用 mtime 而非 Date.now() 作为回声抑制锚点
-        syncSaveButton();
+        //
+        // 防御：editor 在 await window.api.writeFile 期间可能被 pagehide 拆掉
+        // （dispose() 置 view = null）—— 那种情况下文已经要走了，不必再更新
+        // state / UI，命中则跳过即可。
+        if (editor.view) {
+          const currentDoc = editor.view.state.doc.toString();
+          state.isDirty = (currentDoc !== content);
+          editor.markSaved();
+          state.lastSavedMtimeMs = result.mtimeMs;
+          state.lastWriteMtimeMs = result.mtimeMs; // P1-2：用 mtime 而非 Date.now() 作为回声抑制锚点
+          syncSaveButton();
+        }
 
         // 更新当前文件的 size/mtime（让侧边栏和状态栏反映最新值）
         state.currentFile = { ...state.currentFile, mtimeMs: result.mtimeMs, size: result.size };
@@ -1960,7 +2099,11 @@ async function openFile(file) {
   // `myEpoch !== openEpoch` 检查会因 openEpoch 已被新调用顶到 N+1 而失败，
   // 导致整个加载链在中途放弃状态变更（双击同一个文件，editor/viewer 不更新）。
   // 直接返回原 promise，等它正常走完；新调用方复用同一结果。
-  if (openInFlight && openInFlight.path === file.path) {
+  // audit fix (Case-M1)：Windows / macOS 路径大小写不敏感 —— 用户输入的 case
+  // 与 IPC 返回的 canonical case 可能不一致。`===` 会漏命中，导致同一文件
+  // 被并发打开两次（双 editor 抖动、state.currentFile 终态不确定）。统一走
+  // pathsEqual（utils.js 已有 case-fold 实现）。
+  if (openInFlight && pathsEqual(openInFlight.path, file.path)) {
     return openInFlight.promise;
   }
 
@@ -1981,6 +2124,15 @@ async function openFile(file) {
   // 防止 IME 期间切文件 / 打开同名文件时不弹「未保存改动」对话框，让用户
   // 编辑的 IME 字符随 view 销毁静默丢失。详见 syncDirtyFromEditor 注释块。
   syncDirtyFromEditor();
+
+  // 第二阶段代码审查 (Phase 2 review #5)：在第一个 await 之前抓「用户当前打开的文件」
+  // + 脏态快照。下面的 dirty 对话框 / save() await 期间，clearCurrentFile 可能被
+  // 触发（onFilesChanged race、外部删除、关窗路径、rename 完成），把 state.currentFile
+  // 拍成 null、state.isDirty 拍成 false。FILE_NOT_FOUND 分支里如果继续读
+  // state.currentFile / state.isDirty，rescue 检查会永远短路，dirty 内容静默丢失。
+  // 用快照判断「我们当时打算 open 的那个文件是谁」才是正确的语义。
+  const targetFileSnapshot = state.currentFile ? { ...state.currentFile } : null;
+  const targetIsDirtySnapshot = !!state.isDirty;
 
   // 切换到不同文件且当前脏 → 提示
   if (state.isDirty && state.currentFile && state.currentFile.path !== file.path) {
@@ -2020,7 +2172,7 @@ async function openFile(file) {
       let stillDirtyAfterRetry = false;
       for (let i = 0; i < 3; i++) {
         if (!state.isDirty) break;
-        if (!state.currentFile || state.currentFile.path === file.path) break;
+        if (!state.currentFile || pathsEqual(state.currentFile.path, file.path)) break;
         ok = await save({ silent: true });
         if (myEpoch !== openEpoch) return;
         if (!ok) break;
@@ -2059,7 +2211,7 @@ async function openFile(file) {
       // 关窗时主进程的 rendererDirty 还是 true，会要求用户保存一个他们已经放弃的版本。
       syncSaveButton();
     }
-  } else if (state.isDirty && state.currentFile && state.currentFile.path === file.path) {
+  } else if (state.isDirty && state.currentFile && pathsEqual(state.currentFile.path, file.path)) {
     // Phase 2 audit 修复 (P0 BUG #1)：点同一文件 + dirty → 也走「保存 / 放弃 / 取消」对话框。
     // 原代码 `path !== file.path` 把同文件情况短路，编辑器直接被磁盘版本覆盖 → 未
     // 保存字符静默丢失（用户高频误点 / focus 切换都会触发）。提示文案改成「重新加载会丢
@@ -2089,7 +2241,7 @@ async function openFile(file) {
       editor.markSaved();
       syncSaveButton();
     }
-  } else if (state.currentFile && state.currentFile.path === file.path) {
+  } else if (state.currentFile && pathsEqual(state.currentFile.path, file.path)) {
     // Phase 2 audit 修复：同文件 + 干净 → no-op，避免无谓的 readFile + editor.loadFile
     // 重新加载（编辑器内容 = 磁盘内容，刷新没意义，徒增 IO）。如果用户是想 reload
     // 外部修改过的文件，应该走工具栏「重新加载」按钮（reloadCurrentFileFromDisk），
@@ -2115,22 +2267,26 @@ async function openFile(file) {
           // 的 createFile(rescueName, editor.getContent())）把脏内容救到数据目录。
           // 注意：必须在 clearCurrentFile **之前**取 editor.getContent() —— clearCurrentFile
           // 会 unload editor view，之后 editor.getContent() 返回 ''。
-          if (state.isDirty && state.currentFile && state.currentFile.path === file.path) {
-            const originalName = state.currentFile.name || 'untitled.md';
-            const base = originalName.replace(/\.md$/i, '');
-            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23);
-            const suffix = Math.random().toString(36).slice(2, 6);
-            const rescueName = `${base}-rescued-${stamp}-${suffix}.md`;
-            const rescueContent = (typeof editor.getContent === 'function') ? editor.getContent() : '';
-            window.api.createFile(rescueName, rescueContent).then((r) => {
-              if (r && r.ok) {
-                showToast(`文件已被删除，未保存内容已救回到「${rescueName}」`, 'warning', 4500);
-              } else {
-                showToast(`文件已被删除；未保存内容丢失（救回失败：${window.api.friendlyFsError(r?.code, r?.error)}）`, 'error', 4500);
-              }
-            }).catch((e) => {
-              console.error('[app] openFile rescue createFile IPC 异常:', e);
-              showToast('文件已被删除；未保存内容丢失', 'error', 4500);
+          //
+          // 第二阶段代码审查 (Phase 2 review #5)：用上方抓的 targetFileSnapshot
+          // + targetIsDirtySnapshot 代替直接读 state.currentFile / state.isDirty。
+          // 原因：readFile 之前发生过 dirty 对话框 / save() await，clearCurrentFile
+          // 可能在这段窗口里被触发（onFilesChanged race、fs-watcher rescue 删文件、
+          // 关窗路径），把 state.currentFile 拍成 null、state.isDirty 拍成 false。
+          // 原检查 `state.isDirty && state.currentFile && state.currentFile.path === file.path`
+          // （pathsEqual 兜底 Windows / macOS 大小写）在 race 命中时永远短路 →
+          // dirty 内容被静默丢失。用快照保持「我们当时打算 open 的那个文件是谁」
+          // 这个意图不变。
+          if (targetIsDirtySnapshot && targetFileSnapshot && pathsEqual(targetFileSnapshot.path, file.path)) {
+            // 命名 / 写盘 / toast 文案统一走 src/rescue.js（含 friendlyFsError
+            // 错误码 vs message 的语义判断）。注意：必须在 clearCurrentFile 之前
+            // 调 rescueDirtyContent 之前的 editor.getContent() —— clearCurrentFile
+            // 会 unload view，之后 getContent() 返回 ''。
+            rescueDirtyContent({
+              api: window.api,
+              originalName: targetFileSnapshot.name,
+              content: (typeof editor.getContent === 'function') ? editor.getContent() : '',
+              event: '文件已被删除',
             });
           } else {
             showToast('文件已被删除', 'warning');
@@ -2140,7 +2296,14 @@ async function openFile(file) {
           // 外部删除、fs-watcher 还没刷掉的条目 B，readFile(B) 撞 FILE_NOT_FOUND，
           // 却把 A 一起清了：clearCurrentFile 会 editor.unload() 并把 isDirty 置 false，
           // A 的未保存内容既没救回也不会在关窗时告警 → 静默丢失。
-          if (!state.currentFile || state.currentFile.path === file.path) {
+          //
+          // 第二阶段代码审查：clearCurrentFile 检查也用快照判断「消失的是不是当初
+          // 打算 open 的那个文件」。state.currentFile 为 null 时 clearCurrentFile 是
+          // no-op（line 2249 的早退路径），原表达式 `!state.currentFile || ...` 已经
+          // 兼容 race；这里改成显式读快照让两条 rescue / clear 分支的判断口径一致，
+          // 未来读代码时不必在两处分别解释为什么一个用 state 一个用 snapshot。
+          const matchesTarget = targetFileSnapshot && pathsEqual(targetFileSnapshot.path, file.path);
+          if (!state.currentFile || matchesTarget) {
             clearCurrentFile();
           }
         } else if (result.error === 'FILE_TOO_LARGE') {
@@ -2604,6 +2767,24 @@ async function openSettingsDialog(options = {}) {
           // toolbar 自动保存按钮自己处理；这里不再重复 apply，settingsStore.change 事件统一同步。
           // 见 [[feedback-prefer-near-affected-area]]。
         },
+        // 实时预览：用户在设置里切配色 / 字号 / 行距，立刻反映到 app 主题。
+        // 走 CSS / dataset，不走 settingsStore（不走就不持久化、不会触发 onChanged），
+        // 取消时由 onPreviewRevert 把视觉回退到打开对话框瞬间。
+        // AI 字段（provider / baseUrl / key / model / systemPrompt）不走预览——
+        // 那是「下次请求要用的参数」，实时预览反而会让人误以为已经发出去。
+        onPreview: (changes) => {
+          if ('themePalette' in changes) {
+            applyPalette(changes.themePalette);
+          }
+          if ('readerFontSize' in changes || 'readerLineHeight' in changes) {
+            applyReaderSettings(changes);
+          }
+        },
+        // 取消时把视觉回滚到基线（基线是 open() 时记录的「打开对话框瞬间」的值）。
+        onPreviewRevert: (baseline) => {
+          applyPalette(baseline.themePalette);
+          applyReaderSettings(baseline);
+        },
       });
       try {
         await dialog.open(options);
@@ -2625,10 +2806,23 @@ async function openSettingsDialog(options = {}) {
 /**
  * 应用阅读字号 / 行距到 CSS 变量（挂在 documentElement，独立于主题）
  * 这样切主题不会重置用户的字号 / 行距
+ *
+ * @param {object} [partial] - 可选的覆盖值。键 readerFontSize / readerLineHeight。
+ *   - 不传 → 两个维度都从 settingsStore 读（设置启动 / 落盘后的常规路径）
+ *   - 部分字段 → 该字段用 partial 里的值；未携带的字段仍然回退到 settingsStore
+ *
+ * 用于设置对话框实时预览：settings-dialog 维护一个累计视觉快照
+ * （palette/fs/lh 三个维度任一切换都更新整体），onPreview 总是传完整快照；
+ * 这种 full-partial 路径也支持只携带一个字段 —— 比如以后想做「单维度 patch 式
+ * 预览」时也接得住。
  */
-function applyReaderSettings() {
-  const fs = settingsStore.get('readerFontSize');
-  const lh = settingsStore.get('readerLineHeight');
+function applyReaderSettings(partial) {
+  const fs = partial && 'readerFontSize' in partial
+    ? partial.readerFontSize
+    : settingsStore.get('readerFontSize');
+  const lh = partial && 'readerLineHeight' in partial
+    ? partial.readerLineHeight
+    : settingsStore.get('readerLineHeight');
   if (typeof fs === 'number' && Number.isFinite(fs)) {
     document.documentElement.style.setProperty('--reader-font-size', `${fs}px`);
   }
@@ -2684,7 +2878,10 @@ function syncBehaviorPrefsUI(settings) {
   }
 
   // 2. 自动保存 chip 文案 + （关 → 取消 pending；开 → 等下次 onChange 重新调度）
-  const ms = Number.isFinite(settings.autoSaveDebounceMs) ? settings.autoSaveDebounceMs : 500;
+  // audit fix：fallback 用 schema 同一份常量而不是硬编码 500，改默认值只改一处。
+  const ms = Number.isFinite(settings.autoSaveDebounceMs)
+    ? settings.autoSaveDebounceMs
+    : window.api.settingsSchema.AUTO_SAVE_DEFAULT_DEBOUNCE_MS;
   if (ms !== lastAutosaveMs) {
     lastAutosaveMs = ms;
     // 用状态点 dot 的 dim/highlight 替代旧「自动保存: 开/关」冗余文案 —— 开启态
@@ -2794,6 +2991,10 @@ function scheduleAutoSave(debounceMs) {
  * 这与 fileList / viewer / editor 的 .dispose() 同款「统一释放入口」模式。
  */
 const ipcUnsubscribes = [];
+// audit fix (Phase 6 H2)：mountKeyboardShortcuts 返回 document keydown 的
+// dispose 闭包，bootstrap 必须 capture 它并交给 pagehide —— 否则重复 bootstrap
+// （未来 settings / dataDir 切换走热重载路径时）会堆 listener。
+let disposeShortcuts = null;
 function subscribeIpc() {
   // 文件列表变化（外部添加 / 删除 / 修改）
   // 用签名缓存去重：内容真正变化才 setFiles + updateFileCount，
@@ -2835,7 +3036,13 @@ function subscribeIpc() {
     // 上一 handler 仍在飞？记下要补扫的 relDir 后直接 return。
     if (inFlightToken !== 0) {
       console.debug('[app] fs:changed burst dropped (handler in flight)');
-      if (payloadRel) pendingRescanRel = payloadRel;
+      // Round 13 fix (H11)：只有新事件与当前显示目录相关时才覆盖 pendingRescanRel。
+      // 旧版无条件 `pendingRescanRel = payloadRel`（以及下方 inFlight 路径的
+      // 同样无条件赋值）会让「在子目录里编辑时收到根目录变化」覆盖掉子目录里
+      // 的 pending —— 用户切回子目录时看不到该刷的列表。
+      if (payloadRel === state.currentRelDir) {
+        pendingRescanRel = payloadRel;
+      }
       return;
     }
     inFlightToken = myToken;
@@ -2870,7 +3077,10 @@ function subscribeIpc() {
       // Stage 8：fs-watcher 只盯「当前显示目录」，payload.relDir 字段标识事件来源；
       // 与 state.currentRelDir 不匹配的事件（理论不会发生 —— 我们已经切了 watchDir，
       // 但 polling 期间用户可能在另一目录触发变化）一律忽略，避免子目录事件把根目录列表刷掉。
-      const payloadRel = typeof relDir === 'string' ? relDir : '';
+      // Round 13 fix (H11)：payloadRel 已在入口处解构（line ~2914），这里复用，
+      // 删除重复 const 声明 —— 旧版在 try 块顶部又声明一次会让 lint 报
+      // 'payloadRel' is already declared in upper scope。
+      // payloadRel === state.currentRelDir 检查覆盖范围不变。
       if (payloadRel !== state.currentRelDir) {
         // audit fix：原版静默 return，未来如果出现「切目录 debounce 错位」类 bug
         // 会让侧栏停在旧视图而用户毫无线索。给一条 console.debug 让 DevTools 能
@@ -2969,29 +3179,14 @@ function subscribeIpc() {
           return;
         }
         if (state.isDirty) {
-          // P1-4：未保存内容不能静默丢失。尝试用 file:create 把当前内容写到
-          // 数据目录里的一个 rescue 文件（`<原名>-rescued-<时间戳>-<随机>.md`）。
-          // 这样用户至少可以在侧栏找到它，手动改名 / 粘贴回去。
-          // audit fix (renderer-M9)：原版用秒级 ISO 时间戳（slice(0,19)），
-          // 同一秒内两次删除会让 rescueName 重名，createFile 走 EEXIST 分支
-          // 让用户「未保存内容丢失」。改用毫秒 + 4 字符随机后缀，碰撞概率
-          // 约 1 / 1.6M（即使 ms 撞上，4 字符 base36 仍有 1.68M 空间）。
-          const originalName = state.currentFile?.name || 'untitled.md';
-          const base = originalName.replace(/\.md$/i, '');
-          const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23); // 含 .mmm
-          const suffix = Math.random().toString(36).slice(2, 6);
-          const rescueName = `${base}-rescued-${stamp}-${suffix}.md`;
-          const content = (typeof editor.getContent === 'function') ? editor.getContent() : '';
-          window.api.createFile(rescueName, content).then((r) => {
-            if (r && r.ok) {
-              showToast(`原文件已被删除，未保存内容已救回到「${rescueName}」`, 'warning', 4500);
-            } else {
-              showToast(`原文件已被删除；未保存内容丢失（救回失败：${window.api.friendlyFsError(r?.code, r?.error)}）`, 'error', 4500);
-            }
-          }).catch((e) => {
-            // IPC 协议层异常（非 createFile 的 result.error）—— 至少留一条 console 便于排查
-            console.error('[app] rescue createFile IPC 异常:', e);
-            showToast('原文件已被删除；未保存内容丢失', 'error', 4500);
+          // P1-4：未保存内容不能静默丢失。命名 / 写盘 / toast / friendlyFsError
+          // 错误码 vs message 的处理全部收口到 src/rescue.js（详见该文件注释 + audit
+          // renderer-M9 的同秒重名问题）。这里只关心「有 content、想救回」。
+          rescueDirtyContent({
+            api: window.api,
+            originalName: state.currentFile?.name,
+            content: (typeof editor.getContent === 'function') ? editor.getContent() : '',
+            event: '原文件已被删除',
           });
         } else {
           showToast('当前文件已被删除', 'warning');
@@ -3028,10 +3223,13 @@ function subscribeIpc() {
       if (updated && state.lastSavedMtimeMs != null && updated.mtimeMs > state.lastSavedMtimeMs) {
         // 抑制「刚保存引发的回声」（P1-2）：按 mtime 比对而非时间窗。
         //   - 干净态：±5ms 容差覆盖 fs stat 抖动（NTFS/ReFS），吞无意义的 echo。
-        //   - 脏态（Phase N-A4）：只 skip 精确等于，>0ms 差异一律走冲突对话框。
+        //   - 脏态（Phase N-A4 → audit 2026-09-21）：从严格 === 放宽到 ±1500ms，
+        //     覆盖 FAT32 / exFAT（2 秒桶）/ HFS+（1 秒）/ SMB（1-2 秒）下
+        //     自身保存的 mtime 截断 —— 否则用户保存后会被误判为「外部修改」弹
+        //     冲突对话框。1500ms 容差几乎不影响真实外部修改检测：
+        //     外部进程改文件的窗口远大于 1.5s，且用户可手动 reload。
         if (state.lastWriteMtimeMs > 0
-            && ((state.isDirty && updated.mtimeMs === state.lastWriteMtimeMs)
-                || (!state.isDirty && Math.abs(updated.mtimeMs - state.lastWriteMtimeMs) < 5))) {
+            && Math.abs(updated.mtimeMs - state.lastWriteMtimeMs) <= 1500) {
           return; // 自身写盘回声
         }
         if (state.isDirty) {
@@ -3345,6 +3543,30 @@ function getSidebarWidth() {
   return Number.isFinite(w) && w > 0 ? w : 220;
 }
 
+/**
+ * AI 修改预览打开时把面板宽度重置为可用区 50%。
+ *
+ * 用户每次打开 AI 修改预览都默认对半分 —— 与编辑窗口的 splitRatio=0.5 同源设计：
+ * 打开就是默认比例，drag 只在本次会话内有效。
+ *
+ * 宽度计算：容器宽度 - 侧栏 - sb-splitter(4) - ai-splitter(4) = 可用区，
+ * AI 面板取其中一半，clamp 到 mountAiSplitter 的合法范围 [220, 720]。
+ *
+ * 与 mountAiSplitter 一致写到 :root（所有模式共用 --w-ai）。
+ */
+function resetAiPanelWidthToHalf() {
+  if (!els.appShell) return;
+  const containerW = els.appShell.getBoundingClientRect().width;
+  if (!containerW) return;
+  const sidebarW = getSidebarWidth();
+  // 4px = sb-splitter, 4px = ai-splitter
+  const fixedCols = sidebarW + 4 + 4;
+  const available = Math.max(1, containerW - fixedCols);
+  const half = Math.round(available * 0.5);
+  const clamped = Math.max(220, Math.min(720, half));
+  document.documentElement.style.setProperty('--w-ai', clamped + 'px');
+}
+
 /** editor + viewer 那段可用像素空间（fr_space）。减掉所有固定列：
  * sidebar + sb-splitter(4) + #splitter(4) + AI panel + ai-splitter(4)。
  * 这正是 split + AI 模式下拖 #splitter 报错的
@@ -3377,7 +3599,6 @@ function mountSplitter() {
   const MIN_VIEWER_WIDTH = 200; // 阅读视图下限
 
   let currentEditorWidth = 0;
-  let currentRatio = clampSplitRatio(settingsStore.get('splitRatio'));
 
   function clampEditorWidth(width) {
     const frSpace = getEditorFrSpace();
@@ -3412,13 +3633,14 @@ function mountSplitter() {
     // audit #1：写盘失败要让用户看到 —— 否则下次启动布局错乱无迹可循。
     onDragEnd: () => {
       const ratio = getCurrentRatio();
-      currentRatio = ratio;
       settingsStore.update({ splitRatio: Number(ratio.toFixed(3)) }).catch((e) => {
         showToast(`布局比例保存失败：${e?.message || '未知错误'}`, 'error', 3500);
       });
     },
     // mount 时按 saved ratio 计算 editor 宽度（与拖动走同一道 clamp 闸）。
-    initialSize: () => getEditorFrSpace() * currentRatio,
+    // 每都从 settingsStore 重读 —— 这样切换到双栏时 onChange 写入的 0.5
+    // 会被 MutationObserver 触发的 rebalance 立即拾取，避免停在旧 ratio。
+    initialSize: () => getEditorFrSpace() * clampSplitRatio(settingsStore.get('splitRatio')),
   });
 
   // AI 面板 / 视图模式切换时 fr_space 也会变（+ AI 360 + ai-splitter 4），
@@ -3757,9 +3979,11 @@ async function bootstrap() {
   }
 
   // 3. 绑定静态事件
-  els.linkOpenFolder.addEventListener('click', () => {
-    openDataFolder();
-  });
+  if (els.linkOpenFolder) {
+    els.linkOpenFolder.addEventListener('click', () => {
+      openDataFolder();
+    });
+  }
   if (els.linkSwitchFolder) {
     els.linkSwitchFolder.addEventListener('click', () => {
       switchDataFolder();
@@ -3841,7 +4065,7 @@ async function bootstrap() {
   mountEditorContextMenu();
 
   // 8. 加载全局快捷键
-  mountKeyboardShortcuts({
+  disposeShortcuts = mountKeyboardShortcuts({
     onFocusSearch: () => els.searchInput?.focus(),
     onClearSearch: () => {
       if (els.searchInput && document.activeElement === els.searchInput) {
@@ -3913,6 +4137,10 @@ async function bootstrap() {
       }
       window.location.reload();
     },
+    // 关闭当前打开的文件：与工具栏 onCloseFile 共用同一个 closeCurrentFile()。
+    // closeCurrentFile() 内部已经处理「未保存改动」三选一对话框 + 同步 dirty；
+    // 无文件时该函数内部直接 return，不会弹空对话框。
+    onCloseFile: () => closeCurrentFile(),
   });
 
   // 注意：原 beforeunload 监听已删除（P2-11）。
@@ -3950,6 +4178,12 @@ async function bootstrap() {
       }
     }
     ipcUnsubscribes.length = 0;
+    // audit fix (Phase 6 H2)：全局快捷键的 document keydown listener —— 与
+    // ipcUnsubscribes 同源对称：mount 时 capture，pagehide 时统一拆。
+    if (typeof disposeShortcuts === 'function') {
+      try { disposeShortcuts(); } catch (e) { console.warn('[app] disposeShortcuts failed:', e); }
+      disposeShortcuts = null;
+    }
     // AI 控制器：chat panel 7 个 listener + AbortController + recomputeTimer
     if (typeof ai !== 'undefined' && ai && typeof ai.destroy === 'function') {
       try { ai.destroy(); } catch (e) { console.warn('[app] ai.destroy failed:', e); }
@@ -3969,6 +4203,10 @@ async function bootstrap() {
     if (typeof scrollFrame !== 'undefined' && scrollFrame) {
       cancelAnimationFrame(scrollFrame);
       scrollFrame = null;
+    }
+    if (typeof editorFocusFrame !== 'undefined' && editorFocusFrame) {
+      cancelAnimationFrame(editorFocusFrame);
+      editorFocusFrame = null;
     }
     if (typeof livePreviewTimer !== 'undefined' && livePreviewTimer) {
       clearTimeout(livePreviewTimer);

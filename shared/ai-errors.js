@@ -37,6 +37,16 @@ const AI_ERROR = Object.freeze({
   IPC_FAILED: 'IPC_FAILED',
   GENERATION_STALE: 'GENERATION_STALE',
   FILE_CHANGED: 'FILE_CHANGED',
+
+  // ---- 输入校验（main 在调用远端前自检）----
+  // Round 13 fix (H3)：原裸字面量 'INVALID_PROMPT' / 'INVALID_CONTENT' /
+  // 'CONTENT_TOO_LARGE' / 'PROMPT_TOO_LARGE' 在 main/ai.js 直接 return，
+  // 绕开共享 AI_ERROR，renderer 端只能走通用 toast。
+  // 集中到这里后 preload 一次性通过 contextBridge 暴露。
+  INVALID_PROMPT: 'AI_INVALID_PROMPT',
+  INVALID_CONTENT: 'AI_INVALID_CONTENT',
+  CONTENT_TOO_LARGE: 'AI_CONTENT_TOO_LARGE',
+  PROMPT_TOO_LARGE: 'AI_PROMPT_TOO_LARGE',
 });
 
 module.exports = { AI_ERROR };

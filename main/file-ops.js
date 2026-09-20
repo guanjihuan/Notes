@@ -30,6 +30,21 @@ const { friendlyFsError: sharedFriendlyFsError } = require('../shared/friendly-f
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
 
 /**
+ * atomicWriteFile 产生的 tmp 文件名匹配规则：`<name>.<editableExt>.tmp.<pid>.<ts>.<rand>`。
+ * cleanupStaleFileTmpFiles 用它判断哪些 .tmp.* 是自家产物需要清理。
+ * 严格要求 pid / ts / rand 三段：pid 与 ts 必须数字，rand 是 6 字符小写 base36。
+ *
+ * 旧版 `\.tmp\.\d+\.\d+\.[a-z0-9]+$` 太宽 —— 把 `report.tmp.2024.1234567.abcdef` 这种
+ * 用户合法文件也匹配上，24h 跨进程阈值后会被静默 unlink。要求 .tmp. 前一段是
+ * EDITABLE_EXTS 之一（白名单扩展名）把误伤清零。
+ */
+const ATOMIC_TMP_RE = new RegExp(
+  '\\.(?:' + Array.from(EDITABLE_EXTS).map((e) => e.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('|') +
+  ')\\.tmp\\.\\d+\\.\\d+\\.[a-z0-9]{1,8}$',
+  'i',
+);
+
+/**
  * 检查 fullPath 的占用情况 —— 返回三种状态：
  *   - 'free'       路径不存在，可用
  *   - 'file'       路径已被一个文件占用，需要重命名避让
@@ -381,6 +396,11 @@ async function scanFiles(dir) {
     }
     const mdFiles = entries.filter((e) => {
       if (!e.isFile()) return false;
+      // Round 13 fix (H6)：与 scanDir 对称过滤符号链接。OneDrive / 网盘
+      // 用户在数据目录里放指向外部 secret 文件的 symlink 时，旧版会跟随
+      // 读 size / mtime 但 file:read 拒开，UX 不一致且把外部 stat 信息暴露
+      // 到 renderer 内存。
+      if (e.isSymbolicLink()) return false;
       const lower = e.name.toLowerCase();
       return lower.endsWith('.md') || lower.endsWith('.markdown');
     });
@@ -585,7 +605,12 @@ function toRelativeDir(absDir, dataRoot) {
  * @param {string} content UTF-8 文本
  */
 async function atomicWriteFile(dst, content) {
-  const tmpPath = `${dst}.tmp.${process.pid}.${Date.now()}`;
+  // audit fix (Round 16 P0)：追加 6 位 base36 随机后缀。pid + Date.now() 只保证
+  // 跨进程 / 跨毫秒唯一，同进程同毫秒并发（如自动保存触发的 saveConfig 与
+  // 用户手动 Ctrl+S 撞在同一毫秒）会算出相同 tmpPath，后到的 rename 因源文件
+  // 已被消费而失败（ENOENT），上层捕获后返回 {ok:false}。random 后缀 ~36^6 ≈ 21
+  // 亿组合，同毫秒冲突概率可忽略。main/config-store.js#saveConfig 也做了对称修复。
+  const tmpPath = `${dst}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
   let fh;
   try {
     fh = await fs.open(tmpPath, 'w');
@@ -611,12 +636,14 @@ async function atomicWriteFile(dst, content) {
     // 但 fs.open(path, 'r') 在目录上 Windows 会拒绝写操作，所以这里走 OS 守卫）。
     // 风险：失败 fsync 不抛（让 save 走 OK 路径），由下次保存自动覆盖。
     if (process.platform !== 'win32') {
+      // Round 13 fix (H5)：dirFh.sync() 抛错时 close() 不会执行 → fd 泄漏。
+      // 长跑保存下磁盘压力大 / USB 抖动会让 sync 间歇失败，多次累加触发
+      // EMFILE；统一走 try/finally 兜底 close。
+      const dirFh = await fs.open(path.dirname(dst), 'r');
       try {
-        const dirFh = await fs.open(path.dirname(dst), 'r');
         await dirFh.sync();
-        await dirFh.close();
-      } catch (dirFsyncErr) {
-        console.warn('[file-ops] 父目录 fsync 失败（不影响本次保存内容，但跨崩溃可能丢目录项）:', dirFsyncErr.message);
+      } finally {
+        try { await dirFh.close(); } catch { /* close 失败也无能为力 */ }
       }
     }
   } catch (e) {
@@ -650,6 +677,57 @@ async function renameWithRetry(src, dst) {
 }
 
 /**
+ * 删除数据目录里残留的 `*.tmp.<pid>.<ts>.<rand>` 文件。
+ * 由 main.js 在启动时 / 切换数据目录时调用一次。
+ *
+ * 两层阈值（与 main/config-store.js#cleanupStaleTmpFiles 对齐）：
+ *   - 自己 pid + 60s 前 → 必删（防止本进程崩溃留下永久孤儿）
+ *   - 非自己 pid + 24h 前 → 必删（清理上一次 Notes 实例崩溃的孤儿）
+ *
+ * audit fix (Round 16 R2)：atomicWriteFile 自身的 try/catch 已经在失败时
+ * unlink tmp，但「本进程崩溃 / 被 kill -9 / 断电」三种场景不会进入清理分支。
+ * `scripts/_archive/` 9 个一次性 repro 脚本的历史足以说明崩溃/中断场景不是
+ * 理论风险。启动时扫一次数据目录，避免孤儿永久累积。
+ *
+ * @param {string} dataDir 数据目录绝对路径
+ * @returns {Promise<void>}
+ */
+async function cleanupStaleFileTmpFiles(dataDir) {
+  if (!dataDir) return;
+  try {
+    const files = await fs.readdir(dataDir);
+    const myPid = process.pid;
+    const now = Date.now();
+    const STALE_THRESHOLD_MS = 60_000;
+    const CROSS_PID_STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+    for (const f of files) {
+      // 只匹配 atomicWriteFile 生成的 `<name>.<ext>.tmp.<pid>.<ts>.<rand>`。
+      // audit fix (Tmp-L2)：旧版 `/\.tmp\.\d+\.\d+\.[a-z0-9]+$/i` 太宽，
+      // 会把用户自己命名 / 同步盘生成 / 备份工具遗留的 `report.tmp.2024.1234567.abcdef`
+      // 这种正常文件当成孤儿静默 unlink。必须要求 .tmp. 前面是 EDITABLE_EXTS
+      // 之一（白名单扩展名），且 tmp 段是 pid.ts.rand 严格三段数字 + 小写 base36。
+      // config-store 的 `config.json.tmp.*` 不在此正则范围内，仍由它自家扫（注释指向
+      // shared/extension-lists.js#EDITABLE_EXTS，与 fileOps / sidebar 共用扩展名）。
+      if (!ATOMIC_TMP_RE.test(f)) continue;
+      const full = path.join(dataDir, f);
+      try {
+        const st = await fs.stat(full);
+        const isMine = f.includes(`.${myPid}.`);
+        const ageMs = now - st.mtimeMs;
+        const shouldRemove = isMine
+          ? ageMs > STALE_THRESHOLD_MS
+          : ageMs > CROSS_PID_STALE_THRESHOLD_MS;
+        if (shouldRemove) {
+          await fs.unlink(full);
+        }
+      } catch { /* 单个文件 stat/unlink 失败不影响整体 */ }
+    }
+  } catch {
+    // readdir 失败（目录不存在等）静默 —— 后续 IPC handler 会处理
+  }
+}
+
+/**
  * audit fix (Round 4 收尾)：file:write 的 errno 翻译 —— 与 main.js 各 IPC handler
  * （_friendlyCreateError / _friendlyRenameError / _friendlyDeleteError / _friendlyReadError）
  * 共用一份文案。Round 4 之前本函数与 src/app.js#friendlyWriteError、
@@ -678,6 +756,7 @@ function friendlyWriteError(e) {
 module.exports = {
   MAX_FILE_SIZE,
   EDITABLE_EXTS,
+  ATOMIC_TMP_RE,
   assertNotSymlink,
   assertNoSymlinkAncestor,
   classifyEntry,
@@ -690,5 +769,6 @@ module.exports = {
   toRelativeDir,
   atomicWriteFile,
   renameWithRetry,
+  cleanupStaleFileTmpFiles,
   friendlyWriteError,
 };

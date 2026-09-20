@@ -74,6 +74,12 @@ export class MarkdownEditor {
       this._composing = false;
       this.editableCompartment = null;
       this.themeCompartment = null;
+      // Round 13 fix (H8)：dispose 时也 abort viewAbort，确保即便 loadFile
+      // 路径漏调（极端情况）contentDOM 上的 IME listener 也能摘掉。
+      if (this._viewAbort) {
+        try { this._viewAbort.abort(); } catch { /* ignore */ }
+        this._viewAbort = null;
+      }
     });
   }
 
@@ -109,6 +115,18 @@ export class MarkdownEditor {
       throw new Error('MarkdownEditor: element required (must be a DOM node)');
     }
     this._destroyView();
+
+    // Round 13 fix (H8)：clearListeners 用新 AbortController 包住本轮 view 的
+    // listener 与 IME handler。下次 loadFile() / dispose() 时清掉旧 listener。
+    // 旧实现每次 loadFile 都给 contentDOM addEventListener，但只 dispose 时
+    // 才走 addAbort 的 remove —— 多次开文件会让 DOM 上累积多份 IME handler，
+    // 极端时序（compositionend 在 view 已 destroy 之后才 fire）会跑多次
+    // onChangeCallback，让 app 翻脏态 + 调度多余的 auto-save。
+    this._viewAbort = new AbortController();
+    // 把 contentDOM 上的 listener 挂到这个 signal，loadFile 重入 / dispose
+    // 都一次性 abort。CM6 自己的 listener 用 contentDOM 默认挂（不在 signal
+    // 上），由 _destroyView / view.destroy 拆解。
+    const contentSignal = this._viewAbort.signal;
 
     this.lastSavedDoc = content || '';
 
@@ -227,15 +245,13 @@ export class MarkdownEditor {
         }
       }
     };
-    this.view.contentDOM.addEventListener('compositionstart', this._onCompositionStart);
-    this.view.contentDOM.addEventListener('compositionend', this._onCompositionEnd);
-    this.view.contentDOM.addEventListener('compositioncancel', this._onCompositionCancel);
-    this.addAbort(() => {
-      if (!this.view || !this.view.contentDOM) return;
-      this.view.contentDOM.removeEventListener('compositionstart', this._onCompositionStart);
-      this.view.contentDOM.removeEventListener('compositionend', this._onCompositionEnd);
-      this.view.contentDOM.removeEventListener('compositioncancel', this._onCompositionCancel);
-    });
+    // Round 13 fix (H8)：用 this._viewAbort.signal 一次性管所有 listener，
+    // 下次 loadFile / dispose 时整体 abort。旧版 addAbort 路径在 dispose 时
+    // 才 removeEventListener，期间多次 loadFile 会让多份 IME handler 累积
+    // 在 contentDOM 上。signal 路径里 removeEventListener 由浏览器自动处理。
+    this.view.contentDOM.addEventListener('compositionstart', this._onCompositionStart, { signal: contentSignal });
+    this.view.contentDOM.addEventListener('compositionend', this._onCompositionEnd, { signal: contentSignal });
+    this.view.contentDOM.addEventListener('compositioncancel', this._onCompositionCancel, { signal: contentSignal });
   }
 
   /**
@@ -430,6 +446,15 @@ export class MarkdownEditor {
   }
 
   _destroyView() {
+    // audit fix (M2)：loadFile 走 _destroyView → 立刻建新 _viewAbort；旧信号若
+    // 不 abort，挂在新 view contentDOM 上的 compositionstart/end/cancel listener
+    // 仍绑着。view.destroy() 只解 CM6 自己的 DOM，**不**摘我们手动 add 的 listener。
+    // detach 后 listener 不会 fire（事件 target 已不在 DOM），但 listener↔signal
+    // 循环推迟旧 view 整棵子树的 GC。
+    if (this._viewAbort) {
+      try { this._viewAbort.abort(); } catch { /* ignore */ }
+      this._viewAbort = null;
+    }
     // audit fix (renderer-M4)：先取消可能挂着的 rAF —— 否则 destroy 后 rAF
     // 回调里读 this.view / this.onScrollCallback 还能命中内存中尚未 GC 的
     // 引用，触发到旧组件实例的回调链。

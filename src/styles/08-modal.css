@@ -376,6 +376,20 @@
   text-decoration: underline;
 }
 
+/* btn-link 之前没有 disabled 样式 ——「恢复默认」等按钮在「已经是默认」时
+   会陷入 disabled 状态却仍是 accent 色，视觉上像可点；降到 fg-tertiary +
+   取消 hover 反馈保持一致。 */
+.btn-link:disabled,
+.btn-link[disabled] {
+  color: var(--fg-tertiary);
+  cursor: not-allowed;
+}
+.btn-link:disabled:hover,
+.btn-link[disabled]:hover {
+  color: var(--fg-tertiary);
+  text-decoration: none;
+}
+
 .form-path-row {
   display: flex;
   gap: var(--space-2);
@@ -414,6 +428,17 @@
   /* 之前还有 margin-bottom: var(--space-2)（8px），但 section 是 flex + gap，
      gap 已经管了 header → form-row 的距离，再叠 8px 让 header 视觉过重。
      与上面的 form-row 修复思路一致：margins and gaps 二选一，避免叠加。 */
+}
+
+/* section header 内的右侧动作按钮（如「恢复默认」）—— margin-left:auto
+   让它贴到 header 右边；同时 align-self:center 让按钮纵向居中于 header
+   的图标 + 标题块，避免按钮顶部紧贴 header 顶端。覆盖 .btn-link 的固定
+   margin-left: var(--space-2)（在 text-flow 里有用，header 里靠 gap 即可）。 */
+.settings-section-action {
+  margin-left: auto;
+  align-self: center;
+  /* 按钮的字体略小一点，与标题形成"标题 / 次要操作"层级 */
+  font-size: var(--fs-xs-readable);
 }
 
 .settings-section-icon {
@@ -521,7 +546,9 @@
   /* 11 → 12：用 --fs-xs-readable 解决"看不清"，仍走 --fg-secondary 保对比度 */
   font-size: var(--fs-xs-readable);
   color: var(--fg-secondary);
-  margin: 1px 0 0 0;
+  /* 1 → 3：与上方 15px 标题之间留出更明显的呼吸；之前 1px 让副标题紧贴标题，
+     视觉上像同一段文字的两行而非"标题 + 描述"的层级关系。 */
+  margin: 3px 0 0 0;
   line-height: 1.4;
 }
 
@@ -677,7 +704,10 @@
 
 .picker-group-value {
   font-size: var(--fs-xs-readable);
-  color: var(--fg-tertiary);
+  /* --fg-tertiary 在部分调色板（如 sunset）对比度接近 3.5，低于 WCAG AA；
+     改用 --fg-secondary 后即使在 sunset 上也稳定 ≥ 4.5。
+     "选中数值"是用户决策依据之一，不该比副标题还暗。 */
+  color: var(--fg-secondary);
   font-variant-numeric: tabular-nums;
   font-family: var(--font-mono);
   font-weight: 500;
@@ -742,12 +772,14 @@
 }
 
 /* 卡片底部 label 容器共享样式 —— 不论 palette / fontsize / lineheight / ai-provider，
-   视觉重量（字号 11px + tabular-nums + mono）在所有 picker 间一致，
-   让用户看到所有 picker 都是同一套"卡片 + 数值标签"语言。 */
+   视觉重量（字号 12px + tabular-nums + mono）在所有 picker 间一致，
+   让用户看到所有 picker 都是同一套"卡片 + 数值标签"语言。
+   --fs-xs-readable (12px) 比 --fs-xs (11px) 在低 DPI 屏幕更可读，
+   picker 卡片是用户主要点击区域，label 字号不低于 hint。 */
 .picker-card-label,
 .fontsize-card-label,
 .lineheight-card-label {
-  font-size: var(--fs-xs);
+  font-size: var(--fs-xs-readable);
   font-family: var(--font-mono);
   color: var(--fg-tertiary);
   font-weight: 500;
@@ -980,7 +1012,9 @@
    让"14/22px 字号"和"1.5/2.0 行距"的差异在多元素上同时可见。
    ============================================================ */
 .md-preview {
-  margin-top: 12px;
+  /* 与上方 form-row 的间距由 .settings-section 的 flex gap (12px) 统一管理；
+     显式 margin-top 会与 gap 叠加成 24px，反而比 picker 卡片之间的间距还宽，
+     让"选完字号 → 看到预览"这一步视觉跳跃过大。 */
   padding: 14px 18px;
   background: var(--bg-viewer);
   border: 1px solid var(--border-subtle);
@@ -989,7 +1023,9 @@
 }
 
 .md-preview-title {
-  font-size: 10px;
+  /* 10px 不在 token 系统内，且在低 DPI 屏容易发糊；改用 --fs-xs (11px)
+     仍在 token 体系内，跟 callout 副标题等小字保持一致的视觉重量。 */
+  font-size: var(--fs-xs);
   font-weight: 600;
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;

@@ -488,12 +488,17 @@ describe('MarkdownViewer resolveRelativeImages 副作用', () => {
       emptyElement: document.querySelector('.empty'),
       statusPath: document.createElement('div'),
       statusMeta: document.createElement('div'),
+      // audit fix (Sec-M2)：新签名需要 getDataDir 才能继续 setAttribute
+      // loading/decoding；这里给一个「包含路径」的等价 dir，让 img.png 视为
+      // 「在数据目录内」跑通副作用断言。原本旧行为「不传 getDataDir 仍解析」
+      // 已删，这里补齐构造以让 loading/decoding 这条副作用断言继续有意义。
+      getDataDir: () => posixPath('/notes'),
     });
   });
 
-  it('图片自动加 loading="lazy" + decoding="async"', () => {
+  it('图片自动加 loading="lazy" + decoding="async"', async () => {
     body.innerHTML = '<img src="img.png" /><img src="img2.png" />';
-    viewer.resolveRelativeImages('/notes/test.md');
+    await viewer.resolveRelativeImages('/notes/test.md');
 
     for (const img of body.querySelectorAll('img')) {
       expect(img.getAttribute('loading')).toBe('lazy');
@@ -501,18 +506,18 @@ describe('MarkdownViewer resolveRelativeImages 副作用', () => {
     }
   });
 
-  it('已有 loading/decoding 不覆盖', () => {
+  it('已有 loading/decoding 不覆盖', async () => {
     body.innerHTML = '<img src="img.png" loading="eager" decoding="sync" />';
-    viewer.resolveRelativeImages('/notes/test.md');
+    await viewer.resolveRelativeImages('/notes/test.md');
 
     const img = body.querySelector('img');
     expect(img.getAttribute('loading')).toBe('eager');
     expect(img.getAttribute('decoding')).toBe('sync');
   });
 
-  it('data: URL 图片不动', () => {
+  it('data: URL 图片不动', async () => {
     body.innerHTML = '<img src="data:image/png;base64,iVBOR..." />';
-    viewer.resolveRelativeImages('/notes/test.md');
+    await viewer.resolveRelativeImages('/notes/test.md');
 
     const img = body.querySelector('img');
     expect(img.getAttribute('src')).toBe('data:image/png;base64,iVBOR...');
@@ -520,9 +525,9 @@ describe('MarkdownViewer resolveRelativeImages 副作用', () => {
     expect(img.getAttribute('loading')).toBeNull();
   });
 
-  it('绝对 file:// / https:// URL 图片不动', () => {
+  it('绝对 file:// / https:// URL 图片不动', async () => {
     body.innerHTML = '<img src="https://cdn.example.com/img.png" />';
-    viewer.resolveRelativeImages('/notes/test.md');
+    await viewer.resolveRelativeImages('/notes/test.md');
 
     const img = body.querySelector('img');
     expect(img.getAttribute('src')).toBe('https://cdn.example.com/img.png');
@@ -583,25 +588,28 @@ describe('MarkdownViewer resolveRelativeImages dataDir 越界拦截 (audit C3)',
     expect(img.getAttribute('src')).toMatch(/img\.png$/);
   });
 
-  it('getDataDir 返回 null（旧版未注入） → 不做边界检查，仅防 ../.. 越界', async () => {
+  it('getDataDir 返回 null（不可用） → fail-closed：src 被剥，data-blocked="external"', async () => {
+    // audit fix (Sec-M2)：旧版「getDataDir 返回 null → 跳过边界检查」是文件
+    // 系统枚举 oracle —— 恶意 md 可以用 `<img src="../victim.png">` 探测数据
+    // 目录外任意可读图片是否存在。新版 fail-closed：dataDir 不可用时一律拒写 src。
     viewer = makeViewer(() => null);
-    // 不传 / 传 null 时 resolveRelativeImages 跳过 isPathInside 校验。
-    // resolvePath 内部仍会拒绝 '../..' 越界（保留旧行为）。
-    body.innerHTML = '<img src="../../outside.png">';
+    body.innerHTML = '<img src="img.png" alt="x">';
     await viewer.resolveRelativeImages(posixPath('/notes/a.md'));
     const img = body.querySelector('img');
-    // resolvePath 返回 null → src 不变
-    expect(img.hasAttribute('src')).toBe(true);
-    expect(img.getAttribute('src')).toBe('../../outside.png');
+    expect(img.hasAttribute('src')).toBe(false);
+    expect(img.getAttribute('data-blocked')).toBe('external');
   });
 
-  it('getDataDir 抛错 → 不阻断（catch 降级，旧行为继续）', async () => {
+  it('getDataDir 抛错 → fail-closed：src 被剥，不阻断后续调用', async () => {
+    // audit fix (Sec-M2)：旧版 catch 里静默吞掉错误并继续，相当于「IPC 故障时
+    // 整个数据目录边界检查被绕过」。新版与 null 同走 fail-closed 路径，保证
+    // 「dataDir 不可用 = 一律拦截」语义统一。catch 仍不阻断后续 DOM 处理，
+    // 但图片一律不下发 src（与 null 一致），这是有意的更安全默认。
     viewer = makeViewer(() => { throw new Error('IPC down'); });
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     body.innerHTML = '<img src="img.png">';
     await viewer.resolveRelativeImages(posixPath('/notes/a.md'));
-    // 不抛错；图片被正常解析
-    expect(body.querySelector('img').getAttribute('src')).toMatch(/^file:/);
+    expect(body.querySelector('img').hasAttribute('src')).toBe(false);
     consoleWarn.mockRestore();
   });
 
@@ -614,7 +622,8 @@ describe('MarkdownViewer resolveRelativeImages dataDir 越界拦截 (audit C3)',
     expect(img.getAttribute('data-blocked')).toBe('external');
   });
 
-  it('未传 getDataDir 选项 → 不做边界检查（旧行为兼容）', async () => {
+  it('未传 getDataDir 选项 → fail-closed：src 被剥', async () => {
+    // audit fix (Sec-M2)：与 null / 抛错同走 fail-closed —— 边界守护不可降级。
     viewer = new MarkdownViewer({
       bodyElement: body,
       emptyElement: document.querySelector('.empty'),
@@ -624,7 +633,8 @@ describe('MarkdownViewer resolveRelativeImages dataDir 越界拦截 (audit C3)',
     });
     body.innerHTML = '<img src="img.png">';
     await viewer.resolveRelativeImages(posixPath('/notes/a.md'));
-    expect(body.querySelector('img').getAttribute('src')).toMatch(/^file:/);
+    expect(body.querySelector('img').hasAttribute('src')).toBe(false);
+    expect(body.querySelector('img').getAttribute('data-blocked')).toBe('external');
   });
 });
 

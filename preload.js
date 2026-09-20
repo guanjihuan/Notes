@@ -86,15 +86,29 @@ const { friendlyFsError: sharedFriendlyFsError } = require('./shared/friendly-fs
 //
 // renderer 端 subscribeIpc 仍然有 pagehide 主清理路径，这里只是 pagehide
 // 顺序漂移时的兜底。
+//
+// audit fix (Phase 2 review cleanupOn)：每个 cleanupOn 调用原本各挂一个
+// beforeunload listener —— onXxx 订阅 5 个就是 5 个 listener。生产路径
+// subscribeIpc 只跑一次不累积，但 dev / HMR 每次 reload 都会再注册 5 个。
+// 改成单一 beforeunload 监听 + 一个 Set 收集所有 unsub，listener 数与
+// on* 数量解耦（HMR / devtools-reload 跑多少次都是 1 个 beforeunload 监听）。
+const beforeUnloadUnsubs = new Set();
+try {
+  window.addEventListener('beforeunload', () => {
+    for (const u of beforeUnloadUnsubs) {
+      try { u(); } catch { /* ignore */ }
+    }
+    beforeUnloadUnsubs.clear();
+  }, { once: true });
+} catch { /* ignore */ }
 function cleanupOn(channel, handler) {
-  const beforeUnload = () => {
+  const unsub = () => {
     try { ipcRenderer.removeListener(channel, handler); } catch { /* ignore */ }
-    try { window.removeEventListener('beforeunload', beforeUnload); } catch { /* ignore */ }
   };
-  try { window.addEventListener('beforeunload', beforeUnload, { once: true }); } catch { /* ignore */ }
+  beforeUnloadUnsubs.add(unsub);
   return () => {
-    try { ipcRenderer.removeListener(channel, handler); } catch { /* ignore */ }
-    try { window.removeEventListener('beforeunload', beforeUnload); } catch { /* ignore */ }
+    beforeUnloadUnsubs.delete(unsub);
+    try { unsub(); } catch { /* ignore */ }
   };
 }
 
@@ -161,6 +175,8 @@ contextBridge.exposeInMainWorld('api', {
   settingsSchema: {
     DEFAULT_SETTINGS: settingsSchema.DEFAULT_SETTINGS,
     SETTINGS_UI_OPTIONS: settingsSchema.SETTINGS_UI_OPTIONS,
+    // 抽常量让 renderer 也能用同一份事实源（bootstrap fallback / UI 默认值）。
+    AUTO_SAVE_DEFAULT_DEBOUNCE_MS: settingsSchema.AUTO_SAVE_DEFAULT_DEBOUNCE_MS,
   },
 
   /**

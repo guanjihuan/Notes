@@ -17,6 +17,9 @@
 //   - 不重复实现 scanDir —— 由 deps.scanDir() 注入（同一份扫描逻辑）
 
 const fsSync = require('fs');
+// audit fix (Round 16 M1)：self-write filter 需要 path.resolve 标准化路径，
+// 把登记 key 和 dirWatcher 上报的 absPath 都归一化到同一形态。
+const path = require('path');
 
 const DIR_POLL_INTERVAL_MS = 2000;
 const EMIT_DEBOUNCE_MS = 300;
@@ -31,6 +34,13 @@ const REATTACH_MAX_MS = 60_000;
 // 屏幕常驻 5 条警告。30s 重发间隔让用户有充裕时间响应，又不至于漏掉
 // 真实新错误（同 error 不同 dir 也算新错误，立即重发）。
 const ERROR_REPEAT_THROTTLE_MS = 30_000;
+// audit fix (Round 16 M1)：self-write filter TTL。file:write / file:create 成功后
+// 会在 expectedWrites 里登记这个文件未来 ~500ms 内的变更属于自己；dirWatcher
+// callback 看到这个 key 就跳过 emit。500ms 比 SMB / OneDrive rename+fsync
+// 最坏值（实测 100~400ms）再大一档，留余量。500ms 之后外部真改的概率已经
+// 上来了，不再抑制 —— 不会漏真信号，只会避免「renderer 把自己的写盘当
+// 外部修改」的幽灵 reload 对话框。
+const SELF_WRITE_TTL_MS = 500;
 
 /**
  * @typedef {Object} FsWatcherDeps
@@ -84,10 +94,89 @@ function createFsWatcher(deps) {
   // lastFilesSnapshot → 后完成的可能是先发起的（旧快照覆盖新基线）。
   // pollInFlight 守卫：上一轮未返回时直接跳过本次。
   let pollInFlight = false;
+  // audit fix (Round 16 M1)：self-write filter。file:write / file:create 成功后
+  // 通过 markExpectedWrite(absPath, mtimeMs) 登记；dirWatcher callback 看到这个
+  // key 命中 + 未过期 → 跳过 scheduleEmit，避免「renderer 把自己的写盘当外部
+  // 修改」（慢盘上 atomicWriteFile 的 fs.watch 事件晚于 IPC 响应 → race）。
+  // 结构：{ mtimeMs, expiresAt }；命中检查只看路径不看 mtime —— 同一文件 500ms
+  // 内自己再写一次也会命中（更新条目即可）；漏报概率 1/1.6M（同毫秒 + 同路径
+  // + 非自己写）基本为零。
+  const expectedWrites = new Map();
 
   function isWindowVisible() {
     const win = getMainWindow();
     return !!win && !win.isDestroyed() && win.isVisible() && !win.isMinimized();
+  }
+
+  /**
+   * audit fix (Round 16 M1)：登记一次「自己刚写」的路径，500ms 内 dirWatcher
+   * 看到这个 key 就跳过 scheduleEmit。file:write / file:create 成功后调用。
+   *
+   * 路径大小写处理：Windows fs.watch 上报的文件名大小写与写入路径可能不同
+   * （取决于底层 ReadDirectoryChangesW 是否 normalize）。统一走 path.resolve
+   * 把 caller 路径标准化，dirWatcher 解析后的 absPath 也走同一份 resolve +
+   * 同平台大小写策略比对，避免「登记 C:\...\Foo.md、fs.watch 上报 c:\...\foo.md」
+   * 不命中。
+   *
+   * @param {string} absPath - 文件绝对路径
+   * @param {number} mtimeMs - 写入后磁盘 mtime（ms），仅用于日志 / 调试
+   */
+  function markExpectedWrite(absPath, mtimeMs) {
+    if (typeof absPath !== 'string' || !absPath) return;
+    // audit fix (Case-M1)：用 pathKey(case-fold) 当 map key，跨 case 命中。
+    expectedWrites.set(pathKey(absPath), {
+      mtimeMs: Number.isFinite(mtimeMs) ? mtimeMs : 0,
+      expiresAt: Date.now() + SELF_WRITE_TTL_MS,
+    });
+  }
+
+  /**
+   * 判断一个 absPath 是否在「self-write」窗口内。dirWatcher callback 用。
+   * 命中时调用方应跳过 scheduleEmit（避免 renderer 误把自写当成外部修改）。
+   * 顺带做一次惰性 GC —— 路过时把已过期的条目清掉，保持 Map 大小有界。
+   *
+   * @param {string} absPath
+   * @returns {boolean}
+   */
+  function isSelfWrite(absPath) {
+    if (!absPath || expectedWrites.size === 0) return false;
+    let key;
+    try { key = pathKey(absPath); }
+    catch { return false; }
+    const entry = expectedWrites.get(key);
+    if (!entry) return false;
+    const now = Date.now();
+    if (now >= entry.expiresAt) {
+      expectedWrites.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * audit fix (Case-M1)：Windows / macOS 路径大小写不敏感（NTFS / APFS 默认），
+   * fs.watch 上报的 absPath 与 caller 路径 case 不一致是常态。`path.resolve` 只
+   * 做符号链接折叠 + 绝对化，**不**做大小写折叠。`Map.get(resolved)` 严格匹配
+   * 会让 self-write filter 在 case-mismatch 时漏命中 → renderer 把自己的写盘当
+   * 「外部修改」误报，用户选「用磁盘版」会覆盖刚保存的内容。
+   *
+   * 修：用 platform-aware 的 key —— Windows / darwin 统一 toLowerCase()，
+   * Linux（ext4 等默认大小写敏感）保持严格。这样 caller + watcher 路径走同一份
+   * 归一化，跨 case 命中。
+   *
+   * @param {string} p
+   * @returns {string}
+   */
+  function pathKey(p) {
+    const resolved = path.resolve(p);
+    return (process.platform === 'win32' || process.platform === 'darwin')
+      ? resolved.toLowerCase()
+      : resolved;
+  }
+
+  /** 清空 self-write 窗口（stopWatchingDir / 切目录时调一次）。 */
+  function clearExpectedWrites() {
+    expectedWrites.clear();
   }
 
   /**
@@ -194,7 +283,10 @@ function createFsWatcher(deps) {
           safeSend({
             error: result.error,
             code: result.code,
-            dir,
+            // Round 13 fix (M12)：移除绝对路径字段。renderer 不消费它，
+            // 但 IPC 通道透传任意大字段增加无谓的序列化成本 + 通过
+            // DevTools / 抓包能拿到数据目录绝对路径（含用户名 / OneDrive
+            // 用户名等）。renderer 用 relDir 就能唯一定位。
             relDir,
           });
         }
@@ -204,13 +296,18 @@ function createFsWatcher(deps) {
     // 恢复 ok → 清错误闩锁
     clearErrorLatch();
     const list = result.entries || [];
-    const snapshot = entriesSnapshot(list);
-    if (snapshot !== lastFilesSnapshot) {
-      lastFilesSnapshot = snapshot;
-      if (!skipInitialEmit) {
-        emitFilesChanged(list, dir);
-      }
-    }
+    // baseline 写入 + push 决策一起交给 emitFilesChanged，由 skipInitialEmit 控制。
+    //
+    // 历史 bug（Round 13 fix fce2d83 引发的回归）：
+    // 旧实现这里先写 baseline、再调 emitFilesChanged(list, dir)。emitFilesChanged
+    // 内部的 snapshot 比对看到 baseline 已相同、if 块不进、safeSend 跳过 —— 2s
+    // 轮询（OneDrive / SMB 等 fs.watch 不可靠环境的唯一兜底）检测到的文件变化
+    // 永远不通知 renderer，侧栏永久 stale。fs.watch 路径仍能通过 scheduleEmit
+    // 兜底，但在纯靠轮询的环境侧栏刷新完全失效。
+    // 修：让 emitFilesChanged 拥有 baseline + 推送决策，参数透传 skipInitialEmit。
+    // skipInitialEmit=true（启动时） → emitFilesChanged 写基线但不 push；
+    // skipInitialEmit=false（轮询）   → 写基线 + push 到 renderer。
+    emitFilesChanged(list, dir, { skipInitialEmit });
   }
 
   /**
@@ -231,8 +328,9 @@ function createFsWatcher(deps) {
    * `relDir`（POSIX 相对路径），与 file:scan-dir handler 的返回形状对齐，
    * 方便 renderer 兜底逻辑无需依赖 IPC 调用上下文。
    */
-  async function emitFilesChanged(precomputed, dir) {
+  async function emitFilesChanged(precomputed, dir, opts = {}) {
     const targetDir = dir || watchedDir || resolveDataDir();
+    const skipInitialEmit = opts && opts.skipInitialEmit === true;
     // audit fix (shared-M9)：同样的 generation 防护。emitFilesChanged 自带
     // scanDir 分支时同样有「scan 期间用户切目录 → 旧结果覆盖新基线」的竞态。
     const myGen = dirGeneration;
@@ -261,19 +359,45 @@ function createFsWatcher(deps) {
           safeSend({
             error: result.error,
             code: result.code,
-            dir: targetDir,
+            // Round 13 fix (M12)：移除绝对路径字段。renderer 不消费它，
+            // 但 IPC 通道透传任意大字段增加无谓的序列化成本 + 通过
+            // DevTools / 抓包能拿到数据目录绝对路径（含用户名 / OneDrive
+            // 用户名等）。renderer 用 relDir 就能唯一定位。
             relDir,
           });
         }
         return;
       }
       list = result.entries || [];
-      // 同步基线，避免轮询把这次改动再报一遍
-      lastFilesSnapshot = entriesSnapshot(list);
     }
+    // Round 13 fix (M13)：snapshot 写入必须在 generation 检查通过之后。
+    // 旧代码把 `lastFilesSnapshot = entriesSnapshot(list)` 写在 gen 检查
+    // 之前的 try 块里 —— 竞态场景：
+    //   t=0 watcher A 开始 scanDir(dir1) → 拿 myGen=1
+    //   t=1 用户切目录 → dirGeneration 推进到 2，watcher B 开始 scanDir(dir2)
+    //   t=2 watcher A 的 scanDir 完成 → 写 lastFilesSnapshot = A 的列表
+    //   t=3 watcher A 检查 gen → 不等 → 直接 return（不写 payload）
+    //   t=4 watcher B 的 scanDir 完成 → 比较 lastFilesSnapshot（已是 A 的列表，
+    //         跟 B 的列表很可能不一样）→ 推送 B 的列表 ✓
+    //   t=5 但是 lastFilesSnapshot 没被 B 写（push 路径没写基线）→ 下次 2s
+    //         轮询拿 B 的列表 → entriesSnapshot !== lastFilesSnapshot（A 的）→
+    //         又发一次 payload。
+    // 现在把 snapshot 写入移到 gen 检查通过后、push 前，让旧 watcher 直接
+    // return 时不留脏基线。
     if (myGen !== dirGeneration) return;
-    // 成功路径同样补 dir 字段（FS-F11）。
-    safeSend({ entries: list, dir: targetDir, relDir: relOf(targetDir) });
+    if (list) {
+      const snapshot = entriesSnapshot(list);
+      // skipInitialEmit 用于启动时（updateSnapshot(dir, true)）—— 静默同步基线
+      // 不向 renderer 推送，避免「刚加载就 emitFilesChanged 又被 renderer 当
+      // fs:changed 事件 → 触发 scanDir 重复请求」循环。
+      if (snapshot !== lastFilesSnapshot) {
+        lastFilesSnapshot = snapshot;
+        if (!skipInitialEmit) {
+          // 成功路径同样补 relDir 字段（FS-F11）；移除绝对 dir 字段（M12）。
+          safeSend({ entries: list, relDir: relOf(targetDir) });
+        }
+      }
+    }
   }
 
   function scheduleEmit() {
@@ -394,6 +518,25 @@ function createFsWatcher(deps) {
           scheduleEmit();
           return;
         }
+        // audit fix (Round 16 M1)：self-write filter —— file:write / file:create
+        // 自己刚写过的文件 500ms 内变更视为 self-write，不 emit 给 renderer。
+        // 慢盘（SMB / OneDrive）下 atomicWriteFile 触发 fs.watch 事件的时刻
+        // 可能早于 IPC 'file:write' 的 ok 响应回到 renderer，renderer 还没
+        // 更新 state.lastWriteMtimeMs 就收到 files:changed → 误判外部修改 →
+        // 弹「文件在外部被修改」对话框。dirWatcher 这层拦掉。
+        // 注意 Windows 上 filename 可能是绝对路径（含 watchedDir 前缀），
+        // Linux 是相对路径；统一 path.resolve(watchedDir, filename) 兜底。
+        if (watchedDir) {
+          let absPath;
+          try {
+            absPath = path.isAbsolute(filename) ? filename : path.join(watchedDir, filename);
+          } catch {
+            absPath = null;
+          }
+          if (absPath && isSelfWrite(absPath)) {
+            return;
+          }
+        }
         // Windows 上可能触发多次事件，加 300ms 防抖合并
         scheduleEmit();
       });
@@ -471,6 +614,9 @@ function createFsWatcher(deps) {
       try { dirWatcher.close(); } catch {}
       dirWatcher = null;
     }
+    // audit fix (Round 16 M1)：切目录 / 停监听时清掉 self-write 窗口 —— 旧
+    // 目录的 500ms 窗口不应泄漏到新目录（极小概率，但语义更干净）。
+    clearExpectedWrites();
     stopDirPoll();
     // audit fix (Round 7 FS-F5)：停止监听也重置退避计数，避免下次启动
     // 接着用上一会话的指数退避值。
@@ -487,6 +633,23 @@ function createFsWatcher(deps) {
     pauseDirPolling,
     resumeDirPolling,
     stopWatchingDir,
+    // audit fix (Round 16 M1)：file:write / file:create 成功后调用，
+    // 告诉 fsWatcher 「这个文件接下来 500ms 内的 fs.watch 事件是我自己的，
+    // 别当外部修改推给 renderer」。
+    markExpectedWrite,
+    // 内部供 dirWatcher callback 调用以判断是否需要跳过 scheduleEmit；
+    // 也暴露给单测（tests/unit/fs-watcher.test.js）作为回归锚点，
+    // 避免后续重构把 case-M1 修复回退掉。生产路径只在内部用。
+    isSelfWrite,
+    /** 切目录 / stop 监听时清空 self-write 窗口 —— 测试也通过它做硬复位 */
+    clearExpectedWrites,
+    /**
+     * 测试钩子：暴露 updateSnapshot 用于单测绕过 fs.watch / 轮询触发 polling
+     * 路径，验证 push 决策（Round 13 fix fce2d83 修复的回归测试用）。
+     * 生产路径只通过 startWatchingDir / resumeDirPolling / 2s 轮询定时器调用，
+     * 故意没暴露给 renderer 直接调用 —— 上层不应该知道这个内部步骤。
+     */
+    _test_updateSnapshot: updateSnapshot,
     /** 测试 / 调试用：当前是否在监听某个目录 */
     get watchedDir() { return watchedDir; },
   };

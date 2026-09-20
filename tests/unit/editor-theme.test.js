@@ -125,4 +125,28 @@ describe('editorThemeSpec background overrides (oneDark / base theme 互斥)', (
     expect(v).toMatch(/var\(--fg-primary\)/);
     expect(v).toMatch(/!important/);
   });
+
+  // base theme 给 .cm-line 设了 `padding: 0 2px 0 6px`，左侧 6px 内边距会
+  // 形成「行首死区」——鼠标点击这一段 6px 区域时光标无法可靠地放到该行最前面。
+  // 我们的覆盖必须是左内边距 0 + !important（与 base theme 同特异性 (0,1,0)，
+  // 源序胜负不可靠，!important 兜底）。
+  it('.cm-line padding 必须覆盖 base theme 的左内边距 6px → 0（带 !important）', () => {
+    const v = __editorThemeSpecForTests.linePadding;
+    // 期望值形如 "0 2px 0 0 !important"，左 0、右 2px、上 0、下 0
+    expect(v).toMatch(/^0\s+2px\s+0\s+0/);
+    expect(v).toMatch(/!important/);
+  });
+
+  // basicSetup 的 foldGutter() 渲染的 chevron 列默认宽度 ~16px，会从
+  // .cm-gutters 容器（CSS width 钉死 32px）溢出 ~10px，盖在 cm-line 的开头
+  // 字符上，导致点击「行首最前面」时 hit target 是 gutter SPAN 而非 cm-line
+  // —— CM6 监听挂在 view.contentDOM 上，gutter 不在 contentDOM 子树内，
+  // mousedown 不会冒泡过去，光标位置不变。
+  // 我们用 display:none + !important 隐藏 chevron 渲染部分。foldGutter()
+  // 的 keymap（Ctrl+Shift+[ / ]）仍然有效，只是视觉上看不到 chevron。
+  it('.cm-foldGutter 必须 display:none（带 !important）— 隐藏溢出 chevron', () => {
+    const v = __editorThemeSpecForTests.foldGutterDisplay;
+    expect(v).toMatch(/^none/);
+    expect(v).toMatch(/!important/);
+  });
 });

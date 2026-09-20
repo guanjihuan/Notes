@@ -1,2 +1,37 @@
+# 依赖
 node_modules/
+
+# 打包产物
 dist/
+
+# 调试 / 工具产物
+_dbg-*.png
+.playwright-mcp/
+*.log
+tmp-*.mjs
+_test-*.mjs
+scripts/launch-debug.js
+
+# 会话临时截图（手工布局调试用，看一眼即丢；不进版本库）
+# 命名约定：check-*.png / overview*.png / opt-*.png / test-*.png
+check-*.png
+overview*.png
+opt-*.png
+test-*.png
+
+# 一次性手工 debug 页（CodeMirror 行为 / 视觉孤立测试）
+# 之前 test-cursor.html 被误提交，又被误删；模式化命中避免复发。
+test-*.html
+
+# 截图 / 视觉回归
+screenshots/
+screenshot-*.png
+
+# 手工视觉验证的临时产物（布局调试截图 + 独立复现页）
+# 这些是「看一眼就丢」的调试产物，不是回归基线，不进版本库。
+tests/manual/
+
+# 一次性 repro / debug 脚本存档（与 tmp-*.mjs 同性质）。
+# 历史一次性脚本，未被 package.json / lint / check 引用 —— 不进版本库
+# 即可，但留在磁盘方便日后查同一类问题的修复路径。
+scripts/_archive/

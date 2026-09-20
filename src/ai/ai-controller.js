@@ -189,16 +189,25 @@ export function createAiController({
    * 点「应用」，会把 A 的 diff region 算进 B 的内容里（可能命中 / 可能不命中 →
    * 即使命中也是把 A 的修改写到 B，数据丢失）。
    * 现在所有 setPendingDiff 都带上 myFile，apply 前再核对一次。
-   * @returns {{ ok: true } | { ok: false, reason: string }}
+   *
+   * audit fix：返回字段从 `reason` 改名为 `message`。原因：app.js save flow
+   * 里 `reason` 是「state code」（STALE / NO_CHANGES / DELEGATED 等用于
+   * decideSaveToast 分支的短串），而这里 `reason` 实际存的是人类可读
+   * 字符串 —— 同名不同语义，调用方读 `check.reason` 还得猜它是 code 还是
+   * message。改成 `message` 后与 main IPC 错误形状 `{ok:false, error, message}`
+   * 对齐，调用方一眼就知道是直接给 toast 的文本（这里 `error` 不存在 —— AI
+   * 流这几个 state 没有跨进程错误码概念，只有给用户看的中文）。
+   *
+   * @returns {{ ok: true } | { ok: false, message: string }}
    */
   function ensurePendingDiffMatchesCurrentFile() {
-    if (!pendingDiff) return { ok: false, reason: '没有待应用的 AI 修改' };
+    if (!pendingDiff) return { ok: false, message: '没有待应用的 AI 修改' };
     const expected = pendingDiff.forFilePath;
     const current = state.currentFile && state.currentFile.path;
     if (expected == null || current == null || expected !== current) {
       return {
         ok: false,
-        reason: '当前文件已切换，原 AI 修改已失效（请重新提交）',
+        message: '当前文件已切换，原 AI 修改已失效（请重新提交）',
       };
     }
     return { ok: true };
@@ -226,6 +235,28 @@ export function createAiController({
   let diffPanel = null;
 
   function bindMountPoint(chatElement, diffElement, splitterElement = null) {
+    // Round 13 fix (H9)：bind 重入前先让 in-flight 状态整体失效 —— 旧实现
+    // 只 destroy 旧 panel，没 ++requestGeneration / 清 currentRequestId /
+    // 清 pendingDiff，老 handleSubmit await 后还会写「新 panel」的
+    // pendingDiff（闭包捕获 panel 变量引用）。现在递增 generation 让旧
+    // in-flight 自然走 stale 分支丢弃；同时清掉 pendingDiff 避免新 panel
+    // 一上来就显示老 diff。
+    requestGeneration++;
+    if (currentRequestId && chatPanel && typeof chatPanel.cancelRequest === 'function') {
+      try { chatPanel.cancelRequest(currentRequestId); } catch { /* ignore */ }
+    }
+    currentRequestId = null;
+    pendingDiff = null;
+    // audit fix (2026-09-21)：重置 diffOpenState 让 syncBodyFlag 在新面板上能正确
+    // 触发 onDiffOpenChange(true)。之前只调 onDiffOpenChange(false) 通知外部，
+    // 但闭包变量 diffOpenState 没复位 —— 后续 setPendingDiff(non-null) → syncBodyFlag
+    // 比较 `has !== diffOpenState`，若上次是 true → 永远 true，下一次打开面板不再回调。
+    // 生产路径只 bind 一次不触发；HMR / 未来 runtime remount 才会暴露。
+    diffOpenState = false;
+    if (typeof onDiffOpenChange === 'function') {
+      try { onDiffOpenChange(false); } catch { /* ignore */ }
+    }
+
     // 3rd-agent fix：重复 bind 要先销毁旧实例，否则旧 listener 残留、
     // 旧 _submitting 状态无法被新 controller 感知。
     if (chatPanel && typeof chatPanel.destroy === 'function') {
@@ -426,7 +457,7 @@ export function createAiController({
     // 那 pendingDiff 仍存在但属于 A。下面这层 forFilePath 校验兜底。
     const check = ensurePendingDiffMatchesCurrentFile();
     if (!check.ok) {
-      if (typeof toast === 'function') toast(check.reason, 'error', 3000);
+      if (typeof toast === 'function') toast(check.message, 'error', 3000);
       setPendingDiff(null);
       return;
     }
@@ -559,7 +590,7 @@ export function createAiController({
     // audit H163：与 handleApplyRegion 同款校验，挡住「跨文件覆盖」数据丢失。
     const check = ensurePendingDiffMatchesCurrentFile();
     if (!check.ok) {
-      if (typeof toast === 'function') toast(check.reason, 'error', 3000);
+      if (typeof toast === 'function') toast(check.message, 'error', 3000);
       setPendingDiff(null);
       return;
     }
@@ -649,7 +680,7 @@ export function createAiController({
     // 与 handleApply* 一致：先确认 pendingDiff 还属于当前文件
     const guard = ensurePendingDiffMatchesCurrentFile();
     if (!guard.ok) {
-      if (typeof toast === 'function') toast(guard.reason, 'warning', 2500);
+      if (typeof toast === 'function') toast(guard.message, 'warning', 2500);
       setPendingDiff(null);
       return;
     }
@@ -822,9 +853,15 @@ export function createAiController({
 
   /**
    * 编辑器内容变化时：重算 diff（让用户看到"已应用部分还剩多少"）
-   * P1-3 fix (audit)：100ms 防抖 —— 连续 keystroke 只跑一次 DP
+   * P1-3 fix (audit)：防抖 —— 连续 keystroke 只跑一次 DP
    * （pickDiffOptions 把 tokenDiff 限制在 ≤80k / ≤120k 行乘积，但每个
    * keystroke 仍触发同步 DP 会卡顿）。
+   *
+   * 优化 (Round 14)：100ms → 300ms —— 用户连续打字时
+   * "每个 keystroke 都触发 DP + 全量 innerHTML 重渲染" 是可见卡顿。
+   * 300ms 让用户停手后才跑，体感上不卡；setDiff 内部已经把重渲染延后到
+   * 下一帧（详见 ai-diff-panel.js#scheduleRender），这里只需保证
+   * 「最后一次按键 → 一次重算 + 重渲染」即可。
    */
   function onContentChanged() {
     if (!pendingDiff) return;
@@ -832,7 +869,7 @@ export function createAiController({
     recomputeTimer = setTimeout(() => {
       recomputeTimer = null;
       recomputeDiffFromBase();
-    }, 100);
+    }, 300);
   }
 
   /**

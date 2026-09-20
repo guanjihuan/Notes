@@ -73,23 +73,29 @@ describe('decideSaveToast —— STALE 反馈（核心 bug #1 修复 + Phase 2 P
     expect(showToast).toHaveBeenCalledWith('文件已切换，未保存到磁盘', 'warning', 2500);
   });
 
-  it('silent=false + reason=STALE + ok=true → 同样弹「文件已切换」', () => {
-    // Phase 2 audit 修复 (P1 #3)：writeFile 在 STALE 检查前已 resolve，
-    // ok=true 表示 data 已落盘，但 editor 已不在 targetPath 上。用户视角
-    // 仍然需要「文件已切换」反馈（编辑器和预期的不一致）。
+  it('silent=false + reason=STALE + ok=true → 弹「已保存」(success，data 已落盘)', () => {
+    // Round 13 fix (M20)：writeFile 在 STALE 检查前已 resolve → data 已落
+    // targetPath，ok=true 表示写盘成功。此时用户已切走，editor 与 targetPath
+    // 解耦，但磁盘上数据是对的 —— 弹「已保存」(success) 比「文件已切换」更
+    // 准确反映「数据有没有存」。失败分支（ok=false）才弹「文件已切换」。
     const showToast = makeShowToast();
     decideSaveToast(false, { ok: true, reason: 'STALE' }, showToast);
     expect(showToast).toHaveBeenCalledTimes(1);
-    expect(showToast).toHaveBeenCalledWith('文件已切换，未保存到磁盘', 'warning', 2500);
+    expect(showToast).toHaveBeenCalledWith('已保存', 'success', 2500);
   });
 
-  it('STALE 优先于 ok=true：reason=STALE 时一律走 warning', () => {
-    // 防呆测试：即使 ok=true，reason=STALE 必须弹 warning 而不是 success。
-    // 否则 Phase 2 修复会把「data 已落盘」的 success 文案误导成「保存好了」。
-    const showToast = makeShowToast();
-    decideSaveToast(false, { ok: true, reason: 'STALE' }, showToast);
-    expect(showToast).toHaveBeenCalledWith('文件已切换，未保存到磁盘', 'warning', 2500);
-    expect(showToast).not.toHaveBeenCalledWith('已保存', 'success', 2500);
+  it('STALE + ok=true 走 success；ok=false 走 warning（防呆双向断言）', () => {
+    // 防呆：必须严格按 ok 分流 —— ok=true 弹 success，ok=false 弹 warning。
+    // 不能「STALE 一律走 warning」（会把「data 已落盘」误导成「没存」），
+    // 也不能「STALE 一律走 success」（写盘失败却被告知「已保存」）。
+    const okToast = makeShowToast();
+    decideSaveToast(false, { ok: true, reason: 'STALE' }, okToast);
+    expect(okToast).toHaveBeenCalledWith('已保存', 'success', 2500);
+    expect(okToast).not.toHaveBeenCalledWith('文件已切换，未保存到磁盘', 'warning', 2500);
+    const failToast = makeShowToast();
+    decideSaveToast(false, { ok: false, reason: 'STALE' }, failToast);
+    expect(failToast).toHaveBeenCalledWith('文件已切换，未保存到磁盘', 'warning', 2500);
+    expect(failToast).not.toHaveBeenCalledWith('已保存', 'success', 2500);
   });
 
   it('silent=false + 其它失败 reason（CONFLICT_*/WRITE_FAILED/IPC_ERROR/...）→ 不弹', () => {
@@ -132,12 +138,13 @@ describe('decideSaveToast —— shared path 场景（核心 bug #2 修复）', 
     expect(showToast).toHaveBeenCalledWith('文件已切换，未保存到磁盘', 'warning', 2500);
   });
 
-  it('auto-save silent=true 飞行期 + manual silent=false STALE+ok=true → 弹「文件已切换」', () => {
-    // Phase 2 P1 #3：writeFile 成功但用户已切走 → 关窗路径用 ok=true 退出，
-    // 但 silent=false manual caller 仍应弹 STALE 反馈。
+  it('auto-save silent=true 飞行期 + manual silent=false STALE+ok=true → 弹「已保存」', () => {
+    // Round 13 fix (M20)：writeFile 成功但用户已切走 → 关窗路径用 ok=true
+    // 退出，silent=false manual caller 看到「数据已落盘」弹 success 而非
+    // 「文件已切换」—— 后者会误导（明明已存却说没存）。
     const showToast = makeShowToast();
     decideSaveToast(false, { ok: true, reason: 'STALE' }, showToast);
-    expect(showToast).toHaveBeenCalledWith('文件已切换，未保存到磁盘', 'warning', 2500);
+    expect(showToast).toHaveBeenCalledWith('已保存', 'success', 2500);
   });
 
   it('同 IIFE 结果：auto-save silent=true 不弹 + manual silent=false 弹 → 不互相干扰', () => {

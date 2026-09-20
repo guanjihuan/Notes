@@ -140,31 +140,6 @@ export function escapeAttr(s) {
 }
 
 /**
- * 当前是否在 Windows 上 —— 用于大小写不敏感比较。
- *
- * 优先用 navigator.userAgentData（Chromium 90+ 官方接口，未来主流）；
- * 退回 navigator.platform（已废弃但 Electron 仍可用）；
- * 再退回 UA 字符串嗅探。
- *
- * 注意：本函数跑在 renderer 里，process 不存在 —— 不能写 process.platform。
- *
- * @returns {boolean}
- */
-function isWindows() {
-  if (typeof navigator === 'undefined') return false;
-  // Chromium 90+: userAgentData.platform 形如 'Windows' / 'macOS' / 'Linux'
-  if (navigator.userAgentData && typeof navigator.userAgentData.platform === 'string') {
-    return navigator.userAgentData.platform.toLowerCase().includes('win');
-  }
-  // navigator.platform 已被 W3C 标记废弃，但 Chromium 内核仍支持；Electron 渲染端可用
-  if (typeof navigator.platform === 'string' && navigator.platform) {
-    if (/^win/i.test(navigator.platform)) return true;
-  }
-  // 兜底：UA 字符串嗅探
-  return /Windows NT/i.test(navigator.userAgent || '');
-}
-
-/**
  * 检查 child 路径是否在 parent 目录之内（防御性边界检查）。
  * 不依赖文件系统（不解析 symlink），只做字符串前缀比对。
  * Windows 下忽略大小写。
@@ -185,7 +160,10 @@ export function isPathInside(child, parent) {
   let a = norm(parent);
   let b = norm(child);
   if (!b) return false; // 空 child 路径不视为合法
-  if (isWindows()) {
+  // 与 pathsEqual 策略对齐 —— Windows + macOS（APFS 默认）都按大小写不敏感，
+  // Linux 严格相等。否则主进程 isWithinDataDir（main.js 的同名守卫）和 renderer
+  // 侧边界检查在 macOS 上会出现一过 allow 一过 reject 的不一致。
+  if (isCaseInsensitiveFs()) {
     a = a.toLowerCase();
     b = b.toLowerCase();
   }
@@ -201,13 +179,19 @@ export function isPathInside(child, parent) {
 /**
  * 平台相关的路径相等比较。
  *
- * Windows 路径大小写不敏感（NTFS 默认），但 macOS / Linux 大小写敏感。
- * 同样两条路径在 Windows 上要求 .toLowerCase() 相等；其他平台要求严格相等。
+ * Windows（NTFS）/ macOS（APFS 默认 case-insensitive）路径大小写不敏感，
+ * 但 Linux（ext4 等默认大小写敏感）严格相等。
+ * 同样两条路径在前两类平台要求 .toLowerCase() 相等；Linux 上要求严格相等。
  *
  * 用法：sidebar / file-list 把当前打开文件（state.currentFile.path，可能是
  * 用户输入的 case）与磁盘条目（fs 返回的真实 case）做匹配时，
- * `state.currentFile.path === entry.path` 在 Windows 上经常 false，
+ * `state.currentFile.path === entry.path` 在 Windows / macOS 上经常 false，
  * 导致高亮 / 选中态错位。统一走 pathsEqual 兜住。
+ *
+ * 与主进程 main/fs-watcher.js 的 pathKey 策略保持一致 —— 双方都用
+ * 「Windows / darwin 折叠，Linux 严格」。否则 main 侧 Map key 命中而 renderer
+ * 侧路径比较 false，会出现「主进程 self-write filter 命中了，但 renderer
+ * 还是把同一文件当成两份」的幽灵 bug。
  *
  * @param {string|null|undefined} a
  * @param {string|null|undefined} b
@@ -216,7 +200,35 @@ export function isPathInside(child, parent) {
 export function pathsEqual(a, b) {
   if (a === b) return true;
   if (!a || !b) return false;
-  return isWindows() ? a.toLowerCase() === b.toLowerCase() : a === b;
+  return isCaseInsensitiveFs() ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/**
+ * 当前文件系统是否大小写不敏感（Windows NTFS / macOS APFS 默认）。
+ *
+ * 与 isWindows 不同 —— Linux 上 ext4 / xfs 大小写敏感，但 macOS APFS（默认）
+ * 是大小写不敏感的。APFS 也支持 case-sensitive 卷，但作为桌面 Electron 应用
+ * 的最常见部署形态我们按默认 case-insensitive 处理，行为与 macOS Finder、
+ * Terminal、`open` 命令一致。
+ *
+ * 注意：本函数跑在 renderer 里，process 不存在 —— 用 navigator.userAgentData
+ * 替代 process.platform。
+ *
+ * @returns {boolean}
+ */
+function isCaseInsensitiveFs() {
+  if (typeof navigator === 'undefined') return false;
+  // Chromium 90+: userAgentData.platform 形如 'Windows' / 'macOS' / 'Linux'
+  if (navigator.userAgentData && typeof navigator.userAgentData.platform === 'string') {
+    const p = navigator.userAgentData.platform.toLowerCase();
+    if (p.includes('win') || p.includes('macos') || p.includes('mac')) return true;
+  }
+  if (typeof navigator.platform === 'string' && navigator.platform) {
+    if (/^(win|mac)/i.test(navigator.platform)) return true;
+  }
+  // 兜底：UA 字符串嗅探
+  const ua = navigator.userAgent || '';
+  return /Windows NT|Macintosh|Mac OS X/i.test(ua);
 }
 
 /**

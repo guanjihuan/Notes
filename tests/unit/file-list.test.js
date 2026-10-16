@@ -3,7 +3,7 @@
 // 覆盖：
 //   - fuzzyScore 评分函数（纯函数）：子串 vs 子序列、单词边界、相邻匹配、空 query
 //   - setFiles：外部删除通知 (audit 2.1)
-//   - applyFilter：排序模式（name / mtime-desc）、搜索 vs sortMode 优先级
+//   - applyFilter：排序模式（name / name-desc / mtime-desc / mtime-asc）、搜索 vs sortMode 优先级
 //   - moveActive：边界（空列表、首/尾）+ 键盘导航
 //   - dispose 后 listener 失效
 //
@@ -63,6 +63,40 @@ describe('FileList 搜索 / 排序行为', () => {
       { name: 'mid.md', path: '/d/mid.md', mtimeMs: 200 },
     ]);
     expect(renderedNames()).toEqual(['new.md', 'mid.md', 'old.md']);
+  });
+
+  it('mtime-asc 模式按修改时间正序（旧 → 新）', () => {
+    // 2026-10 加的下拉排序项之一，与 mtime-desc 方向相反。
+    // 验证升序比较器不写反（避免与降序共享同一个 sort 函数只是顺序反了）。
+    list.setSort('mtime-asc');
+    feed([
+      { name: 'old.md', path: '/d/old.md', mtimeMs: 100 },
+      { name: 'new.md', path: '/d/new.md', mtimeMs: 300 },
+      { name: 'mid.md', path: '/d/mid.md', mtimeMs: 200 },
+    ]);
+    expect(renderedNames()).toEqual(['old.md', 'mid.md', 'new.md']);
+  });
+
+  it('name-desc 模式按文件名倒序（Z → A，zh-CN locale）', () => {
+    // 2026-10 加的下拉排序项之一，与默认 name 方向相反。
+    list.setSort('name-desc');
+    feed([
+      { name: 'a.md', path: '/d/a.md' },
+      { name: 'c.md', path: '/d/c.md' },
+      { name: 'b.md', path: '/d/b.md' },
+    ]);
+    expect(renderedNames()).toEqual(['c.md', 'b.md', 'a.md']);
+  });
+
+  it('setSort 未知 mode 退回到 name 而非抛错', () => {
+    // normalizeSortMode 的契约测试 —— UI / settings 传入拼错或过期值时，
+    // 不该抛错或保留上一次未知状态；回到默认 'name' 是更安全的失败模式。
+    feed([
+      { name: 'b.md', path: '/d/b.md' },
+      { name: 'a.md', path: '/d/a.md' },
+    ]);
+    expect(() => list.setSort('not-a-real-mode')).not.toThrow();
+    expect(renderedNames()).toEqual(['a.md', 'b.md']);
   });
 
   it('无 mtime 时 mtime-desc 模式按 name 兜底（不抛错）', () => {
@@ -344,5 +378,178 @@ describe('FileList dispose lifecycle', () => {
     // 等到 debounce 应该 fire 的时间点
     await new Promise((r) => setTimeout(r, 150));
     // 没有任何报错（监听已解绑，flushSearch 不会跑）
+  });
+});
+
+// ============================================================================
+// audit R7a P1-15：windowed 虚拟滚动
+// ============================================================================
+//
+// 关键约束：jsdom 不做布局，clientHeight 永远是 0 → render() 自动走 full 模式。
+// 测试需要主动 mock clientHeight（+ scrollTop / scrollHeight）才能触发
+// windowed 分支。所有测试都在 beforeEach 里 defineProperty，afterEach 还原，
+// 避免污染其它 describe 块。
+describe('FileList windowed 虚拟滚动 (audit R7a P1-15)', () => {
+  let element;
+  let originalDescriptors;
+  const VIEWPORT_H = 500;          // 10 个可见项
+  const ITEM_H = 50;               // 与 .file-item CSS 同步
+
+  /**
+   * jsdom 不做布局，clientHeight/scrollHeight/scrollTop 都是 0。
+   * 用 Object.defineProperty 直接覆盖实例属性，触发 windowed 分支。
+   * configurable:true 是必须的（afterEach 要 delete 还原）。
+   */
+  function mockLayout(el, { clientHeight = VIEWPORT_H, scrollHeight = 0, scrollTop = 0 } = {}) {
+    Object.defineProperty(el, 'clientHeight', { configurable: true, value: clientHeight });
+    Object.defineProperty(el, 'scrollHeight', { configurable: true, value: scrollHeight });
+    Object.defineProperty(el, 'scrollTop', { configurable: true, value: scrollTop, writable: true });
+  }
+
+  beforeEach(() => {
+    document.body.innerHTML = '<ul id="files"></ul>';
+    element = document.getElementById('files');
+    mockLayout(element);
+  });
+
+  /** 造 N 个文件条目 */
+  function makeFiles(n) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const name = `f-${String(i).padStart(5, '0')}.md`;
+      out.push({ name, path: `/d/${name}`, size: 100, mtimeMs: 1000 + i, entryType: 'editable' });
+    }
+    return out;
+  }
+
+  it('小列表（≤ 可见 + overscan）走 full 模式，DOM 节点数 = 总数', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(5));
+    expect(list._test_isWindowed()).toBe(false);
+    expect(list._test_hasSentinel()).toBe(false);
+    expect(element.querySelectorAll('.file-item')).toHaveLength(5);
+  });
+
+  it('大列表（> 可见 + overscan）切到 windowed 模式', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(10000));
+    expect(list._test_isWindowed()).toBe(true);
+    expect(list._test_hasSentinel()).toBe(true);
+  });
+
+  it('windowed 模式 DOM 节点数 = 可见 + 2*overscan（不随总数线性增长）', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(10000));
+    // 可见 10 + 2*overscan 5 = 20 个 .file-item；sentinel 1 个；共 21 个 children
+    const expected = 10 + 2 * 5; // 20
+    expect(list._test_poolSize()).toBe(expected);
+    expect(element.querySelectorAll('.file-item')).toHaveLength(expected);
+    expect(element.querySelectorAll('.file-list-sentinel')).toHaveLength(1);
+  });
+
+  it('10000 文件 render 时间 < 50ms（核心 perf 指标）', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    const files = makeFiles(10000);
+    // warmup：让 V8 对分配函数 inline-cache 收敛，第一次跑会比稳态慢
+    list.setFiles(makeFiles(100));
+    // 测时：只算 setFiles 内部 render 路径
+    const t0 = performance.now();
+    list.setFiles(files);
+    const dt = performance.now() - t0;
+    // audit 目标：< 50ms。jsdom 环境下无 layout/paint 开销，纯 DOM 构建，
+    // windowed 模式 20 节点 < full 模式 10000 节点的 1/500，< 5ms 稳过。
+    expect(dt).toBeLessThan(50);
+  });
+
+  it('scroll 后池内 <li> 的 textContent 反映新数据（不重建）', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(10000));
+    // 记录初始池里第一个 li 的引用
+    const firstLi = list._test_poolSize() > 0 ? element.querySelectorAll('.file-item')[0] : null;
+    expect(firstLi).toBeTruthy();
+    const initialName = firstLi.querySelector('.file-name').textContent;
+    expect(initialName).toBe('f-00000.md');
+
+    // 滚到第 5000 行附近 → 池子 flush 新的 file
+    Object.defineProperty(element, 'scrollTop', { configurable: true, value: 5000 * ITEM_H, writable: true });
+    // scroll 事件 → rAF 节流 → _renderWindowed
+    element.dispatchEvent(new Event('scroll'));
+    // 同步等 rAF flush（jsdom 的 rAF 走 setImmediate，正常 await 即可）
+    return new Promise((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          // 池中第一个 li 的 textContent 应是 f-04995.md（5000 - overscan 5）
+          const newFirst = element.querySelectorAll('.file-item')[0];
+          expect(newFirst.querySelector('.file-name').textContent).toBe('f-04995.md');
+          // 同一个 <li> 引用（池子复用，不重建）
+          expect(newFirst).toBe(firstLi);
+          resolve();
+        });
+      });
+    });
+  });
+
+  it('windowed 模式 setActive 跨 sentinel 也能正确高亮（不会高亮 sentinel）', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(10000));
+    // 滚到中间 → 池子里有 5000 附近的数据
+    Object.defineProperty(element, 'scrollTop', { configurable: true, value: 5000 * ITEM_H, writable: true });
+    element.dispatchEvent(new Event('scroll'));
+    // 设 active 为 f-05000.md（当前 DOM 池里可能没有，但 filteredFiles 有）
+    list.setActive('/d/f-05000.md');
+    // sentinel 永远不应该被加 is-active
+    const sentinel = element.querySelector('.file-list-sentinel');
+    expect(sentinel.classList.contains('is-active')).toBe(false);
+  });
+
+  it('setFiles 切回小列表 → 自动 _teardownWindowed，DOM 节点数 = 小列表数', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(10000));
+    expect(list._test_isWindowed()).toBe(true);
+    list.setFiles(makeFiles(3));
+    expect(list._test_isWindowed()).toBe(false);
+    expect(list._test_hasSentinel()).toBe(false);
+    expect(element.querySelectorAll('.file-item')).toHaveLength(3);
+  });
+
+  it('setFiles([]) → 退出 windowed + 显示 data-empty', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(10000));
+    expect(list._test_isWindowed()).toBe(true);
+    list.setFiles([]);
+    expect(list._test_isWindowed()).toBe(false);
+    expect(element.querySelectorAll('.file-item')).toHaveLength(0);
+    expect(element.querySelector('.file-list-sentinel')).toBeNull();
+    expect(element.dataset.empty).toBe('此文件夹为空');
+  });
+
+  it('moveActive 跨视口（windowed）能找到正确的 filteredFiles idx', () => {
+    const list = new FileList({ element, onSelect: vi.fn() });
+    list.setFiles(makeFiles(10000));
+    // 滚到中间位置，让池子窗口落在 [4995, 5015)
+    Object.defineProperty(element, 'scrollTop', { configurable: true, value: 5000 * ITEM_H, writable: true });
+    element.dispatchEvent(new Event('scroll'));
+    // activePath 设为 f-00000.md（第 0 项，远在窗口上方）
+    list.setActive('/d/f-00000.md');
+    // 向下走 3 步 → 应该是 f-00003.md
+    list.moveActive(3);
+    expect(list.activePath).toBe('/d/f-00003.md');
+    // 一直按到底 → f-09999.md
+    list.moveActive('last');
+    expect(list.activePath).toBe('/d/f-09999.md');
+  });
+
+  it('windowed 模式下 search 过滤后切回 full 模式（总数变小）', () => {
+    const list = new FileList({ element, onSelect: vi.fn(), searchInput: document.getElementById('search-input') });
+    list.setFiles(makeFiles(10000));
+    expect(list._test_isWindowed()).toBe(true);
+    // 搜索 'f-00099' → fuzzyScore 命中的子集（f-00099.md 1 个，f-00090-f-00099 也含
+    // 模糊命中 099 子序列，但远 < 10000）→ 切回 full
+    // 直接调 applyFilter + render 模拟 search hit
+    list.searchTerm = 'f-00099';
+    list.applyFilter();
+    list.render();
+    expect(list._test_isWindowed()).toBe(false);
+    expect(element.querySelectorAll('.file-item')).toHaveLength(list.filteredFiles.length);
   });
 });

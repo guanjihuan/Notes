@@ -103,7 +103,7 @@ export function mountModal({
     <div class="modal" role="document">
       <div class="modal-header">
         <h2 id="${escapeHtml(id)}" class="modal-title">${escapeHtml(title)}</h2>
-        <button class="modal-close" type="button" data-action="__modal_close__" aria-label="关闭">${CLOSE_BUTTON_SVG}</button>
+        <button class="modal-close" type="button" data-action="__modal_close__" aria-label="关闭对话框">${CLOSE_BUTTON_SVG}</button>
       </div>
       <div class="modal-body" data-modal-body></div>
       <div class="modal-footer" data-modal-footer></div>

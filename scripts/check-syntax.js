@@ -14,8 +14,14 @@ const targets = [
   'main.js',
   'preload.js',
   'scripts/launch.js',
-  // src/ 下用 ESM import/export，node --check 会按 ESM 解析（package.json 无 "type" 字段 → CJS），
-  // 因此 src/**/*.js 必须以 .mjs 单独跑。
+];
+
+// 额外需要语法检查的 CJS 目录（递归扫描其中的 .js）。main/ 与 shared/ 都是 CJS
+// （module.exports），此前被漏检；ESLint 能抓到语法错误，但原生 node --check 覆盖不到。
+// 注意：walk 仅收集 .js（CJS）；若某目录下出现 ESM 文件需另行处理。
+const cjsDirs = [
+  'shared',
+  'main',
 ];
 
 const esmTargets = [
@@ -41,6 +47,10 @@ function walk(dir, out) {
 
 /** @type {string[]} */
 const allCjs = targets.map((p) => path.join(ROOT, p)).filter(fs.existsSync);
+for (const d of cjsDirs) {
+  const abs = path.join(ROOT, d);
+  if (fs.existsSync(abs)) walk(abs, allCjs);
+}
 
 /** @type {string[]} */
 const allEsm = [];

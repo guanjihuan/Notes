@@ -452,7 +452,7 @@ export class SettingsDialog {
 
         // 3 个 radio 都已是默认值时按钮应禁用 —— click 后立即重算。
         updateResetBtnState();
-        showToast('已恢复外观默认值，点保存后生效', 'info', 1800);
+        showToast('外观已恢复默认，点保存后生效', 'info', 1800);
       }, { signal });
 
       // 暴露给 _bindAppearancePickers 的 change 监听器：用户改 picker 后实时
@@ -570,7 +570,7 @@ export class SettingsDialog {
           // 审计修复 (Round 11 P2-4)：去掉重复的 applyHint('openai')。
           // 上面 dispatch + openaiRadio.checked 已触发 aiProviderRadios 的 change
           // 监听器跑过一次 applyHint，再调一次是冗余。
-          showToast('已清空 AI 配置，点保存后生效', 'info', 1800);
+          showToast('AI 配置已清空，点保存后生效', 'info', 1800);
           // focus 到 Base URL 让用户能直接接着填；不放 model 是因为清空后
           // 通常会先确认/切换 provider，再选对应模型。
           aiBaseUrlInput.focus();
@@ -683,8 +683,24 @@ export class SettingsDialog {
     // 只提供「配色（palette）」，因为它没有顶部按钮入口。
     const palette = THEME_PALETTES.some(p => p.value === initial.themePalette) ? initial.themePalette : 'default';
     const paletteLabel = THEME_PALETTES.find(p => p.value === palette)?.label || palette;
-    const fs = READER_FONT_SIZES.includes(initial.readerFontSize) ? initial.readerFontSize : 17;
-    const lh = READER_LINE_HEIGHTS.includes(initial.readerLineHeight) ? initial.readerLineHeight : 1.85;
+    // 显示列表：若当前值在 schema 合法范围但不在 UI 枚举里（用户手改 config.json 设了 20），
+    // 把它前置为可选项并选中，避免打开设置一保存就静默回落到 17（丢弃用户真实设置）。
+    const fsList = READER_FONT_SIZES.includes(initial.readerFontSize)
+      ? READER_FONT_SIZES
+      : (typeof initial.readerFontSize === 'number' && Number.isInteger(initial.readerFontSize)
+          && initial.readerFontSize >= 12 && initial.readerFontSize <= 24)
+        ? [initial.readerFontSize, ...READER_FONT_SIZES]
+        : READER_FONT_SIZES;
+    const fsFallback = READER_FONT_SIZES.includes(17) ? 17 : (READER_FONT_SIZES[0] ?? 17);
+    const fs = initial.readerFontSize != null && fsList.includes(initial.readerFontSize)
+      ? initial.readerFontSize : fsFallback;
+    const lhList = READER_LINE_HEIGHTS.includes(initial.readerLineHeight)
+      ? READER_LINE_HEIGHTS
+      : (typeof initial.readerLineHeight === 'number' && initial.readerLineHeight >= 1.4 && initial.readerLineHeight <= 2.2)
+        ? [initial.readerLineHeight, ...READER_LINE_HEIGHTS]
+        : READER_LINE_HEIGHTS;
+    const lh = initial.readerLineHeight != null && lhList.includes(initial.readerLineHeight)
+      ? initial.readerLineHeight : 1.85;
 
     // 「恢复默认」按钮的初始 disabled 态：当前 3 个视觉字段都已经是 schema 默认值时禁用。
     // 默认值在 _render 入口已统一计算到 this._appearanceDefaults。
@@ -711,8 +727,8 @@ export class SettingsDialog {
       `;
     }).join('');
 
-    // 字号卡片：5 张卡，每张渲染一个 "Aa" 样本
-    const fontSizeCards = READER_FONT_SIZES.map((n) => {
+    // 字号卡片：5 张卡，每张渲染一个 "Aa" 样本（fsList 可能含用户手设的自定义值）
+    const fontSizeCards = fsList.map((n) => {
       const isSelected = n === fs;
       return `
         <label class="picker-card fontsize-card ${isSelected ? 'is-selected' : ''}" data-picker="fontsize" data-value="${n}" style="--sample-size:${n}px">
@@ -724,8 +740,8 @@ export class SettingsDialog {
       `;
     }).join('');
 
-    // 行距卡片：4 张卡，每张渲染 3 行示例文本
-    const lineHeightCards = READER_LINE_HEIGHTS.map((n) => {
+    // 行距卡片：4 张卡，每张渲染 3 行示例文本（lhList 可能含用户手设的自定义值）
+    const lineHeightCards = lhList.map((n) => {
       const isSelected = n === lh;
       return `
         <label class="picker-card lineheight-card ${isSelected ? 'is-selected' : ''}" data-picker="lineheight" data-value="${n}" style="--sample-lh:${n}">
@@ -912,7 +928,7 @@ print('hello')</code></pre>
           </div>
           ${initial._aiKeyRevealFailed
             ? `<div class="form-hint form-hint-warning" role="status">
-                 Key 已保存但当前无法回显。如要替换请输入完整新 Key；留空不会清空已有 Key（需清空请手动编辑 config.json）。
+                 已保存的 Key 当前无法回显。输入完整新 Key 可替换；留空将保留原值。
                </div>`
             : ''}
         </div>
@@ -937,7 +953,7 @@ print('hello')</code></pre>
             </svg>
           </span>
           <div class="settings-callout-text">
-            API Key 明文存储于本机 <code>config.json</code>${initial._configName ? `${initial._configDirName ? `（位于 <code>${escapeAttr(initial._configDirName)}</code> 配置目录）` : ''}<button type="button" class="btn-link" data-action="open-config-dir">[打开文件夹]</button>` : ''}。每次请求以 HTTP header 形式发送至上方的 Base URL，请使用你信任的服务。
+            API Key 明文存储于本机 <code>config.json</code>${initial._configName ? `${initial._configDirName ? `（位于 <code>${escapeAttr(initial._configDirName)}</code> 配置目录）` : ''}<button type="button" class="btn-link" data-action="open-config-dir">打开文件夹</button>` : ''}。每次请求以 HTTP header 形式发送至上方填写的 Base URL，请使用你信任的服务。
           </div>
         </div>
 
@@ -950,7 +966,7 @@ print('hello')</code></pre>
             rows="4"
             placeholder="留空使用内置默认提示词"
           ></textarea>
-          <div class="form-hint">让 AI 按特定角色或格式回复；留空时使用内置默认。</div>
+          <div class="form-hint">让 AI 按特定角色或格式回复；留空时使用内置默认提示词。</div>
         </div>
 
         <div class="settings-callout settings-callout-danger" role="note">
@@ -976,7 +992,7 @@ print('hello')</code></pre>
                 // 直接禁用按钮 + tooltip 引导「手动编辑 config.json」，避免与 hint 自相矛盾。
                 ? 'disabled aria-disabled="true" title="Key 无法回显，无法安全清空。请手动编辑 config.json。"'
                 : ''}
-            >[清空 AI 配置]</button>
+            >清空 AI 配置</button>
           </div>
         </div>
       </section>
@@ -1250,13 +1266,14 @@ print('hello')</code></pre>
     } catch (e) {
       console.error('[settings-dialog] 保存失败:', e);
       showToast(`保存失败：${e.message}`, 'error');
+    } finally {
+      // 统一收口：成功 / 失败 / 早退（DOM 缺失 / 无变更）三条路径都走这里。
+      // 用 finally 保证即便 try 内提前 return（如关键 DOM 元素缺失，line ~1174）
+      // 也能复位 _saving 与保存按钮 —— 否则 _saving 卡在 true 会让后续 _save
+      // 被 `if (this._saving) return` 误挡，必须 reload 才能恢复。
+      this._saving = false;
+      if (saveBtn) saveBtn.disabled = false;
     }
-    // 统一收口：成功 / 失败 / 早退（DOM 缺失 / 无变更）三条路径都走这里。
-    // 之前只有 catch 分支复位 _saving —— 成功后 modal.close('save') 直接
-    // return，_saving 留在 true；再次 open() 会被 `if (this._saving) return`
-    // 误挡，必须 reload 才能恢复（按钮看起来"失灵"，但实际上是状态卡死）。
-    this._saving = false;
-    if (saveBtn) saveBtn.disabled = false;
   }
 }
 

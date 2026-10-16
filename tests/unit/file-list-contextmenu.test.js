@@ -94,7 +94,9 @@ describe('showFileListContextMenu 集成', () => {
   function fakeShowFileListContextMenu(entry, x, y, contextMenu, callbacks) {
     const isFolder = entry && entry.entryType === 'folder';
     const items = [];
-    if (!isFolder) items.push({ label: '重命名', value: 'rename' });
+    // 历史：folder 原本隐藏「重命名」—— file:rename 主进程强绑 .md 后缀。
+    // 现在用 folder:create / folder:rename / folder:delete 三个新 IPC 解锁文件夹重命名/删除。
+    items.push({ label: '重命名', value: 'rename' });
     items.push({ label: '在文件夹中显示', value: 'reveal' });
     items.push({ separator: true, value: '' });
     items.push({ label: '删除', value: 'delete' });
@@ -119,15 +121,34 @@ describe('showFileListContextMenu 集成', () => {
     ]);
   });
 
-  it('folder 条目 → 菜单不包含 rename', () => {
+  it('folder 条目 → 菜单包含 rename / reveal / delete（folder:rename 解锁）', () => {
+    // 历史注释：folder 条目原本隐藏「重命名」 —— file:rename 主进程强绑 .md 后缀。
+    // 现在用独立的 folder:create / folder:rename / folder:delete IPC，folder 也允许重命名。
     fakeShowFileListContextMenu(
       { name: 'subdir', path: '/d/subdir', entryType: 'folder' }, 10, 10, menu,
       { onRename: vi.fn(), onReveal: vi.fn(), onDelete: vi.fn() }
     );
     const buttons = container.querySelectorAll('.context-menu-item');
     expect(Array.from(buttons).map((b) => b.textContent)).toEqual([
-      '在文件夹中显示', '删除',
+      '重命名', '在文件夹中显示', '删除',
     ]);
+  });
+
+  it('folder 条目点「重命名」 → onRename 被调（分支到 folder rename 而非 file rename）', () => {
+    // 验证 onSelect 回调：根据 entryType 把「重命名」分支到对应 handler。
+    // 真实现里 showFileListContextMenu 直接调 fileOps.renameFolder / renameCurrentOrFile，
+    // fakeShowFileListContextMenu 这里只能验证 onRename 被调用（具体 handler 是生产代码的
+    // 内部调度的，由 file-ops.test.js / 集成覆盖）。
+    const onRename = vi.fn();
+    fakeShowFileListContextMenu(
+      { name: 'subdir', path: '/d/subdir', entryType: 'folder' }, 10, 10, menu,
+      { onRename, onReveal: vi.fn(), onDelete: vi.fn() }
+    );
+    const buttons = container.querySelectorAll('.context-menu-item');
+    buttons[0].click(); // 「重命名」
+    expect(onRename).toHaveBeenCalledTimes(1);
+    expect(onRename.mock.calls[0][0].name).toBe('subdir');
+    expect(onRename.mock.calls[0][0].entryType).toBe('folder');
   });
 
   it('点击「重命名」 → onRename 回调被调，且菜单关闭', () => {

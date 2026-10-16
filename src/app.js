@@ -6,7 +6,10 @@
 import { SettingsStore } from './settings-store.js';
 import { FileList } from './file-list.js';
 import { MarkdownViewer } from './markdown-viewer.js';
-import { MarkdownEditor } from './markdown-editor.js';
+// P2-9（audit C-4）：MarkdownEditor 不走顶层静态 import —— basicSetup 会拖
+// 整个 CM6 图（23 条 importmap）进模块图，show:false + ready-to-show 下
+// 「窗口出现」= 等 CM6 全部下载解析完。改在 bootstrap 里 dynamic import
+// （见下方 _heavyModules），编辑器实例化随之延后（let editor，line ~661）。
 import { EditorToolbar, EDITOR_MODES } from './editor-toolbar.js';
 import { Toolbar } from './toolbar.js';
 import { SettingsDialog } from './settings-dialog.js';
@@ -22,7 +25,9 @@ import { isOpen as modalIsOpen } from './modal-stack.js';
 import { mountKeyboardShortcuts } from './shortcuts.js';
 import { syncSaveButton as syncSaveButtonUI } from './save-button-ui.js';
 import { ContextMenu } from './context-menu.js';
-import { EditorView } from '@codemirror/view';
+import { makeLock } from './fs-handler-lock.js';
+// P2-9：EditorView 类引用也由 bootstrap dynamic import 注入（EditorViewCtor），
+// 唯一使用点是 contextmenu 里读 EditorView.editable facet。
 import { isPathInside, dirnameOf, basenameOf, resolvePath, isMarkdownFile, pathsEqual } from './utils.js';
 import { formatStatusStats } from './stats.js';
 // 文件操作层（Stage 4c 抽离）
@@ -38,6 +43,8 @@ import { createAiController } from './ai/ai-controller.js';
 // 通用拖拽分割条工厂（mountSplitter / mountSidebarSplitter / mountAiSplitter 三段
 // 共用的样板抽到一处）。dispose() 一次性解除挂载的所有 listener。
 import { createSplitter } from './splitter.js';
+// splitRatio 视觉模式重置（audit P0-4 + Memory-2 兜底：每次进入 split 默认 50%）。
+import { applySplitRatioResetIfEnteringSplit } from './editor-mode-reset.js';
 
 // 启动错误兜底：如果 preload 没注入 window.api（极少见），显示错误并退出
 if (!window.api) {
@@ -45,6 +52,19 @@ if (!window.api) {
   if (el) el.removeAttribute('hidden');
   throw new Error('[app] window.api not available; preload.js failed to inject contextBridge');
 }
+
+// P2-9（audit C-4）：模块 eval 一开始就发起 CM6 dynamic import —— fetch/解析
+// 与 bootstrap 的 settings IPC / 首屏文件列表扫描完全并飞，bootstrap 里
+// await 只是 join 一个在途 promise。importmap 对 dynamic import 同样生效，
+// 裸 specifier '@codemirror/view' 可用（且 markdown-editor.js 静态依赖它，
+// 这条 import 命中模块缓存，零额外 fetch）。
+const _heavyModules = Promise.all([
+  import('./markdown-editor.js'),
+  import('@codemirror/view'),
+]).then(([editorMod, viewMod]) => ({
+  MarkdownEditor: editorMod.MarkdownEditor,
+  EditorView: viewMod.EditorView,
+}));
 
 /**
  * 把 preload 缓存的 icon.ico PNG data URL 注入到左上角 <img>。
@@ -75,10 +95,20 @@ function mountAppIcon() {
 // 硬编码在多处 fallback，schema 改默认或加新枚举时这些地方会悄无声息地继续走旧值。现在只读
 // 一处事实源（schema），fallback 用 UI 选项表第一项 —— 与 schema.js#DEFAULT_SETTINGS.fileListSort
 // 共享同一个 [0].value。
-const FILE_LIST_SORT_OPTIONS = (window.api?.settingsSchema?.SETTINGS_UI_OPTIONS?.fileListSort) || [
-  { value: 'name', label: '按名称' },
-  { value: 'mtime-desc', label: '按修改时间' },
-];
+// audit fix：fallback 数组与 schema SETTINGS_UI_OPTIONS.fileListSort 完整对齐
+// （name / name-desc / mtime-desc / mtime-asc 四项），而不是只列两项。
+// 历史 fallback 只有 {name, mtime-desc} 两项，但 HTML/Schema 已有 4 项；fallback
+// 路径被走到时（preload schema 没传过桥，比如 renderer 单测或外部以 ESM 直
+// 跑 app.js）会让 FILE_LIST_SORT_VALUES 缺 name-desc / mtime-asc，
+// syncBehaviorPrefsUI 把这两个值当成「非法」退回 'name'，侧栏 sort 下拉
+// 选中态 + 触发器 label 跟实际 settings 不一致。fallback 与 schema 完全同步，
+// 走 fallback 也至少不丢项。
+const FILE_LIST_SORT_OPTIONS = (window.api?.settingsSchema?.SETTINGS_UI_OPTIONS?.fileListSort) || Object.freeze([
+  { value: 'name', label: '按名称', hint: 'A → Z，localeCompare(zh-CN)' },
+  { value: 'name-desc', label: '按名称', hint: 'Z → A，localeCompare(zh-CN) 反向' },
+  { value: 'mtime-desc', label: '按修改时间', hint: '最近修改排在最前' },
+  { value: 'mtime-asc', label: '按修改时间', hint: '最早修改排在最前' },
+]);
 const FILE_LIST_SORT_VALUES = FILE_LIST_SORT_OPTIONS.map((o) => o.value);
 const DEFAULT_FILE_LIST_SORT = FILE_LIST_SORT_VALUES[0] || 'name';
 
@@ -139,6 +169,11 @@ const state = {
   // 只有 .md / .markdown 才走 viewer.loadContent() + preview/split 模式；
   // 其它可编辑文件（.txt/.py/.json/...）只走编辑器，viewer 走"不支持预览"空态。
   currentFileIsMarkdown: false,
+  // 剪切 / 复制剪贴板：记录待移动 / 复制的源条目。
+  // { srcPath, srcName, entryType, isCut } —— isCut=true 表示「剪切」（粘贴后清除），
+  // false 表示「复制」（粘贴后可重复粘贴）。粘贴目标 = 当前浏览目录 currentDir。
+  // 由 cutEntry / copyEntry / pasteToCurrentDir 维护（见文件操作区）。
+  clipboard: null,
 };
 
 /**
@@ -152,6 +187,7 @@ const els = {
   btnResetFolder: document.getElementById('btn-reset-folder'),
   markdownBody: document.getElementById('markdown-body'),
   emptyState: document.getElementById('empty-state'),
+  emptyStateNewBtn: document.getElementById('empty-state-new-btn'),
   editorPane: document.getElementById('editor-pane'),
   splitter: document.getElementById('splitter'),
   sidebar: document.getElementById('sidebar'),
@@ -164,14 +200,23 @@ const els = {
   statusModeLabel: document.getElementById('status-mode-label'),
   statusStats: document.getElementById('status-stats'),
   statusScroll: document.getElementById('status-scroll'),
+  // 阅读进度条（viewer 顶部细线）：与 status-scroll 同一次滚动回调里更新，
+  // 复用已经算好的 progress，不另起 scroll 监听。见 updateStatusScroll()。
+  readingProgress: document.getElementById('reading-progress'),
+  readingProgressBar: document.getElementById('reading-progress-bar'),
   statusHeading: document.getElementById('status-heading'),
   // AI chip：状态栏新增，承载 AI 过程/错误/待确认状态 —— 见 [feedback-ai-tips-into-status-bar]
   statusAi: document.getElementById('status-ai'),
   statusAiLabel: document.getElementById('status-ai-label'),
   statusUnsaved: document.getElementById('status-unsaved'),
   toolbarAutosave: document.getElementById('toolbar-autosave'),
-  btnSortName: document.getElementById('btn-sort-name'),
-  btnSortMtime: document.getElementById('btn-sort-mtime'),
+  // 排序下拉：触发器 + 菜单容器 + 当前选项文字 span；触发器本身 aria-expanded 切换开合。
+  // 不再有 btn-sort-name / btn-sort-mtime —— sort 改成下拉模式（4 项），
+  // 原并排两按钮被一个 trigger + ul 替代。见 [[feedback-sort-as-dropdown]]。
+  btnSortTrigger: document.getElementById('btn-sort-trigger'),
+  sidebarSortDropdown: document.getElementById('sidebar-sort-dropdown'),
+  sidebarSortMenu: document.getElementById('sidebar-sort-menu'),
+  sidebarSortTriggerLabel: document.getElementById('sidebar-sort-trigger-label'),
   btnTheme: document.getElementById('btn-theme'),
   btnPin: document.getElementById('btn-pin'),
   btnSave: document.getElementById('btn-save'),
@@ -183,7 +228,6 @@ const els = {
   btnModeSplit: document.getElementById('btn-mode-split'),
   btnSettings: document.getElementById('btn-settings'),
   btnResetLayout: document.getElementById('btn-reset-layout'),
-  btnNewFile: document.getElementById('btn-new-file'),
   // Stage 8：Folder Browser 面包屑
   sidebarBreadcrumb: document.getElementById('sidebar-breadcrumb'),
   btnBreadcrumbRoot: document.getElementById('btn-breadcrumb-root'),
@@ -462,6 +506,16 @@ const fileList = new FileList({
     openFile(entry);
   },
   onContextMenu: (entry, x, y) => fileOps.showFileListContextMenu(entry, x, y),
+  // 列表空白区域右键：弹「粘贴到当前目录」（剪贴板为空时禁用）。
+  // 没命中具体条目时用户无处粘贴，这里补上入口（与拖拽到文件夹、Ctrl+V 同源）。
+  onContextMenuEmpty: (x, y) => showSidebarEmptyContextMenu(x, y),
+  // 拖拽到文件夹：把 dragged 条目 move / copy 进 targetFolder。
+  // copy=true 表示拖拽时按住 Ctrl/Cmd（复制）；否则移动。
+  onDropIntoFolder: (dragged, targetFolder, { copy } = {}) => {
+    if (!dragged || !targetFolder) return;
+    if (copy) fileOps.copyEntry(dragged, targetFolder.path);
+    else fileOps.moveEntry(dragged, targetFolder.path);
+  },
   // M-series fix (audit Phase M-H2)：移除 fileList.setFiles 触发的 onFileRemoved
   // 回调。旧逻辑仅凭「previousActive 不在新 entries 里」就通知上层清空编辑器，
   // 把「用户导航到子目录」（Folder Browser：浏览期间不自动关文件）与「文件被
@@ -638,33 +692,44 @@ if (els.editorPane) {
 // AI 聊天面板显隐观察器（模块级持有，便于 unload/卸载时 disconnect）
 let aiObserver = null;
 
-const editor = new MarkdownEditor({
-  element: els.editorPane,
-  onChange: () => {
-    state.isDirty = editor.isDirty();
-    syncSaveButton();
-    updateStatusStats();
-    scheduleLivePreview();
-    // 编辑动作 → 重新调度自动保存（debounce 语义：每次键入重置计时器）
-    // 仅当用户实际输入（isDirty=true）时才有意义；isDirty=false 的回声
-    // （如 setExternalContent）也会调用本函数，但 scheduleAutoSave 里
-    // save() 在 isDirty=false 时直接返回，所以是安全的 no-op。
-    scheduleAutoSave(currentAutoSaveDebounceMs());
-    // AI 应用了部分 region / 用户继续编辑：让 AI 控制器重算剩余 diff。
-    // 由 controller 内部判断是否有 pendingDiff，没有就 no-op。
-    ai && ai.onContentChanged();
-  },
-  onSave: () => save(),
-  onScroll: (progress) => {
-    // 任何模式下都先刷新状态栏（rAF 内 coalesce，多次触发无开销）；
-    // split 模式再额外把 viewer 同步过去。syncScrollGuard 用来避免
-    // 反向同步（A→B→A）的循环。
-    updateStatusScroll();
-    if (state.editorMode !== 'split') return;
-    if (syncScrollGuard) return;
-    viewer.setScrollProgress(progress);
-  },
-});
+// P2-9（audit C-4）：editor 不在模块 eval 时 new —— 由 bootstrap join
+// _heavyModules 后调 _instantiateEditor 实例化。所有 editor 使用点都在
+// bootstrap 之后的事件路径上（IPC / 快捷键 / 用户输入），let + null 初始安全；
+// bootstrap 把编辑器实例化放在任何事件接线之前，不会出现 null deref。
+let editor = null;
+// contextmenu 构建器要读 EditorView.editable facet —— 类引用同样由
+// bootstrap 从 _heavyModules 注入（app.js 顶层不静态 import @codemirror/view）。
+let EditorViewCtor = null;
+
+function _instantiateEditor(MarkdownEditor) {
+  editor = new MarkdownEditor({
+    element: els.editorPane,
+    onChange: () => {
+      state.isDirty = editor.isDirty();
+      syncSaveButton();
+      updateStatusStats();
+      scheduleLivePreview();
+      // 编辑动作 → 重新调度自动保存（debounce 语义：每次键入重置计时器）
+      // 仅当用户实际输入（isDirty=true）时才有意义；isDirty=false 的回声
+      // （如 setExternalContent）也会调用本函数，但 scheduleAutoSave 里
+      // save() 在 isDirty=false 时直接返回，所以是安全的 no-op。
+      scheduleAutoSave(currentAutoSaveDebounceMs());
+      // AI 应用了部分 region / 用户继续编辑：让 AI 控制器重算剩余 diff。
+      // 由 controller 内部判断是否有 pendingDiff，没有就 no-op。
+      ai && ai.onContentChanged();
+    },
+    onSave: () => save(),
+    onScroll: (progress) => {
+      // 任何模式下都先刷新状态栏（rAF 内 coalesce，多次触发无开销）；
+      // split 模式再额外把 viewer 同步过去。syncScrollGuard 用来避免
+      // 反向同步（A→B→A）的循环。
+      updateStatusScroll();
+      if (state.editorMode !== 'split') return;
+      if (syncScrollGuard) return;
+      viewer.setScrollProgress(progress);
+    },
+  });
+}
 
 /**
  * AI 修改控制器（自然语言 → diff → 应用）。
@@ -719,6 +784,49 @@ viewer.onScroll((progress) => {
 const contextMenu = new ContextMenu();
 
 /**
+ * 文件夹管理配套回调（被 file-ops.js#renameFolder / deleteFolder 调用）。
+ *
+ * 数据目录（dataRoot）的绝对路径在运行时才确定，所以这几个回调都依赖
+ * state.currentDir + state.currentRelDir，由调用方层（app.js）即时计算。
+ * 不传 state / dataRoot 到 file-ops.js，保持 file-ops 模块无应用层状态耦合。
+ */
+function _wasEntryAffectingCurrentDir(entryPath) {
+  // currentRelDir 为空 ⇒ 正在根目录查看，dataRoot 本身不会被 user-created folder 改到
+  // （folder:create 不会作用于 root），
+  // 所以空 relDir 时任何 entry 都不算影响
+  if (!state.currentDir || !entryPath || !state.currentRelDir) return false;
+  // entry = currentDir 时返回 true（pathsEqual 处理 Windows/macOS 大小写）
+  if (pathsEqual(state.currentDir, entryPath)) return true;
+  // entry 是 currentDir 的祖先：用规范化 + sep 边界防 sibling 误判（'foo' vs 'foobar'）
+  const curNorm = state.currentDir.replace(/[\\/]+$/, '');
+  const entNorm = entryPath.replace(/[\\/]+$/, '');
+  const sep = entNorm.includes('\\') ? '\\' : '/';
+  return curNorm.startsWith(entNorm + sep);
+}
+
+function _computeCurrentRelAfterRename(oldPath, oldName, newPath, newName) {
+  // currentRelDir 在 state 里 —— 把它的某段 oldName 替换成 newName，路径位置不变
+  if (!state.currentRelDir || !oldName) return state.currentRelDir || '';
+  const segs = state.currentRelDir.split('/');
+  const idx = segs.indexOf(oldName);
+  if (idx === -1) return state.currentRelDir;
+  segs[idx] = newName;
+  return segs.join('/');
+}
+
+function _parentRelForRemovedEntry(entryPath, entryName) {
+  if (!entryName) return '';
+  // 简单反算：找到 entryName 在 currentRelDir 中的位置，slice 出去
+  // 边界：若 entryName 不在 currentRelDir（理论上 wasAffectingCurrentDir 已保证它影响），
+  // 返回根
+  if (!state.currentRelDir) return '';
+  const segs = state.currentRelDir.split('/');
+  const idx = segs.indexOf(entryName);
+  if (idx === -1) return '';
+  return segs.slice(0, idx).join('/');
+}
+
+/**
  * 文件操作实例化（Stage 4c）
  *
  * 依赖 state（共享）+ controls（fileList / viewer / editor / contextMenu）
@@ -730,7 +838,16 @@ const contextMenu = new ContextMenu();
  */
 fileOps = createFileOps({
   state,
-  controls: { fileList, viewer, editor, contextMenu },
+  controls: {
+    fileList,
+    viewer,
+    contextMenu,
+    // P2-9（audit C-4）：editor 是模块级 let，bootstrap 里 dynamic import CM6
+    // 后才实例化 —— 直接写 `editor` 会把模块 eval 时的 null 拷给 file-ops。
+    // 对象字面量 getter 提供活视图，file-ops 内部 getEditor() 运行时现取
+    // （契约：tests/unit/file-ops-lazy-editor.test.js）。
+    get editor() { return editor; },
+  },
   api: window.api,
   callbacks: {
     openFile,
@@ -752,6 +869,21 @@ fileOps = createFileOps({
         }
       }
     },
+    // 文件夹管理配套回调（renameFolder / deleteFolder 用）：
+    //   - wasEntryAffectingCurrentDir：被删 / 被改名的文件夹是不是当前目录 / 祖先
+    //   - navigateToRelDir：切到 POSIX relDir（folder rename 后把视图同步到新位置用）
+    //   - computeCurrentRelAfterRename：把 currentRelDir 里的 oldName 段替换成 newName
+    //   - parentRelForRemovedEntry：反算被删文件夹的父级 relDir
+    // 决策权与状态都在 app.js 里维护，file-ops 通过这几个 callback 不依赖任何 app.js 状态
+    wasEntryAffectingCurrentDir: _wasEntryAffectingCurrentDir,
+    computeCurrentRelAfterRename: _computeCurrentRelAfterRename,
+    parentRelForRemovedEntry: _parentRelForRemovedEntry,
+    navigateToRelDir,
+    // 剪切 / 复制 / 粘贴：clipboard 状态在 app.js 维护，file-ops 的
+    // showFileListContextMenu 通过这三个回调触发（不直接碰 state.clipboard）。
+    onCut: (entry) => cutEntry(entry),
+    onCopy: (entry) => copyEntry(entry),
+    onPaste: () => pasteToCurrentDir(),
   },
 });
 
@@ -777,13 +909,29 @@ async function writeClipboard(text) {
   } catch (e) {
     console.warn('[app] navigator.clipboard.writeText 失败:', e);
   }
-  // 兜底：execCommand 在 Electron 内仍可用
+  // 兜底：execCommand 在 Electron 内仍可用，但只能复制"当前选区"。
+  // 手动把 text 塞进一个临时 textarea 并选中，才能复制真正要复制的内容
+  // （否则降级路径会复制错误的选区 / 空内容）。
+  // 用 try/finally 保证 textarea 必定被清理 —— 即便 execCommand 同步抛错
+  // （老 Chromium 极少见但存在）也不能让 positioned-off-screen 的 DOM 节点泄漏。
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.top = '-9999px';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
   try {
     const ok = document.execCommand('copy');
-    if (!ok) throw new Error('execCommand 失败');
+    if (!ok) throw new Error('execCommand 返回 false');
   } catch (e) {
-    console.error('[app] 复制到剪贴板失败:', e);
-    showToast('复制失败', 'error', 1500);
+    console.error('[app] execCommand copy 失败:', e);
+    // toast 给出具体原因（execCommand 消息 / 抛错消息），让用户知道是「返回值 false」
+    // 还是抛错（权限 / 文档失焦），而不是统一的「复制失败」。
+    showToast(`复制失败：${e && e.message ? e.message : '请检查剪贴板权限'}`, 'error', 2000);
+  } finally {
+    if (ta.parentNode) ta.parentNode.removeChild(ta);
   }
 }
 
@@ -801,6 +949,133 @@ async function readClipboard() {
   }
   showToast('粘贴失败：无法访问剪贴板', 'error', 1500);
   return '';
+}
+
+/**
+ * 剪切 / 复制剪贴板：记录待移动 / 复制的源条目到 state.clipboard，
+ * 并给源文件列表项加 .is-clipboard-cut 提示（仅剪切需要，提示「将被移走」）。
+ *
+ * @param {{path:string,name:string,entryType:string}} entry
+ * @param {boolean} isCut
+ */
+function _setClipboard(entry, isCut) {
+  if (!entry || !entry.path) return;
+  // 切换 clipboard 时先清掉旧源的高亮
+  _clearClipboardCutMark();
+  state.clipboard = {
+    srcPath: entry.path,
+    srcName: entry.name,
+    entryType: entry.entryType,
+    isCut: !!isCut,
+  };
+  if (isCut) {
+    const li = findFileListItem(entry.path);
+    if (li) li.classList.add('is-clipboard-cut');
+  }
+  showToast(isCut ? `已剪切：${entry.name}` : `已复制：${entry.name}`, 'info', 1500);
+}
+
+/** 清空 .is-clipboard-cut 高亮（切换 / 粘贴 / 取消时调用）。 */
+function _clearClipboardCutMark() {
+  if (!els.fileList) return;
+  const prev = els.fileList.querySelector('.file-item.is-clipboard-cut');
+  if (prev) prev.classList.remove('is-clipboard-cut');
+}
+
+function cutEntry(entry) {
+  _setClipboard(entry, true);
+}
+
+function copyEntry(entry) {
+  _setClipboard(entry, false);
+}
+
+/**
+ * 把 clipboard 里的源条目移动 / 复制到「当前浏览目录」（state.currentDir）。
+ * - 剪切（isCut）→ move，完成后清除 clipboard + 去高亮
+ * - 复制（isCut=false）→ copy，保留 clipboard（可重复粘贴）
+ * clipboard 为空或目标目录无效时静默 no-op。
+ */
+async function pasteToCurrentDir() {
+  const clip = state.clipboard;
+  if (!clip || !clip.srcPath) return;
+  const destDir = state.currentDir || '';
+  if (!destDir) return;
+  // 不能把条目粘进自身 / 自身子孙（与拖拽校验同源）
+  if (clip.entryType === 'folder'
+      && (destDir === clip.srcPath || destDir.startsWith(clip.srcPath + '/') || destDir.startsWith(clip.srcPath + '\\'))) {
+    showToast('不能粘贴到文件夹自身或其子文件夹内', 'warning', 1500);
+    return;
+  }
+  const srcEntry = { path: clip.srcPath, name: clip.srcName, entryType: clip.entryType };
+  if (clip.isCut) {
+    const res = await fileOps.moveEntry(srcEntry, destDir);
+    // 仅在移动成功后才清 clipboard —— 失败（如权限/磁盘）保留 clipboard，
+    // 源文件仍在原地，用户可修好原因后重试粘贴。
+    if (res && res.ok) {
+      state.clipboard = null;
+      _clearClipboardCutMark();
+    }
+  } else {
+    await fileOps.copyEntry(srcEntry, destDir);
+    // 复制保留 clipboard，可连续粘贴多份
+  }
+}
+
+/**
+ * 侧栏列表空白区域右键菜单：仅「粘贴到当前目录」。
+ * 没命中具体条目（列表留白 / 滚动条留白）时，用户无处粘贴，这里补一个入口，
+ * 把剪贴板里的条目粘进当前浏览目录（state.currentDir），与 Ctrl+V、右键条目
+ * 菜单里的「粘贴」走同一个 pasteToCurrentDir。clipboard 为空时禁用。
+ */
+function showSidebarEmptyContextMenu(x, y) {
+  const clip = state.clipboard;
+  // 侧栏空白右键：除「粘贴到当前目录」外，补「新建文件 / 新建文件夹」。
+  // 落点都是当前浏览目录 state.currentDir（与文件夹条目右键「在文件夹中新建」同源
+  // —— 后者用 entry.path 落点、此处用 state.currentDir），让用户不必先去点具体
+  // 条目也能在此目录里建东西。建进子目录则走文件夹条目的右键菜单。
+  // 2026-09 设计优化：侧栏顶部的「+ 新建笔记」按钮移除后，"顶部 + 按钮同源"
+  // 的注释失去意义 —— 新建入口只剩右键菜单（侧栏空白 / 文件夹条目）。
+  const items = [
+    { label: '新建文件', value: 'new_file' },
+    { label: '新建文件夹', value: 'new_folder' },
+    { separator: true, value: '' },
+    {
+      label: clip ? `粘贴到当前目录（来自 ${clip.srcName}）` : '粘贴到当前目录',
+      value: 'paste',
+      disabled: !clip,
+    },
+  ];
+  if (!clip) {
+    items.push({ separator: true, value: '' });
+    items.push({ label: '（剪贴板为空）', value: '', disabled: true });
+  }
+  contextMenu.show({
+    x, y, items,
+    onSelect: (value) => {
+      if (value === 'new_file') fileOps.createNewFile();
+      else if (value === 'new_folder') fileOps.createNewFolder();
+      else if (value === 'paste') pasteToCurrentDir();
+    },
+  });
+}
+
+/**
+ * 在文件列表 DOM 里按 path 反查 .file-item 元素（windowed / full 模式都适用）。
+ * @param {string} path
+ * @returns {HTMLElement|null}
+ */
+function findFileListItem(path) {
+  if (!els.fileList || !path) return null;
+  return els.fileList.querySelector(`.file-item[data-path="${cssEscapeAttr(path)}"]`);
+}
+
+/**
+ * 给 CSS 属性选择器里的特殊字符做最小转义（path 含引号 / 方括号会破坏选择器）。
+ * @param {string} s
+ */
+function cssEscapeAttr(s) {
+  return String(s).replace(/["\\]/g, '\\$&');
 }
 
 /**
@@ -863,7 +1138,8 @@ function mountEditorContextMenu() {
     }
 
     const view = editor.view;
-    const editable = !view || view.state.facet(EditorView.editable);
+    // EditorViewCtor 由 bootstrap 注入（P2-9）；contextmenu 只会在那之后触发
+    const editable = !view || view.state.facet(EditorViewCtor.editable);
 
     // 取主选区（CM6 支持多选区，右键菜单只针对主选区）
     const sel = view ? view.state.selection.main : null;
@@ -982,7 +1258,7 @@ async function closeCurrentFile() {
   if (state.isDirty) {
     const choice = await showConfirmDialog({
       title: '未保存的改动',
-      message: `当前文件「${state.currentFile.name}」有未保存的改动。\n\n关闭前请选择如何处理。`,
+      message: `当前文件「${state.currentFile.name}」有未保存改动。关闭前请选择处理方式。`,
       icon: 'warning',
       buttons: [
         { value: 'cancel', label: '取消' },
@@ -1027,8 +1303,13 @@ async function closeCurrentFile() {
  * @param {{path:string,name:string,mtimeMs?:number,size?:number}} file
  * @returns {Promise<boolean>} 是否成功替换（失败时调用方应保持原状态）
  */
-async function reloadCurrentFileFromDisk(file) {
+async function reloadCurrentFileFromDisk(file, opts = {}) {
   if (!file || !file.path) return false;
+  // force：用户**主动**选择「使用外部版本」时跳过 dirty 守门。
+  // 此时丢弃本地改动是用户明确意图，不应被 dirty 守卫静默忽略（HIGH：冲突
+  // 对话框「使用外部版本」按钮在 dirty 场景下曾是 no-op）。IME 合成守卫
+  // （下方 try/catch EDITOR_COMPOSING）仍生效，避免覆盖正在输入的中文拼音。
+  const force = !!(opts && opts.force);
   // 防 stale reload：用户可能在 await 之前已经切换 / 关闭文件。
   // 这种情况不能再用 state.currentFile 重新装载 —— 否则会把 A 的 mtime/size
   // 写到 B（或空）的 state 上，导致「切到 C 后状态栏又跳回 A」之类的诡异 UX。
@@ -1070,7 +1351,7 @@ async function reloadCurrentFileFromDisk(file) {
   // state.isDirty 仍为 false 但 editor 内部 view.state.doc 已含 IME 临时字符。
   // 这里改用 editor.isDirty()（与 dirtyAtStart 同源），覆盖 IME 这条 race 路径，
   // 否则 setExternalContent 全量替换会摧毁 IME buffer。
-  if (dirtyAtStart || editor.isDirty()) {
+  if (!force && (dirtyAtStart || editor.isDirty())) {
     return false;
   }
   // 重新计算 currentFileIsMarkdown（理论上 reload 是同一路径，但 path 可能改变 —— 如重命名）
@@ -1165,27 +1446,6 @@ const editorToolbar = new EditorToolbar({
 });
 
 /**
- * 双栏左侧占比：clamp 到 0.2..0.8（与主进程 app:save-settings 的校验一致），
- * 非法值回落到 0.5。
- * @param {unknown} value
- * @returns {number}
- */
-function clampSplitRatio(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return 0.5;
-  return Math.max(0.2, Math.min(0.8, n));
-}
-
-/**
- * 应用视图模式到 DOM 和编辑器
- *
- * Stage 8：非 Markdown 文件（.txt/.py/.json/...）只支持编辑 —— 即使 state.editorMode
- * 持久化的是 'preview' 或 'split'，DOM 视觉模式也强制回落到 'edit'；toolbar 的
- * preview/split 按钮 disabled（hover 提示原因）。
- *
- * 注意：state.editorMode 本身保持不变 —— 用户回到 Markdown 后能恢复上次选的模式。
- */
-/**
  * 应用视图模式到 DOM 和编辑器
  *
  * Stage 8：非 Markdown 文件（.txt/.py/.json/...）只支持编辑 —— 即使 state.editorMode
@@ -1209,23 +1469,16 @@ function applyEditorMode(mode, opts) {
   const isMd = state.currentFileIsMarkdown;
   const visualMode = isMd ? mode : 'edit';
 
-  // 视觉模式从非 split 切到 split 时重置 splitRatio=0.5 —— 用户期待「双栏」= 50/50
-  // （每次进入双栏都从默认比例起步，drag 只在本次会话内有效）。
-  // 用 DOM 上的 prevVisualMode（document.body.dataset.editorMode）而不是 state.editorMode：
-  //   - state.editorMode 会在 AI 打开时被覆盖为 'edit'（handleAiDiffOpenChange(true) →
-  //     applyEditorMode('edit')），与用户真正看到的视觉模式可能脱节；
-  //   - DOM 是 CSS 渲染的唯一依据，在 _setDOM 同步写入；这里在 setMode 之前读，正好是
-  //     「进入前的视觉状态」，符合「看到双栏的瞬间重置」语义。
-  // 这同时覆盖 md ↔ non-md 重命名场景：把 .md 改 .txt 时视觉退回 edit，再改回 .md 时
-  // 视觉从 edit 重新进入 split，闸触发重置。
-  // bootstrap 时 currentFile=null → isMd=false → visualMode='edit'，闸不触发（视觉不显示 split）；
-  // 用户打开第一个 md 文件时 applyEditorMode 触发，visualMode='split'，DOM 之前是 'edit'，
-  // 闸触发 —— 视觉上用户看到 split 的瞬间就是 50/50。
-  // settingsStore.update 是乐观写盘（缓存同步更新、IPC 异步），MutationObserver 作为
-  // microtask 在当前同步块之后才 drain；reset 写在这里是先于 _setDOM，便于阅读。
-  if (visualMode === 'split' && document.body.dataset.editorMode !== 'split') {
-    settingsStore.update({ splitRatio: 0.5 });
-  }
+  // Memory-2 / audit P0-4（每次打开 split 默认对半分）：视觉模式为 'split' 时
+  // 调 applySplitRatioResetIfEnteringSplit 把 settings.splitRatio 重置到 0.5。
+  // 旧实现用 `document.body.dataset.editorMode !== 'split'` 做闸 —— 但默认
+  // editorMode='split' 冷启动时 dataset 已是 'split'，闸永远为假，上次拖的 70%
+  // 在冷启动被恢复。改用 visualMode 决策：非 md 文件强制回落 'edit' 也不重置。
+  // drag 不持久化：mountSplitter.onDragEnd 是 noop，不写 store；rebalance 重算
+  // 走 initialSize 读 settingsStore.get('splitRatio')，因为重置在切 split 时
+  // 已落 0.5，所以「切到 split 后拖 → 拖到的 px 是当前会话内临时位置，
+  // 关闭后下次启动仍是 0.5」。
+  applySplitRatioResetIfEnteringSplit(visualMode, settingsStore, (msg) => showToast(msg, 'error', 3500));
 
   // editorToolbar.setMode 内部已 _setDOM 写 body[data-editor-mode] + 高亮按钮；
   // 不要再单独 dataset，否则两边写同一属性会产生「两次 setAttribute」的
@@ -1277,9 +1530,12 @@ function applyEditorMode(mode, opts) {
  */
 function updateStatusMode() {
   if (!els.statusMode) return;
-  const mode = state.editorMode
+  const rawMode = state.editorMode
     || window.api?.settingsSchema?.DEFAULT_SETTINGS?.editorMode
     || 'split';
+  // 非 md 文件没有预览 / 双栏视图，强制回落 edit（与 applyEditorMode 的视觉模式解析一致），
+  // 否则状态栏会显示「双栏」/「预览」却实际只能编辑，误导用户。
+  const mode = (state.currentFile && !state.currentFileIsMarkdown) ? 'edit' : rawMode;
   const labels = { preview: '预览', edit: '编辑', split: '双栏' };
   // 文字写到 #status-mode-label 子 span（chip 内的 SVG 图标保留）
   if (els.statusModeLabel) els.statusModeLabel.textContent = labels[mode] || mode;
@@ -1397,6 +1653,15 @@ function updateStatusScroll() {
         ? editor.getScrollProgress()
         : viewer.getScrollProgress();
     els.statusScroll.textContent = `${Math.round(progress * 100)}%`;
+    // 阅读进度条：progress 可能是 NaN（内容不足一屏、max 为 0），
+    // 这时没有可滚动进度，隐藏细线避免「空条」。有限且 > 0 时按百分比铺宽。
+    if (els.readingProgress) {
+      const finite = Number.isFinite(progress);
+      els.readingProgress.hidden = !finite || els.markdownBody.hidden;
+      if (finite) {
+        els.readingProgressBar.style.width = `${Math.min(100, Math.max(0, progress * 100))}%`;
+      }
+    }
   });
 }
 
@@ -1608,6 +1873,10 @@ function watchViewerHeading() {
         els.statusHeading.textContent = text;
         els.statusHeading.title = heading.text; // 鼠标悬停查看完整
         els.statusHeading.hidden = false;
+        // 章节切换时平滑淡入：移除类→强制 reflow→加回，重触发 CSS 动画。
+        els.statusHeading.classList.remove('is-updating');
+        void els.statusHeading.offsetWidth;
+        els.statusHeading.classList.add('is-updating');
       } else {
         els.statusHeading.textContent = '';
         els.statusHeading.title = '';
@@ -1615,6 +1884,50 @@ function watchViewerHeading() {
       }
     }
   });
+}
+
+/**
+ * 工具栏主按钮 hover 时浮现快捷键 chip（如 Ctrl+S / Ctrl+E）。
+ * 只读按钮上的 data-shortcut 属性，不改动按钮本身的 DOM；
+ * 提示框是挂在 document.body 的全局浮层（pointer-events:none，纯视觉、不挡 hover）。
+ */
+function setupShortcutHints() {
+  const toolbar = document.querySelector('.toolbar');
+  if (!toolbar) return;
+  const hint = document.createElement('div');
+  hint.className = 'shortcut-hint';
+  hint.setAttribute('aria-hidden', 'true');
+  hint.hidden = true;
+  document.body.appendChild(hint);
+
+  const render = (shortcut) =>
+    shortcut.split('+').map((k) => `<kbd>${k}</kbd>`).join('<span class="shortcut-hint-plus">+</span>');
+
+  const show = (btn) => {
+    const sc = btn.getAttribute('data-shortcut');
+    if (!sc) return;
+    hint.innerHTML = render(sc);
+    hint.hidden = false;
+    const r = btn.getBoundingClientRect();
+    const hr = hint.getBoundingClientRect();
+    let left = r.left + r.width / 2 - hr.width / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - hr.width - 8));
+    hint.style.left = `${left}px`;
+    hint.style.top = `${r.bottom + 6}px`;
+  };
+  const hide = () => { hint.hidden = true; };
+
+  toolbar.addEventListener('mouseover', (e) => {
+    const btn = e.target.closest('[data-shortcut]');
+    if (btn) show(btn);
+  });
+  toolbar.addEventListener('mouseout', (e) => {
+    const btn = e.target.closest('[data-shortcut]');
+    if (btn) hide();
+  });
+  // 窗口滚动 / 尺寸变化时收起，避免错位
+  window.addEventListener('scroll', hide, { passive: true });
+  window.addEventListener('resize', hide, { passive: true });
 }
 
 /**
@@ -1763,7 +2076,10 @@ async function save(opts = {}) {
     // audit fix (C1)：把「实际写盘 + 冲突处理 + 状态更新」整段包进 IIFE 赋值给
     // inFlightSave，try/finally 确保异常路径也清掉 sentinel。force_overwrite 的
     // 二次保存走 skipMtimeCheck=true，上面早退判断会放它进来重新写一次新 Promise。
-    inFlightSave = (async () => {
+    // 捕获本调用自己的 Promise，避免 force_overwrite 递归 save() 重写模块级
+    // inFlightSave 后，外层 `await inFlightSave`（line ~2148）读到 inner 已置 null 的哨兵，
+    // 导致外层 save() 错误返回 false（HIGH：强制覆盖写盘成功却报保存失败 / 关窗被拒）。
+    const savePromise = (async () => {
       // L1 fix (audit)：标记本 save 调用是否解锁了 preview 模式的只读，
       // finally 统一还原 —— 之前只在成功路径 + catch 路径 2 处还原，
       // discard_local 完成 / 文件外部修改后切走 / 各类早退 return false 路径
@@ -1801,12 +2117,12 @@ async function save(opts = {}) {
           if (result.error === 'FILE_CHANGED_EXTERNALLY') {
             const choice = await showConfirmDialog({
               title: '文件在外部被修改',
-              message: `「${targetName}」在你编辑期间被外部修改。\n\n如何处理？`,
+              message: `「${targetName}」在编辑期间被外部修改。请选择保留哪一份。`,
               icon: 'conflict',
               buttons: [
-                { value: 'cancel', label: '取消（保留本地）', variant: 'secondary' },
-                { value: 'discard_local', label: '放弃本地，使用外部版本', variant: 'secondary' },
-                { value: 'force_overwrite', label: '强制覆盖（保留我的版本）', variant: 'primary' },
+                { value: 'cancel', label: '取消', variant: 'secondary' },
+                { value: 'discard_local', label: '使用外部版本', variant: 'secondary' },
+                { value: 'force_overwrite', label: '保留我的版本', variant: 'primary' },
               ],
             });
             // dialog 期间用户切走 → 不再写任何 state（已经是新文件的 state）
@@ -2040,6 +2356,7 @@ async function save(opts = {}) {
         }
       }
     })();
+    inFlightSave = savePromise;
     // audit fix (Phase O-M4)：主路径也走 outer toast 决策，与 shared path 对称。
     // IIFE 内部不弹 success toast（line 1773 注释已说明），save() outer 在
     // silent=false + result.ok 为真值时统一弹一次「已保存」。shared path（line 1569-1574）
@@ -2049,7 +2366,7 @@ async function save(opts = {}) {
     // Phase N Q-fix：契约统一为 IIFE 返回 {ok, reason}（line 1798 / 各 catch 分支）。
     // 主路径 + silent=false + reason='STALE'（飞行期切文件）→ 弹「文件已切换，
     // 未保存到磁盘」提示用户，silent=false manual caller 不再被吞反馈。
-    const result = await inFlightSave;
+    const result = await savePromise;
     decideSaveToast(silent, result, showToast);
     return !!(result && result.ok);
   } finally {
@@ -2138,7 +2455,7 @@ async function openFile(file) {
   if (state.isDirty && state.currentFile && state.currentFile.path !== file.path) {
     const choice = await showConfirmDialog({
       title: '未保存的改动',
-      message: `当前文件「${state.currentFile.name}」有未保存的改动。\n\n打开「${file.name}」之前请选择如何处理。`,
+      message: `当前文件「${state.currentFile.name}」有未保存改动。打开「${file.name}」前请选择处理方式。`,
       icon: 'warning',
       buttons: [
         { value: 'cancel', label: '取消' },
@@ -2218,7 +2535,7 @@ async function openFile(file) {
     // 弃本地改动」，让用户明白这是 reload 而非切文件。
     const choice = await showConfirmDialog({
       title: '未保存的改动',
-      message: `当前文件「${state.currentFile.name}」有未保存的改动。\n\n重新加载会丢弃本地改动，如何处理？`,
+      message: `当前文件「${state.currentFile.name}」有未保存改动。重新加载会丢弃本地改动，请选择处理方式。`,
       icon: 'warning',
       buttons: [
         { value: 'cancel', label: '取消' },
@@ -2468,6 +2785,10 @@ function applyEntries(entries) {
     const sameDir = fileDir && state.currentDir && pathsEqual(fileDir, state.currentDir);
     const stillThere = list.some((e) => pathsEqual(e.path, state.currentFile.path));
     if (sameDir && !stillThere) {
+      // 非脏文件被外部删除：这里补一条提示。onFilesChanged 后续 `if (!state.currentFile) return`
+      // 会在本函数清掉 currentFile 后早退，导致「当前文件已删除」的反馈被吞掉
+      // （脏的那条路径由 rescue 接管并弹 rescue toast，不能让非脏分支静默消失）。
+      showToast('当前文件已被删除', 'warning');
       clearCurrentFile();
     }
   }
@@ -2643,9 +2964,18 @@ function buildBreadcrumb(relDir) {
  * 实际「恢复上次子目录」超出 v1 范围 —— 用户切目录时子目录状态丢失是可接受的；
  * 后续要做再加 settingsStore 持久化。
  */
-async function loadFileList() {
+/**
+ * 加载首屏文件列表。
+ *
+ * @param {Promise<{ok:boolean, entries?:Array, files?:Array, dir?:string, relDir?:string,
+ *   total?:number, hasMore?:boolean, error?:string}>|null} [prefetched]
+ *   audit R7b P1-21：bootstrap 在 settingsStore.load() 时就并飞的 listFiles
+ *   promise（已挂 .catch 兜底成 {ok:false}）。不传则现取 —— onDataDirChanged
+ *   等运行时路径行为不变。
+ */
+async function loadFileList(prefetched) {
   try {
-    const result = await window.api.listFiles();
+    const result = prefetched ? await prefetched : await window.api.listFiles();
     if (!result || !result.ok) {
       showToast(`加载文件列表失败：${result?.error || '未知错误'}`, 'error');
       return;
@@ -2653,13 +2983,86 @@ async function loadFileList() {
     state.currentDir = result.dir || '';
     state.currentRelDir = result.relDir || '';
     state.breadcrumb = buildBreadcrumb(state.currentRelDir);
-    applyEntries(result.entries || result.files || []);
+    // audit fix (R7a P1-20)：分页首屏。保留 hasMore / total / loadedCount
+    // 到 state 上，给 loadMoreFileList 续接用。
+    const page = result.entries || result.files || [];
+    state.entries = page;
+    state.files = page.filter((e) => e.entryType !== 'folder');
+    state.fileListTotal = Number.isFinite(result.total) ? result.total : page.length;
+    state.fileListHasMore = !!result.hasMore;
+    state.fileListLoadedCount = page.length;
+    fileList.setFiles(page);
+    updateFileCount();
+    renderLoadMoreButton();
     renderBreadcrumb();
     viewer.refreshCurrentDir();
   } catch (e) {
     console.error('[app] loadFileList 异常:', e);
     showToast(`加载文件列表失败：${e.message}`, 'error');
   }
+}
+
+/**
+ * audit fix (R7a P1-20)：拉分页后续页，追加到 state.entries / state.files，
+ * fileList.setFiles 全量重渲染。setFiles 每次都全量重建（虚拟滚动要在
+ * P1-15 之后才能 append-only），目前每次 loadMore 渲染成本随已加载条数线性
+ * 增长 —— 10000 文件 ≈ 50 次 loadMore × 200ms = 10s。生产上配合 P1-15
+ * 虚拟滚动后每次渲染 < 50ms。
+ */
+async function loadMoreFileList() {
+  if (!state.fileListHasMore) return;
+  try {
+    const result = await window.api.listFilesMore(state.fileListLoadedCount);
+    if (!result || !result.ok) {
+      showToast(`加载更多失败：${result?.error || '未知错误'}`, 'error');
+      return;
+    }
+    const more = result.entries || result.files || [];
+    state.entries = state.entries.concat(more);
+    state.files = state.files.concat(more.filter((e) => e.entryType !== 'folder'));
+    state.fileListHasMore = !!result.hasMore;
+    state.fileListLoadedCount += more.length;
+    fileList.setFiles(state.entries);
+    updateFileCount();
+    renderLoadMoreButton();
+  } catch (e) {
+    console.error('[app] loadMoreFileList 异常:', e);
+    showToast(`加载更多失败：${e.message}`, 'error');
+  }
+}
+
+/**
+ * 渲染"加载更多"按钮：hasMore=true 时在侧栏底部塞一个 <li>，点击 → loadMore。
+ * audit fix (R7a P1-20)：避免一次性吞 1w 文件 IPC；按钮语义比"滚动到底自动
+ * 加载"更直白（用户能感知「我点了 → 加载」的动作）。
+ */
+function renderLoadMoreButton() {
+  if (!els.fileList) return;
+  // 移除已存在的「加载更多」节点
+  const existing = els.fileList.querySelector('.file-list-load-more');
+  if (existing) existing.remove();
+  if (!state.fileListHasMore) return;
+  const li = document.createElement('li');
+  li.className = 'file-list-load-more';
+  // textContent 防 XSS（即便我们只插入静态文本）
+  const loaded = state.fileListLoadedCount || 0;
+  const total = state.fileListTotal || 0;
+  li.textContent = `加载更多（${loaded} / ${total}）`;
+  li.tabIndex = 0;
+  li.setAttribute('role', 'button');
+  li.setAttribute('aria-label', `加载更多文件，已加载 ${loaded} 共 ${total}`);
+  // 一次性 click 触发；不要在委托监听里登记（构造时已 addEventListener，
+  // 重建时旧 li 已被 replaceChildren 移走，无需 unbind）。
+  li.addEventListener('click', () => {
+    loadMoreFileList();
+  });
+  li.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      loadMoreFileList();
+    }
+  });
+  els.fileList.appendChild(li);
 }
 
 /**
@@ -2694,12 +3097,12 @@ async function withDataDirDirtyCheckHook(fn) {
 
     const choice = await showConfirmDialog({
       title: '未保存的改动',
-      message: `当前文件「${state.currentFile.name}」有未保存的改动。\n\n切换数据文件夹之前请选择如何处理。`,
+      message: `当前文件「${state.currentFile.name}」有未保存改动。切换数据文件夹前请选择处理方式。`,
       icon: 'warning',
       buttons: [
         { value: 'cancel', label: '取消', variant: 'secondary' },
-        { value: 'discard', label: '放弃改动，继续', variant: 'danger' },
-        { value: 'save_first', label: '保存并继续', variant: 'primary' },
+        { value: 'discard', label: '放弃改动', variant: 'danger' },
+        { value: 'save_first', label: '保存', variant: 'primary' },
       ],
     });
     if (choice === 'cancel' || choice == null) return false;
@@ -2852,29 +3255,50 @@ function applyReaderSettings(partial) {
 let lastSortApplied = null;
 let lastAutosaveMs = null;
 function syncBehaviorPrefsUI(settings) {
-  // 1. 排序按钮态 + fileList 重排
+  // 1. 排序下拉态 + fileList 重排
   // audit fix (CQ-MED-9)：未知 fileListSort 走 schema 第一项作为兜底，不再硬编码 'name'。
   const sort = FILE_LIST_SORT_VALUES.includes(settings.fileListSort)
     ? settings.fileListSort
     : DEFAULT_FILE_LIST_SORT;
-  // 用 schema 第一项作为「按名称」按钮的值、第二项作为「按修改时间」按钮的值 —— 与
-  // SETTINGS_UI_OPTIONS.fileListSort 的排列顺序保持一致；加新排序选项时只要在
-  // schema 末尾追加即可，无需再改 renderer 字面量。
-  const nameSortValue = FILE_LIST_SORT_VALUES[0] || 'name';
-  const mtimeSortValue = FILE_LIST_SORT_VALUES[1] || 'mtime-desc';
   if (sort !== lastSortApplied) {
     lastSortApplied = sort;
-    if (els.btnSortName) {
-      const isName = sort === nameSortValue;
-      els.btnSortName.classList.toggle('is-active', isName);
-      els.btnSortName.setAttribute('aria-pressed', isName ? 'true' : 'false');
+    // 触发器 label / title + 菜单项 is-active —— 只在 sort 真变时跑。
+    // 触发器的 is-active 不在这里管：它跟开合状态走（开 → 0，关 → 1），
+    // 见下面 if 块外的「始终跑」分支 —— 否则「打开又关闭不改 sort」会让
+    // trigger 永久失去 is-active 高亮（修这个 bug 后才允许 aria-expanded=
+    // true 与 is-active 并存被 CSS 一次合并，无需手动互斥）。
+    const opt = FILE_LIST_SORT_OPTIONS.find((o) => o.value === sort);
+    if (els.btnSortTrigger) {
+      if (els.sidebarSortTriggerLabel && opt) {
+        // 「排序：」前缀给控件身份，opt.label 给出当前状态 —— 一眼能看出
+        // 「这是 sort 控件 + 当前选的是 name」。避免纯按值（"按名称"）让控件
+        // 失去语义，纯按控件名（"排序"）又丢掉当前状态。
+        els.sidebarSortTriggerLabel.textContent = '排序：' + opt.label;
+      }
+      // title 同步成当前排序 + 方向 hint —— 与菜单项 .sidebar-sort-menu-text 视觉一致
+      els.btnSortTrigger.title = opt
+        ? `${opt.label}（${opt.hint}）· 点击切换`
+        : '点击切换排序方式';
     }
-    if (els.btnSortMtime) {
-      const isMtime = sort === mtimeSortValue;
-      els.btnSortMtime.classList.toggle('is-active', isMtime);
-      els.btnSortMtime.setAttribute('aria-pressed', isMtime ? 'true' : 'false');
+    // 菜单项 is-active：高亮当前选中 + 加 aria-checked 给读屏
+    if (els.sidebarSortMenu) {
+      const items = els.sidebarSortMenu.querySelectorAll('.sidebar-sort-menu-item');
+      items.forEach((item) => {
+        const active = item.dataset.sort === sort;
+        item.classList.toggle('is-active', active);
+        item.setAttribute('aria-checked', active ? 'true' : 'false');
+      });
     }
     fileList?.setSort(sort);
+  }
+  // Trigger is-active 始终跟 aria-expanded 反向 —— 与 sort 变化无关。
+  // 关键修复：原版把这行放在 sort 变化的 if 块内，导致「打开菜单→点击外部
+  // 关闭」但 sort 未变时 sync 跳过整个块，trigger 永久丢失 is-active 高亮。
+  // 现在 cheap O(1) toggle 每次 settings 变更都跑（theme / palette 也会触发 sync），
+  // 但代价可忽略；不变量是「trigger 关时始终高亮当前排序」。
+  if (els.btnSortTrigger) {
+    const isOpen = els.btnSortTrigger.getAttribute('aria-expanded') === 'true';
+    els.btnSortTrigger.classList.toggle('is-active', !isOpen);
   }
 
   // 2. 自动保存 chip 文案 + （关 → 取消 pending；开 → 等下次 onChange 重新调度）
@@ -3024,17 +3448,25 @@ function subscribeIpc() {
   // 已经把 lastFilesSnapshot 推进到新值（详见 main/fs-watcher.js updateSnapshot
   // line ~113），下一次 2s 轮询会判定「无变化」不再 emit，侧栏永久性 stale，
   // 直到发生另一次无关的磁盘变化才恢复。
-  let fsHandlerToken = 0;
-  let inFlightToken = 0;
+  // audit fix (P1-4)：改用 makeLock() 闭包封装「check-and-set」原子操作。
+  // 旧代码 `++fsHandlerToken; if (inFlightToken !== 0) return; inFlightToken = myToken`
+  // 自增和 SET 之间是 microtask 窗口：burst 50 events 时多个 callback 排在同
+  // 一 microtask queue，每个都看到 inFlightToken === 0 → 全部过闸 → handler
+  // 并发跑（applyEntries 双跑、scanDir 双发、UI 闪烁）。tryClaim 是同步
+  // 原子操作，burst 场景只有第一次成功，其余返 null。
+  const fsLock = makeLock();
   let pendingRescanRel = null;
   const FS_HANDLER_WATCHDOG_MS = 8000;
   ipcUnsubscribes.push(window.api.onFilesChanged(async (payload) => {
-    const myToken = ++fsHandlerToken;
+    // audit fix (P1-4)：tryClaim 是同步原子操作，burst 场景只有第一个成功，
+    // 其余返 null → 直接 return。取代旧 `++fsHandlerToken; if (inFlightToken
+    // !== 0) return; inFlightToken = myToken;` 的三行非原子序列。
+    const myToken = fsLock.tryClaim();
     // 入口解构 payload —— 即便被挡也记下 relDir 用于补扫。
     const { entries, error, relDir } = payload || {};
     const payloadRel = typeof relDir === 'string' ? relDir : '';
     // 上一 handler 仍在飞？记下要补扫的 relDir 后直接 return。
-    if (inFlightToken !== 0) {
+    if (myToken === null) {
       console.debug('[app] fs:changed burst dropped (handler in flight)');
       // Round 13 fix (H11)：只有新事件与当前显示目录相关时才覆盖 pendingRescanRel。
       // 旧版无条件 `pendingRescanRel = payloadRel`（以及下方 inFlight 路径的
@@ -3045,26 +3477,24 @@ function subscribeIpc() {
       }
       return;
     }
-    inFlightToken = myToken;
     pendingRescanRel = payloadRel;
     let watchdogTimer = null;
     try {
       watchdogTimer = setTimeout(() => {
         // 看门狗：仅当当前飞的仍是「我的」时强制放行；新 handler 已经进入
         // 的话不动它的锁。
-        if (inFlightToken !== myToken) return;
+        if (fsLock.current() !== myToken) return;
         console.warn('[app] fs-watcher 回调看门狗触发，强制放行（handler 卡住超过 8s）');
         // 审计修复 (Round 11 P0-2)：释放锁 + 主动补扫。
         // 旧实现只 warn 不释放 —— 在 dialog 单槽永久卡死等罕见情况下，
-        // 当前 handler 的 finally 永远跑不到 → inFlightToken 永远 > 0 →
-        // 后续所有 fs:changed 都被入口 if (inFlightToken !== 0) 吞掉。
-        // 现在 watchdog 直接解锁 + 记下补扫；如果原 handler finally 后来又跑，
-        // token 已被覆盖，原 finally 的 if (inFlightToken === myToken) 守卫 noop，
-        // 不会释放新 handler 的锁。
-        if (inFlightToken === myToken) {
+        // 当前 handler 的 finally 永远跑不到 → 后续所有 fs:changed 都被
+        // 入口 if (myToken === null) 吞掉。现在 watchdog 直接解锁 + 记下
+        // 补扫；如果原 handler finally 后来又跑，release(myToken) 因 token
+        // 不匹配返 false，不动新 handler 的锁。
+        if (fsLock.current() === myToken) {
           const relToRescan = pendingRescanRel;
           pendingRescanRel = null;
-          inFlightToken = 0;
+          fsLock.release(myToken);
           if (relToRescan && relToRescan === state.currentRelDir) {
             window.api.scanDir(relToRescan).then((r) => {
               if (r && r.ok && Array.isArray(r.entries)) applyEntries(r.entries);
@@ -3236,11 +3666,11 @@ function subscribeIpc() {
           // 脏：让用户选择
           const choice = await showConfirmDialog({
             title: '文件在外部被修改',
-            message: `「${updated.name}」在外部被修改，但你有未保存的本地改动。\n\n选择保留哪一份？`,
+            message: `「${updated.name}」被外部修改，且当前有未保存改动。请选择保留哪一份。`,
             icon: 'conflict',
             buttons: [
-              { value: 'cancel', label: '取消（暂不处理）', variant: 'secondary' },
-              { value: 'keep_local', label: '保留我的', variant: 'secondary' },
+              { value: 'cancel', label: '稍后处理', variant: 'secondary' },
+              { value: 'keep_local', label: '保留我的版本', variant: 'secondary' },
               { value: 'use_external', label: '使用外部版本', variant: 'primary' },
             ],
           });
@@ -3251,7 +3681,8 @@ function subscribeIpc() {
           // 现在 null 单独识别为「对话框被拒」，不做任何状态推进，让下一次
           // fs.watch 事件再次弹出对话框。
           if (choice === 'use_external') {
-            const ok = await reloadCurrentFileFromDisk(updated);
+            // force：用户明确选择丢弃本地改动、采用外部版本，绕过 dirty 守门
+            const ok = await reloadCurrentFileFromDisk(updated, { force: true });
             if (ok) showToast('已切换到外部版本', 'info', 1800);
           } else if (choice === 'keep_local') {
             // 忽略外部修改：把 lastSavedMtimeMs 推进到最新外部 mtime，
@@ -3281,7 +3712,7 @@ function subscribeIpc() {
       // 的 finally 仍会运行 `if (inFlightFilesChanged) inFlightFilesChanged
       // = false`，把新 handler 刚拿到的锁给释放掉 —— 长对话框场景下「锁」
       // 实际退化为无保护。token 校验：旧 handler finally 检查
-      // `inFlightToken === myToken`，不匹配直接跳过释放；新 handler 的锁
+      // `fsLock.current() === myToken`，不匹配直接跳过释放；新 handler 的锁
       // 由它自己的 finally 处理。
       //
       // 注意：不能在 finally 里直接 return —— eslint no-unsafe-finally 规则
@@ -3289,7 +3720,7 @@ function subscribeIpc() {
       // finally 的返回值，覆盖真实逻辑。这里 finally 所在 try 没有显式
       // return（applyEntries / setExternalContent 等副作用），但用 if 包裹
       // 释放路径更稳健：只在自己是当前 in-flight 时才走释放 + 补扫。
-      if (inFlightToken === myToken) {
+      if (fsLock.current() === myToken) {
         // 释放前先做 F2 补扫（FS-F2）：在飞期间 main 端 fs-watcher 已经把
         // lastFilesSnapshot 推进到新值（main/fs-watcher.js#updateSnapshot
         // line ~113），下一次 2s 轮询会判定「无变化」不再 emit → 必须主动
@@ -3298,7 +3729,7 @@ function subscribeIpc() {
         // 没记 pendingRescanRel（即没有被挡的情况），这里直接跳过补扫。
         const relToRescan = pendingRescanRel;
         pendingRescanRel = null;
-        inFlightToken = 0; // 先释放锁，让下一个事件可以进入
+        fsLock.release(myToken); // 先释放锁，让下一个事件可以进入
         if (relToRescan && relToRescan === state.currentRelDir) {
           // 异步补扫，不 await —— finally 不能阻塞 handler 退出。补扫失败
           // 不影响 inFlightToken 释放（已经置 0），下次 fs:changed 会自然推进。
@@ -3316,12 +3747,13 @@ function subscribeIpc() {
   }));
 
   // 菜单命令
-  ipcUnsubscribes.push(window.api.onMenuCommand((cmd) => {
-    if (cmd === 'menu:toggle-theme') {
-      cycleTheme();
-    } else if (cmd === 'menu:settings') {
-      openSettingsDialog();
-    }
+  // P2-3：拆 onMenuCommand → onThemeToggle + onSettings 各挂 1 个 listener。
+  // 每个 on* 严格 1 个 listener，与「一个 on* 一个 channel」1:1 对应。
+  ipcUnsubscribes.push(window.api.onThemeToggle(() => {
+    cycleTheme();
+  }));
+  ipcUnsubscribes.push(window.api.onSettings(() => {
+    openSettingsDialog();
   }));
 
   // 置顶状态变化（来自托盘菜单）
@@ -3485,7 +3917,7 @@ async function promptDataDirFallback(payload) {
   try {
     choice = await showConfirmDialog({
       title: '数据文件夹不可访问',
-      message: `之前设置的数据文件夹无法访问：\n\n${saved}\n\n可能原因：所在磁盘已卸载 / 移动硬盘离线 / OneDrive 同步未完成 / 文件夹被删除。\n\n当前已临时使用默认文件夹 ${defaultDir}，请选择下一步。`,
+      message: `之前设置的数据文件夹无法访问：\n\n${saved}\n\n可能原因：所在磁盘已卸载、移动硬盘离线、OneDrive 同步未完成或文件夹被删除。\n\n当前已临时使用默认文件夹 ${defaultDir}，请选择下一步。`,
       icon: 'warning',
       buttons: [
         { value: 'reset', label: '恢复默认', variant: 'primary' },
@@ -3598,13 +4030,10 @@ function mountSplitter() {
   const MIN_EDITOR_WIDTH = 280; // 与 05-sidebar.css minmax 一致
   const MIN_VIEWER_WIDTH = 200; // 阅读视图下限
 
-  let currentEditorWidth = 0;
-
   function clampEditorWidth(width) {
     const frSpace = getEditorFrSpace();
     const maxW = Math.max(MIN_EDITOR_WIDTH, frSpace - MIN_VIEWER_WIDTH);
     const clamped = Math.max(MIN_EDITOR_WIDTH, Math.min(width, maxW));
-    currentEditorWidth = clamped;
     return clamped;
   }
 
@@ -3616,31 +4045,20 @@ function mountSplitter() {
     return els.editorPane.getBoundingClientRect().width;
   }
 
-  function getCurrentRatio() {
-    const frSpace = getEditorFrSpace();
-    if (frSpace <= 0) return 0.5;
-    return clampSplitRatio(currentEditorWidth / frSpace);
-  }
-
   const splitter = createSplitter({
     handle: els.splitter,
     axis: 'x',
     getSize: getEditorWidth,
     setSize: setEditorWidth,
     clampSize: clampEditorWidth,
-    // 工厂拖完一次后会调 onDragEnd(clampSize(getSize())) —— 已 clamp 的 px。
-    // 我们反算 ratio 持久化：settings schema 仍是 splitRatio (0..1)，内部用 px。
-    // audit #1：写盘失败要让用户看到 —— 否则下次启动布局错乱无迹可循。
-    onDragEnd: () => {
-      const ratio = getCurrentRatio();
-      settingsStore.update({ splitRatio: Number(ratio.toFixed(3)) }).catch((e) => {
-        showToast(`布局比例保存失败：${e?.message || '未知错误'}`, 'error', 3500);
-      });
-    },
-    // mount 时按 saved ratio 计算 editor 宽度（与拖动走同一道 clamp 闸）。
-    // 每都从 settingsStore 重读 —— 这样切换到双栏时 onChange 写入的 0.5
-    // 会被 MutationObserver 触发的 rebalance 立即拾取，避免停在旧 ratio。
-    initialSize: () => getEditorFrSpace() * clampSplitRatio(settingsStore.get('splitRatio')),
+    // Memory-2：drag 比例仅本会话内有效。--w-editor 已 inline 更新，不落盘。
+    // 下次 mount / rebalance / mode 切回 split 由 initialSize=0.5 接管复位。
+    // splitRatio schema 字段保留（resetLayout 仍写 0.5），mount 只读 frSpace，不读 store。
+    onDragEnd: () => {},
+    // Memory-2 兜底：mount 与 rebalance（mode 切换 / AI panel 开合触发的 MO）都
+    // 从 frSpace 算 50%，drag override 在下次 rebalance 时被刷回 50/50。
+    // 不读 settingsStore —— 上次会话拖的 0.7 不会被恢复。
+    initialSize: () => getEditorFrSpace() * 0.5,
   });
 
   // AI 面板 / 视图模式切换时 fr_space 也会变（+ AI 360 + ai-splitter 4），
@@ -3654,7 +4072,18 @@ function mountSplitter() {
   // 掉阅读视图」）。focus 模式不监听 —— editor 被隐藏、--w-editor 视觉上
   // 不生效，监听反而触发无意义的写入。
   if (typeof MutationObserver !== 'undefined' && document.body) {
-    const layoutAttrsObserver = new MutationObserver(() => splitter.rebalance());
+    // AI 面板多路径兜底（Memory-2 + P1-24）：除了 handleAiDiffOpenChange 显式
+    // 调 resetAiPanelWidthToHalf()，这里把 reset 也挂在 data-ai-diff-open→
+    // 'true' 的边沿上 —— 任何写 body[data-ai-diff-open]="true" 的路径都会
+    // 触发复位（与显式调用幂等）。drag 不落盘（见 mountAiSplitter.onDragEnd），
+    // 再次打开自然回到对半分。
+    let prevAiOpen = document.body.dataset.aiDiffOpen === 'true';
+    const layoutAttrsObserver = new MutationObserver(() => {
+      splitter.rebalance();
+      const curAiOpen = document.body.dataset.aiDiffOpen === 'true';
+      if (curAiOpen && !prevAiOpen) resetAiPanelWidthToHalf();
+      prevAiOpen = curAiOpen;
+    });
     layoutAttrsObserver.observe(document.body, {
       attributes: true,
       attributeFilter: ['data-ai-diff-open', 'data-editor-mode'],
@@ -3803,7 +4232,9 @@ function mountSidebarSplitter() {
  * AI 面板的 grid-template 是 minmax(220px, var(--w-ai, 360px))，
  * 所以 MIN_WIDTH=220（与 CSS 一致）+ MAX_WIDTH=720（schema 上限）。
  *
- * 持久化到 settingsStore.aiWidth（px），下次启动恢复。
+ * Memory-2：drag 不持久化（--w-ai inline 更新即可），每次打开 AI 面板
+ * 都默认对半分（initialSize 与 handleAiDiffOpenChange → resetAiPanelWidthToHalf
+ * 同源计算）。aiWidth schema 字段保留（resetLayout 仍写 null），mount 不读 store。
  *
  * 设计要点：splitter 仅在 body[data-ai-diff-open="true"] 时显示（CSS 控制），
  * 但拖拽逻辑与 splitter 是否显示无关 —— 启动后立即挂好 listener，
@@ -3830,13 +4261,17 @@ function mountAiSplitter() {
   }
 
   function getInitialWidth() {
-    const saved = settingsStore.get('aiWidth');
-    if (Number.isFinite(saved) && saved >= MIN_WIDTH && saved <= MAX_WIDTH) {
-      return saved;
-    }
-    const raw = getComputedStyle(document.documentElement).getPropertyValue('--w-ai').trim();
-    const n = parseFloat(raw);
-    return Number.isFinite(n) ? n : 360;
+    // Memory-2：AI 面板首次显示 / 重新显示默认对半分。与 resetAiPanelWidthToHalf
+    // 同源计算（sidebar + 2×splitter 扣出可用区，一半后 clamp 到 [MIN, MAX]）。
+    // 不读 settingsStore —— 上次会话拖过的 aiWidth 不会被恢复。
+    if (!els.appShell) return 360;
+    const containerW = els.appShell.getBoundingClientRect().width;
+    if (!containerW) return 360;
+    const sidebarW = getSidebarWidth();
+    const fixedCols = sidebarW + 4 + 4; // sidebar + sb-splitter + ai-splitter
+    const available = Math.max(1, containerW - fixedCols);
+    const half = Math.round(available * 0.5);
+    return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, half));
   }
 
   /** AI 面板未打开时整个命中区禁用 —— 避免在 AI 关闭时拖出幽灵宽度 */
@@ -3872,13 +4307,11 @@ function mountAiSplitter() {
     clampSize: clampAiWidth,
     initialSize: getInitialWidth,
     getDragSign,
-    // audit #1：持久化失败要让用户看到 —— 下次启动 AI 面板宽度丢失、用户不知情。
-    onDragEnd: () => {
-      const finalW = clampAiWidth(getAiPx());
-      settingsStore.update({ aiWidth: Math.round(finalW) }).catch((e) => {
-        showToast(`AI 面板宽度保存失败：${e?.message || '未知错误'}`, 'error', 3500);
-      });
-    },
+    // Memory-2：drag 仅本会话有效，--w-ai 已 inline 更新，不落盘。
+    // 下次打开 AI 面板由 handleAiDiffOpenChange → resetAiPanelWidthToHalf 接管
+    // （mountSplitter 里的 layoutAttrsObserver 也会在 data-ai-diff-open→true 边沿兜底，
+    // 与显式调用幂等）。
+    onDragEnd: () => {},
     hitZone: {
       radius: HIT_RADIUS,
       distanceTo: distanceToSplitter,
@@ -3926,7 +4359,23 @@ async function bootstrap() {
   // 0. 应用图标：data URL 注入是同步的，挂载点已存在 → 立刻跑。
   // 即使后续设置加载失败，左上角图标也能显示，UI 不至于看着「没起来」。
   mountAppIcon();
+  // 0.5 P2-9（audit C-4）：join 模块 eval 时已发起的 CM6 fetch（_heavyModules，
+  // 见文件顶部），实例化编辑器。必须在任何事件接线（IPC / 快捷键 / 文件列表
+  // 回调可能触发 openFile / save，都 dereference editor）之前完成。
+  const { MarkdownEditor, EditorView } = await _heavyModules;
+  EditorViewCtor = EditorView;
+  _instantiateEditor(MarkdownEditor);
   // 1. 加载并应用设置
+  // audit fix (R7b P1-21)：settings load 与首屏文件列表扫描并飞。
+  // listFiles 是主进程侧独立 IPC（main 自己持有 dataDir，不依赖 renderer 先把
+  // settings 拉下来），两个 IPC round-trip 重叠后启动耗时从 t_settings + t_scan
+  // 降到 max(t_settings, t_scan)。渲染顺序不变：settings 应用完（含 fileListSort）
+  // 才 setFiles，避免「先按默认 name 排序首绘、settings 到位再重排」的闪烁。
+  // prefetch 提前挂 .catch：即便 listFiles 秒拒，也不会在步骤 6 await 之前
+  // 变成 unhandled rejection。
+  const fileListPrefetch = (window.api && typeof window.api.listFiles === 'function')
+    ? window.api.listFiles().catch((e) => ({ ok: false, error: (e && e.message) || String(e) }))
+    : null;
   await settingsStore.load();
   // 迁移：旧版的 'auto' 主题已不再支持，统一收敛到 'dark'，避免 UI 状态与磁盘数据不一致
   if (settingsStore.get('theme') === 'auto') {
@@ -3957,6 +4406,12 @@ async function bootstrap() {
       lastAutosaveMs = null;
     }
     syncBehaviorPrefsUI(event.settings);
+    // P2-23：AI 配置（Base URL / API Key / Model）变更后，把最新配置态推给 AI
+    // 面板，placeholder 立即从「未配置」切到「描述修改」（或反之）。开 dock 时
+    // controller 也会重读，所以 dock 打开后再改 settings 也能正确显示。
+    if (ai && typeof ai.refreshConfigured === 'function') {
+      ai.refreshConfigured();
+    }
   });
   // 聚焦模式初始可见性（持久化在 settingsStore.focusMode，默认 false）
   applyFocusMode(!!settingsStore.get('focusMode'));
@@ -3994,9 +4449,17 @@ async function bootstrap() {
       resetDataFolder();
     });
   }
-  if (els.btnNewFile) {
-    els.btnNewFile.addEventListener('click', () => {
-      fileOps.createNewFile();
+  // 空状态 CTA（audit P2-25）：用户首次打开应用 / 数据文件夹为空时，
+  // 空状态是仅有的引导窗口。让 CTA 走与右键菜单「新建文件」/ Ctrl+N 完全相同的入口
+  // （fileOps.createNewFile），行为一致，避免多路径漂移。
+  //
+  // 走事件委托到 emptyElement 外层 —— 不能直接 addEventListener 到 button：
+  // markdown-viewer.js 的 showUnsupportedFile / _resetEmptyState 会 innerHTML
+  // 重写 emptyElement，原 button 被 detached，新 button 没有 listener 了。
+  if (els.emptyState) {
+    els.emptyState.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('#empty-state-new-btn');
+      if (btn) fileOps.createNewFile();
     });
   }
 
@@ -4016,10 +4479,136 @@ async function bootstrap() {
       showToast(`排序切换失败：${e.message}`, 'error');
     });
   };
-  // audit fix (CQ-MED-9)：按钮 → 排序值的映射从 schema 派生，不再硬编码 'name'/'mtime-desc'。
-  // 顺序与 SETTINGS_UI_OPTIONS.fileListSort 一致；增删排序方式时只需改 schema。
-  els.btnSortName?.addEventListener('click', () => setFileListSort(FILE_LIST_SORT_VALUES[0] || 'name'));
-  els.btnSortMtime?.addEventListener('click', () => setFileListSort(FILE_LIST_SORT_VALUES[1] || 'mtime-desc'));
+  // sort 下拉开关 + 菜单点击委派。
+  // 设计：触发器点击 → 切 aria-expanded + hidden；菜单项点击 → 写 settings + 自动关闭菜单。
+  // 点击外部 / Escape → 关闭（focus-trap-friendly：恢复 focus 到触发器）。
+  // 走事件委托（一个 click listener 管所有菜单项），加新排序只要往 SETTINGS_UI_OPTIONS
+  // 与 ul 里加项即可，无需改这里。
+  const closeSortMenu = () => {
+    if (!els.btnSortTrigger || !els.sidebarSortMenu) return;
+    els.btnSortTrigger.setAttribute('aria-expanded', 'false');
+    els.sidebarSortMenu.hidden = true;
+    // sync 内部读 aria-expanded 决定 trigger is-active —— 单一真相源，避免
+    // 「closeSortMenu 自己管 is-active + sync 也管」的重复路径。
+    syncBehaviorPrefsUI(settingsStore.getAll());
+  };
+  const openSortMenu = () => {
+    if (!els.btnSortTrigger || !els.sidebarSortMenu) return;
+    els.btnSortTrigger.setAttribute('aria-expanded', 'true');
+    els.sidebarSortMenu.hidden = false;
+    // open 也调 sync：让 trigger is-active 跟着 aria-expanded 反向（关时
+    // is-active=true，开时 =false）；这里不手动改 class，统一交给 sync。
+    syncBehaviorPrefsUI(settingsStore.getAll());
+  };
+  const toggleSortMenu = () => {
+    const isOpen = els.btnSortTrigger?.getAttribute('aria-expanded') === 'true';
+    if (isOpen) closeSortMenu();
+    else openSortMenu();
+  };
+  // audit fix：菜单项键盘导航辅助函数。focusMenuItem('first' | 'last' | value)
+  // 把焦点送到指定菜单项；focusMenuItemRelative(current, delta) 按 delta=±1
+  // 循环到相邻项。菜单项 tabindex="-1"，浏览器 Tab 顺序跳过 → 必须靠这些
+  // helper 显式落焦，否则键盘用户开了菜单进不去。
+  const getMenuItems = () =>
+    els.sidebarSortMenu
+      ? Array.from(els.sidebarSortMenu.querySelectorAll('.sidebar-sort-menu-item'))
+      : [];
+  const focusMenuItem = (which) => {
+    const items = getMenuItems();
+    if (items.length === 0) return;
+    let target;
+    if (which === 'first') target = items[0];
+    else if (which === 'last') target = items[items.length - 1];
+    else target = items.find((i) => i.dataset.sort === which) || items[0];
+    target.focus();
+  };
+  const focusMenuItemRelative = (current, delta) => {
+    const items = getMenuItems();
+    if (items.length === 0) return;
+    const idx = items.indexOf(current);
+    if (idx < 0) return;
+    const next = (idx + delta + items.length) % items.length;
+    items[next].focus();
+  };
+
+  els.btnSortTrigger?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSortMenu();
+  });
+  // audit fix：触发器上 ArrowDown / ArrowUp / Enter / Space 的键盘开启语义。
+  // menu 项 tabindex="-1" → 浏览器 Tab 顺序跳过它们，鼠标点击能进 menu，
+  // 但键盘用户开了菜单后进不去 —— 必须从 trigger 上提供「打开 + 落焦第一/末项」
+  // 的入口（ARIA menu 规范）。openSortMenu 后 focus 第一项（按 ↓）/ 最后项
+  // （按 ↑），与原生 <select> / dropdown 一致。
+  els.btnSortTrigger?.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (els.btnSortTrigger.getAttribute('aria-expanded') === 'true') return;
+      openSortMenu();
+      focusMenuItem('first');
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (els.btnSortTrigger.getAttribute('aria-expanded') === 'true') return;
+      openSortMenu();
+      focusMenuItem('last');
+    }
+  });
+  // 菜单项点击：委派到 ul —— 避免给每个 li 单独挂闭包，加新项 0 改 JS。
+  // 注意：当前排序的项点击也算"切换"（setFileListSort 内部判断 settings 一致则 no-op），
+  // 但点击仍然关闭菜单 —— 让菜单始终点击项后退出，符合「下拉=瞬时切换」的预期。
+  els.sidebarSortMenu?.addEventListener('click', (e) => {
+    const item = e.target.closest('.sidebar-sort-menu-item');
+    if (!item || !els.sidebarSortMenu.contains(item)) return;
+    const value = item.dataset.sort;
+    if (!value) return;
+    setFileListSort(value);
+    closeSortMenu();
+    // 切完后把 focus 送回触发器 —— 让键盘用户继续按 Enter 可再次打开。
+    els.btnSortTrigger?.focus();
+  });
+  // 菜单项键盘导航：ArrowDown/Up 在项之间循环，Home/End 跳首/末，Enter/Space
+  // 激活当前 focus 的项；Escape 已在 document keydown 统一处理。
+  // keydown 委派到 ul —— 不给每个 li 单独挂闭包。
+  els.sidebarSortMenu?.addEventListener('keydown', (e) => {
+    const item = e.target.closest('.sidebar-sort-menu-item');
+    if (!item || !els.sidebarSortMenu.contains(item)) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      focusMenuItemRelative(item, +1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      focusMenuItemRelative(item, -1);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      focusMenuItem('first');
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      focusMenuItem('last');
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      const value = item.dataset.sort;
+      if (!value) return;
+      setFileListSort(value);
+      closeSortMenu();
+      els.btnSortTrigger?.focus();
+    }
+  });
+  // 点击下拉外部 → 关闭。监听 document 而不是 ul/容器，因为下拉是浮层，
+  // 任何 sidebar 外的点击（编辑器、工具栏、状态栏）都该关。
+  document.addEventListener('click', (e) => {
+    if (!els.btnSortTrigger || !els.sidebarSortDropdown) return;
+    if (els.sidebarSortDropdown.contains(e.target)) return; // 内部点击已处理
+    if (els.btnSortTrigger.getAttribute('aria-expanded') === 'true') closeSortMenu();
+  });
+  // Escape 关闭 + 焦点回触发器：键盘用户的标准逃生路径。
+  // 仅在菜单打开时拦截 —— 避免拦下其他 Escape 行为（关闭 dialog / 退出全屏）。
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (els.btnSortTrigger?.getAttribute('aria-expanded') !== 'true') return;
+    e.stopPropagation();
+    closeSortMenu();
+    els.btnSortTrigger?.focus();
+  });
   if (els.toolbarAutosave) {
     // 二态切换：点击在「关 (0)」和「开（恢复上次非零值）」之间翻转。
     // audit fix (renderer-M5)：之前固定 500ms，会把用户在设置里调过的
@@ -4053,12 +4642,15 @@ async function bootstrap() {
   // 5.5 heading 联动：把当前 heading 同步到状态栏面包屑
   watchViewerHeading();
 
+  // 5.5b 工具栏主按钮 hover 浮现快捷键 chip
+  setupShortcutHints();
+
   // 5.6 AI 修改：侧栏底部按钮 + 控制器初始化 + 面板挂载
   // ai 需要 settingsStore.getAll()，所以必须在 settings 加载完（步骤 1）之后才创建。
   mountAiPanel();
 
-  // 6. 加载文件列表
-  await loadFileList();
+  // 6. 加载文件列表（R7b P1-21：消费步骤 1 并飞的 prefetch，通常已就绪）
+  await loadFileList(fileListPrefetch);
 
   // 7. 装载右键菜单（阅读视图 + 编辑器）
   mountViewerContextMenu();
@@ -4113,10 +4705,10 @@ async function bootstrap() {
       if (state.isDirty && state.currentFile && state.currentFile.path) {
         const choice = await showConfirmDialog({
           title: '未保存的改动',
-          message: `当前文件「${state.currentFile.name}」有未保存的改动。\n\n重载窗口之前请选择如何处理。`,
+          message: `当前文件「${state.currentFile.name}」有未保存改动。重新加载窗口前请选择处理方式。`,
           icon: 'warning',
           buttons: [
-            { value: 'cancel', label: '取消', variant: 'primary' },
+            { value: 'cancel', label: '取消' },
             { value: 'discard', label: '放弃改动', variant: 'danger' },
             { value: 'save', label: '保存', variant: 'primary' },
           ],
@@ -4141,6 +4733,19 @@ async function bootstrap() {
     // closeCurrentFile() 内部已经处理「未保存改动」三选一对话框 + 同步 dirty；
     // 无文件时该函数内部直接 return，不会弹空对话框。
     onCloseFile: () => closeCurrentFile(),
+    // 剪切 / 复制 / 粘贴侧栏选中的条目。仅侧栏聚焦时由 shortcuts 层触发
+    // （编辑器内让给 CM6、阅读视图让给原生文本复制），见 src/shortcuts.js。
+    onCut: () => {
+      const entry = fileList.getActiveEntry && fileList.getActiveEntry();
+      if (entry) cutEntry(entry);
+    },
+    onCopy: () => {
+      const entry = fileList.getActiveEntry && fileList.getActiveEntry();
+      if (entry) copyEntry(entry);
+    },
+    onPaste: () => {
+      pasteToCurrentDir();
+    },
   });
 
   // 注意：原 beforeunload 监听已删除（P2-11）。
@@ -4236,6 +4841,23 @@ bootstrap().catch(err => {
   // audit fix (3.4)：原 boot-error 兜底只在 window.api 缺失时生效，
   // IPC 抛错 / settings 加载失败 等会让 renderer 卡空白。这里把错误显示到
   // boot-error 元素 + 兜底 toast，让用户至少能看到原因。
+  //
+  // boot-error 生命周期（audit P2-31 文档化）：
+  //   1. 默认 hidden —— `<div id="boot-error" hidden role="alert" aria-live="assertive">`
+  //      （index.html:105）。`hidden` attribute 让 [hidden] { display:none }，但
+  //      role/aria-live 仍待命 —— 屏幕阅读器不播报，因为节点不可见。
+  //   2. 触发条件：bootstrap() reject（window.api 缺失、settings 加载失败、
+  //      IPC 通道抛错、动态 import() 解析失败等）。同步分支 #boot-error-detected
+  //      （file 4519 下方）覆盖 preload script 阶段失败的情况。
+  //   3. 显示路径：removeAttribute('hidden') → CSS 显示，主标题 + 详情段落。
+  //      同步调用 showToast(..., 'error', 0) —— duration=0 让 toast 不自动关闭，
+  //      用户必须主动 click 关闭 / 重启应用。
+  //   4. 后续：用户看到后只能「重启应用」（renderer 进程在 bootstrap 失败时
+  //      没有任何恢复路径 —— 所有功能依赖 window.api / editor / state）。
+  //      主进程不感知 renderer bootstrap 失败，需要在主进程加 window-state
+  //      监听并提示 user 提交 issue。
+  //   5. 风险：boot-error 与 toast 同时显示 + toast 不自动关，叠加可能挡住
+  //      后续操作。acceptable tradeoff：关键故障让用户看见 > 视觉清爽。
   const bootEl = document.getElementById('boot-error');
   if (bootEl) {
     bootEl.removeAttribute('hidden');

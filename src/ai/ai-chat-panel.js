@@ -55,6 +55,22 @@ function inferStatusType(text) {
   return 'success';
 }
 
+/**
+ * P2-23：决策 AI 面板 placeholder 三态文案。
+ *
+ * 优先级：!hasFile 永远盖过 !configured —— 即便用户既没打开文件又没配 AI，
+ * 也只提示「请先打开文件」，避免一屏两行矛盾提示。配置态仅在有文件
+ * 场景下区分。
+ *
+ * @param {{hasFile: boolean, configured: boolean}} state
+ * @returns {string}
+ */
+export function pickPlaceholder({ hasFile, configured }) {
+  if (!hasFile) return '请先打开一个 Markdown 文件';
+  if (!configured) return 'AI 未配置 — 点「⚙ 设置」填 Base URL 与 API Key';
+  return '描述你想如何修改当前文档...';
+}
+
 export class AiChatPanel {
   /**
    * @param {object} options
@@ -63,12 +79,15 @@ export class AiChatPanel {
    * @param {(requestId:string) => void} options.onCancel
    * @param {(text:string, type:'idle'|'running'|'cancelled'|'error'|'success'|'diff') => void} [options.onNotify]
    *   把过程/错误文案转发到外部 UI（statusbar 上的 #status-ai chip）。不传则静默丢弃。
+   * @param {() => void} [options.onOpenSettings] P2-23：未配置时点击「⚙ 设置」内联链调用。
+   *   不传则按钮 click 无效果（依然可见，让用户看见状态）。
    */
-  constructor({ element, onSubmit, onCancel, onNotify }) {
+  constructor({ element, onSubmit, onCancel, onNotify, onOpenSettings }) {
     this.element = element;
     this.onSubmit = onSubmit;
     this.onCancel = onCancel;
     this.onNotify = typeof onNotify === 'function' ? onNotify : null;
+    this.onOpenSettings = typeof onOpenSettings === 'function' ? onOpenSettings : null;
     this._open = false;
     this._enabled = true;
     this._submitting = false;
@@ -83,6 +102,18 @@ export class AiChatPanel {
     const input = this.element.querySelector('.ai-chat-input');
     const submitBtn = this.element.querySelector('.ai-chat-submit');
     const toggleBtn = this.element.querySelector('.ai-chat-toggle');
+    const configureLink = this.element.querySelector('.ai-chat-configure-link');
+
+    if (configureLink) {
+      // P2-23：未配置时显示的「⚙ 设置」内联链；点击调 onOpenSettings（如果有）。
+      // 即使没传 callback，按钮也显示 —— 让用户看见状态差异，避免「为什么 AI 不工作」困惑。
+      this._listeners.push([configureLink, 'click', (e) => {
+        e.preventDefault();
+        if (this.onOpenSettings) {
+          try { this.onOpenSettings(); } catch { /* 回调失败不影响 UI */ }
+        }
+      }]);
+    }
 
     if (input) {
       this._listeners.push([input, 'input', () => {
@@ -224,13 +255,40 @@ export class AiChatPanel {
    */
   setEnabled(enabled) {
     this._enabled = !!enabled;
+    this._syncInputState();
+  }
+
+  /**
+   * P2-23：通知面板 AI 配置状态变化，刷新 placeholder + 内联设置链。
+   * settings 保存 / 清空 API key 都会触发，placeholder 实时切换「未配置」↔「描述修改」。
+   * @param {boolean} configured
+   */
+  setConfigured(configured) {
+    this._configured = !!configured;
+    this._syncInputState();
+  }
+
+  /**
+   * P2-23：把 hasFile + configured 同步到 input / submit / configure-link。
+   * 抽出避免 setEnabled / setConfigured 各算一遍。
+   * @private
+   */
+  _syncInputState() {
     const input = this.element.querySelector('.ai-chat-input');
     const submitBtn = this.element.querySelector('.ai-chat-submit');
+    const configureLink = this.element.querySelector('.ai-chat-configure-link');
+    const hasFile = this._enabled;
+    const configured = this._configured !== false; // 默认 true，避免未初始化中间态误判
     if (input) {
       input.disabled = this._inputShouldBeDisabled();
-      input.placeholder = this._enabled ? '描述你想如何修改当前文档...' : '请先打开一个 Markdown 文件';
+      input.placeholder = pickPlaceholder({ hasFile, configured });
     }
     if (submitBtn) submitBtn.disabled = this._inputShouldBeDisabled();
+    if (configureLink) {
+      // 内联链：仅在「有文件 + 未配置」时显示。！hasFile 时被「请先打开文件」盖过，
+      // 不必再多一个入口。
+      configureLink.hidden = !hasFile || configured;
+    }
   }
 
   /**

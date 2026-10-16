@@ -16,10 +16,9 @@
   /* 宽度由 .app-shell 的 grid 模板通过 --sidebar-width 决定；这里不再写死 px */
   min-width: 0;
   /* container query 锚点：让 .sidebar 内部元素能根据侧栏实际宽度自适应。
-     用途：当侧栏拖到 ~240px 以下时，「新建笔记」内联按钮的"新建笔记"文字
-     自动隐藏、只保留 + 图标，给 sort 按钮（「名称」「修改时间」）腾空间。
-     230px 是经验阈值：sort 文字 + icon + 内边距刚好能完整显示的临界点。
-     命名空间 "sidebar" 与下面 @container 配套，避免与未来其他容器冲突 */
+     下方可用 @container sidebar (max-width: ...) 写响应式规则，
+     跟随 .sidebar 实际渲染宽度，跟主窗口大小解耦。
+     命名空间 "sidebar" 与配套 @container 一致，避免与未来其他容器冲突 */
   container-type: inline-size;
   container-name: sidebar;
 }
@@ -31,10 +30,10 @@
    .sidebar-sort 同一行的右端（用 .sidebar-new-btn--inline + margin-left:auto），
    节省侧栏首屏的垂直空间。原独立行的顶部呼吸转移到了 .sidebar-sort 的 padding-top） */
 
-/* 「+ 新建笔记」按钮：全宽、带文字的主操作按钮
-   ——accent 文字 + 微微的 accent 底色 + 1px accent 边框，hover/active 进一步加深。
+/* 主操作按钮：全宽、带文字（accent 文字 + 软底色 + 1px accent 边框的主操作语义）。
+   新建文件 / 新建文件夹挪到右键菜单后，这个 base 类现在只被侧栏底部 AI 按钮（#btn-ai）复用。
    2026-08 把字号从 12px 提到 14px、字重 500 → 600、加 8% accent 底色 + 32% accent 边框，
-   解决「新建笔记」字看着发淡、按钮太瘦的问题 */
+   解决按钮文字发淡、按钮太瘦的问题 */
 .sidebar-new-btn {
   display: flex;
   align-items: center;
@@ -76,113 +75,65 @@
   outline-offset: 1px;
 }
 
-/* 「新建笔记」按钮的紧凑内联变体（.sidebar-new-btn--inline）：
-   与 .sidebar-sort-btn 并排在 .sidebar-sort 行内，靠 margin-left:auto 推到右端。
-   设计目标：
-   1) 与 sort 按钮同高（覆盖 base 的固定 height:34px → 自适应高度），
-     否则 34px 的新建笔记会撑爆整行、视觉上"跳"出来，盖过 sort 按钮；
-   2) 宽度按内容（flex:0 0 auto），不抢 sort 按钮的弹性空间；
-   3) icon 同步缩到 13px（base 是 14px），与 sort 按钮视觉重量一致；
-   4) 保留 accent 文字 + 软底色 + 1px accent 边框的主操作语义不变。
-   —— base 类继续被侧栏底部 AI 按钮（#btn-ai）复用，仍是 34px 全宽语义。 */
-.sidebar-new-btn--inline {
-  flex: 0 0 auto;
-  margin-left: auto;
-  width: auto;
-  height: auto;
-  /* 5/6 padding 与 sort 按钮对齐：整行按钮横向 padding 一致，视觉上"一排"，
-     而不是 sort 紧、新建笔记松。同节奏点击区也更整齐 */
-  padding: 5px 6px;
-  font-size: var(--fs-sm);
-  letter-spacing: var(--tracking-wide);
-}
-.sidebar-new-btn--inline svg {
-  width: 13px;
-  height: 13px;
-}
-/* 内联态下取消 base 的 scale 反馈 —— 整行按钮高度统一，按下时整行一起缩更协调；
-   若只缩新建笔记，按下瞬间会显得"错位跳出"，与同行 sort 按钮的 active 态不齐 */
-.sidebar-new-btn--inline:active {
-  transform: none;
-}
-
-/* 窄侧栏适配：当侧栏 ≤260px 时，「新建笔记」文字隐藏，只显 + 图标，
-   给 sort 按钮腾出 ~50px 空间，「修改时间」能完整显示。
-   container query（而不是 @media viewport）：跟随 .sidebar 实际渲染宽度，
-   跟主窗口大小解耦。@supports 检测兼容性：旧 Chromium 不支持 container
-   query 会跳过规则，回退到全文字（最差也是 ellipsis，不算破图）
-   阈值 260px 是经验值：sort 「修改时间」4 字 + 新建笔记 4 字同时显示需要
-   ~250px+ 侧栏宽度（实测 240px 时 sort 仍被截断），取 260px 给点余量 */
-@supports (container-type: inline-size) {
-  @container sidebar (max-width: 260px) {
-    .sidebar-new-btn--inline span {
-      /* 视觉上隐藏文字，但保留 a11y / 屏幕阅读器朗读「新建笔记」 */
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      padding: 0;
-      margin: -1px;
-      overflow: hidden;
-      clip: rect(0, 0, 0, 0);
-      white-space: nowrap;
-      border: 0;
-    }
-    .sidebar-new-btn--inline {
-      /* 只显图标时，按钮收紧到 icon + 少量水平内边距即可 */
-      padding: 5px 8px;
-    }
-  }
-}
+/* (.sidebar-new-btn--inline 已删除 —— 2026-09 设计优化：新建文件 / 新建文件夹
+   从侧栏「+」按钮挪到右键菜单（侧栏空白右键、文件夹条目右键），内联变体
+   .sidebar-new-btn--inline 及其窄侧栏 container query 规则随之移除。base 类
+   .sidebar-new-btn 仍被侧栏底部 AI 按钮（#btn-ai）复用) */
 
 /* (search-wrap / search-icon / search-input 已移到 04-toolbar.css —— 2026-09
    设计优化：搜索框从侧栏上移到工具栏，样式跟随 HTML 一起走) */
 
 /* ============================================================
-   Sidebar 排序工具条 + 新建笔记（合并到一行）
+   Sidebar 排序工具条
    紧贴它作用的 .file-list 上方 —— 这是「列表的工具」，
    不应该埋进三层深的设置对话框（见 [[feedback-prefer-near-affected-area]]）。
    设计目标：紧凑到不抢搜索框注意力，active 态明确但不过重。
-   2026-09 优化：「新建笔记」从独立行合并到右端，
-   margin-left:auto 把新建笔记推到行尾，与左侧 sort 按钮形成「列表的工具 vs 主操作」的层次。
-   gap 同步从 2px → 4px：插入「新建笔记」后与 sort 按钮之间需要稍宽间距，避免视觉粘连。
+   新建文件 / 新建文件夹已挪到右键菜单，侧栏首行只剩排序工具条。
    ============================================================ */
 .sidebar-sort {
   display: flex;
   align-items: center;
-  /* gap 2px：sort 按钮之间 2px（连成一组 —— 都是"列表的工具"），
-     margin-left:auto 把"新建笔记"推到最后，自然形成「sort 组」与「主操作」的分组 */
-  gap: 2px;
+  /* gap：sort 触发器与未来同组控件之间的间距（"列表的工具"成组） */
+  gap: 4px;
   /* 顶 8px / 底 8px：sort 是侧栏首屏第一行，工具栏底边已经有 ~8px breathing，
      这里再给 8px 顶距足够拉开层次（10px → 8px 省 2px 给文件列表）；
      上下对称让 sort 行居中感更强，border-bottom 自然分隔 */
   padding: 8px 10px;
   border-bottom: 1px solid var(--border-subtle);
+  /* 切主题时 border-subtle 颜色变化需要 fade —— 否则 1px 分隔线在 body
+     320ms 慢淡变过程中硬切。背景是 transparent，没 background 跳变可淡 */
+  transition: border-color var(--transition-slow);
 }
 
-.sidebar-sort-btn {
+/* Sort 下拉容器：
+   2026-10 设计改造 —— 把原来并排两个 sort 按钮（.sidebar-sort-btn）换成下拉：
+     - 一个触发器占 sort 行左段，按内容宽度（flex:0 0 auto），不抢其它控件空间
+     - 菜单 absolute 定位在触发器下方，absolute 让它能浮在文件列表之上不受
+       flex 行高度限制，也不挤压下方列表布局
+   drop-shadow 比纯 border 更柔和：菜单浮起感强，与触发器同源色调一致
+*/
+.sidebar-sort-dropdown {
+  position: relative;
   flex: 1 1 0;
   min-width: 0;
+}
+
+.sidebar-sort-trigger {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 5px;
-  /* 横向 padding 8px → 6px：sort 标签"修改时间" 4 字 + icon 在默认 220px 侧栏下
-     需要 ~83px，原 5/8 padding + 4px row gap 把每个 sort 按钮挤到 80px，
-     「修改时间」就被截断成「修改时」。收到 6px 后单 sort 按钮宽度降到 76px，
-     省下来的 4×2=8px 让 sort 行整体宽松，可完整显示 4 字标签 */
+  width: 100%;
+  min-width: 0;
   padding: 5px 6px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  /* 2026-08 把字号从 12px 提到 13px（--fs-sm），与文件 meta / 工具栏按钮文字同档，
-     解决排序按钮在 13px 字号下字看着小、发淡的问题。字重 500 → 600 让文字更"实" */
   color: var(--fg-secondary);
   font-size: var(--fs-sm);
   font-weight: 600;
   letter-spacing: var(--tracking-wide);
   cursor: pointer;
-  /* 防止「修改时间」等 4 字标签在 180px 窄侧栏里换行成两行（高度塌到 46px，
-     挤压下方文件列表）。即使不够也用省略号截断，保持一行紧凑 */
+  /* 防止长 label「按修改时间→旧」在窄侧栏里换行塌成两行 */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -192,31 +143,180 @@
     border-color var(--transition-fast);
 }
 
-.sidebar-sort-btn:hover {
-  color: var(--fg-secondary);
-  background: var(--bg-hover);
-}
-
-.sidebar-sort-btn.is-active {
-  /* active 选中态：文字降彩度（--accent-text）。"名称"/"修改时间"/"创建时间"
-     三个 sort 按钮并排时，纯 accent 文字让三者同时"跳出来"，观感刺眼；
-     改用文字版后，accent-soft 底色仍明确选中，但字不再"贴脸"。 */
+/* 触发器打开态：accent-soft 底色 + accent 边框让「选中的排序」在行内就有
+   视觉反馈，不必打开菜单也能看出当前排序 */
+.sidebar-sort-trigger[aria-expanded="true"],
+.sidebar-sort-trigger.is-active {
   color: var(--accent-text);
   background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-.sidebar-sort-btn.is-active:hover {
+.sidebar-sort-trigger:hover {
+  color: var(--fg-secondary);
+  background: var(--bg-hover);
+}
+
+.sidebar-sort-trigger[aria-expanded="true"]:hover,
+.sidebar-sort-trigger.is-active:hover {
+  /* accent-soft + bg-hover 18% 混合：暗色调色板上 hover 不冲掉选中底色 */
   background: color-mix(in srgb, var(--accent) 18%, var(--bg-hover));
 }
 
-.sidebar-sort-btn:focus-visible {
+.sidebar-sort-trigger:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
-.sidebar-sort-btn svg {
+/* chevron 在打开时旋转 180°，暗示菜单已展开。
+   旋转而非切图标 —— 单一 SVG，CSS transform 更顺。
+   hover 提亮到 1.0：与 .status-chip-mode:hover svg 同源（默认 0.7 → 满透明），
+   鼠标停上时给 chevron 一抹"亮起来"的反馈，配合 trigger 底色变化更协调 */
+.sidebar-sort-trigger-chevron {
   flex: 0 0 auto;
+  margin-left: auto;
+  opacity: 0.7;
+  transition:
+    transform var(--transition-fast),
+    opacity var(--transition-fast);
+}
+.sidebar-sort-trigger[aria-expanded="true"] .sidebar-sort-trigger-chevron {
+  transform: rotate(180deg);
+}
+.sidebar-sort-trigger:hover .sidebar-sort-trigger-chevron {
+  opacity: 1;
+}
+
+/* trigger label 同样吃掉多余宽度，触发器 overflow:hidden 时它先被截。
+   flex:1 1 auto + min-width:0 是 flex 子项允许收缩到 content 以下的标配 —— 不加 min-width:0，
+   label 默认 min-content 宽度（最长不可断行片段），触发器 overflow:hidden 时它不会缩，
+   而是溢出 trigger 边缘把 chevron 顶出去。ellipsis 也得在 label 自己被约束时才生效。 */
+.sidebar-sort-trigger-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Sort 菜单：
+   - absolute 在触发器下方 left:0 让左对齐（与触发器同宽），top:calc(100% + 4px) 留 4px gap
+   - min-width:100% 而不是 width:100%：菜单可超出触发器宽度，长 label 「按修改时间」不挤
+   - padding:4px 让菜单项四周呼吸，menu 自身 padding 不参与 grid 列表
+   bg-elevated + drop-shadow + radius-sm：浮起卡片感，区别于触发器内联工具条 */
+.sidebar-sort-menu {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 4px);
+  /* min-width 让菜单始终覆盖触发器宽度，长 label（如「按修改时间」）不挤压；
+     长 label 单独成项时菜单按最长一项自然变宽 */
+  min-width: 100%;
+  max-width: 240px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  /* var(--shadow-md) 与 .focus-exit-hint 同源（4px 12px + 2px 4px 投影组合），
+     浮层用它来给菜单"轻浮起"层次。原来的硬编码 0.18/0.08 透明度是 dark-only 的
+     调参值，亮主题下显得偏重；用 token 后亮 / 暗两套主题的阴影会自动套用
+     02-palettes.css 已校准好的 0.07-0.32 区间，色彩系统内自洽 */
+  box-shadow: var(--shadow-md);
+  z-index: 50;
+  /* 淡入比瞬切更柔和；50ms 极短避免拖慢菜单 */
+  animation: sidebar-sort-menu-in 80ms ease-out;
+}
+
+@keyframes sidebar-sort-menu-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.sidebar-sort-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-secondary);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.sidebar-sort-menu-item:hover,
+.sidebar-sort-menu-item:focus-visible {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+/* 键盘 focus 需要可见环 —— menuitem 默认 outline:none（tabindex="-1" 的 li
+   浏览器不再画默认环），用 :focus-visible 而非 :focus：点击菜单项瞬间
+   focus 会落到它身上，若用 :focus 也会触发"高亮"，给视觉多余干扰。
+   负 offset 让环贴 item 内沿，与 trigger focus-visible 的 +1px 外环形成
+   "内 vs 外"层次（trigger 是浮起控件，环外贴；menu item 已有 padding 4px
+   的 ul 容器，环内贴不会跟外沿视觉挤在一起） */
+.sidebar-sort-menu-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.sidebar-sort-menu-item.is-active {
+  /* 与触发器一致：accent-text + accent-soft；选中态双处呼应（触发器 + 菜单项） */
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.sidebar-sort-menu-item.is-active:hover {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-hover));
+}
+
+/* 选中态左侧打勾；占位用 inline-block 让未选中项也对齐预留 13px + 8px gap。
+   比 flex 子项条件 display 更稳 —— 不参与排序语义，避免影响 item 高度 */
+.sidebar-sort-menu-check {
+  display: inline-flex;
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  opacity: 0;
+}
+.sidebar-sort-menu-item.is-active .sidebar-sort-menu-check {
+  opacity: 1;
+}
+
+.sidebar-sort-menu-text {
+  flex: 1 1 auto;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-sort-menu-hint {
+  /* hint 用 fg-muted + 小字号，与主 label 拉开对比；不抢主 label 视觉重量 */
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  flex: 0 0 auto;
+}
+
+/* 菜单分组分隔：1px 水平细线 + 上下各 4px 留白。
+   margin 而不是 padding 让 flex 容器布局不挤压 —— padding 会撑大 li 高度，
+   上下 4px margin 让「组间距」发生在 li 边缘，与菜单项 5px padding 对称。 */
+.sidebar-sort-menu-separator {
+  list-style: none;
+  height: 1px;
+  margin: 4px 6px;
+  padding: 0;
+  background: var(--border-subtle);
+  pointer-events: none;
 }
 
 .file-list {
@@ -231,6 +331,25 @@
   gap: 1px;
   /* 滚动条预留空间 —— 让滚动条 hover 才出现，不抢视觉 */
   scrollbar-gutter: stable;
+  /* audit fix (R7a P1-15)：windowed render 需要把 .file-item 用
+     position:absolute + top:N*h 钉在指定位置，所以容器得 position:relative
+     作为锚点。flex + position:relative 不冲突（容器本身仍是 flex 布局，
+     决定 sentinel / 非 windowed 模式项的位置）。 */
+  position: relative;
+}
+
+/* audit fix (R7a P1-15)：windowed 虚拟滚动 sentinel。
+   - 真实高度 = N * itemHeight，给滚动条撑出总高
+   - 默认 flex 项目，不抢视觉（aria-hidden + 0 padding）
+   - JS 切到 windowed 模式时 appendChild 它；切回 full / 空 状态时 remove
+   用 <li> 而非 <div> 是因为 <ul> 只能装 <li> 子元素，HTML 规范硬约束 */
+.file-list-sentinel {
+  flex-shrink: 0;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  /* 高度由 JS 直接 style.height 设置；这里只保证不引入意外 padding */
+  pointer-events: none;
 }
 
 .file-list:empty::after {
@@ -245,7 +364,7 @@
   color: var(--fg-tertiary);
   font-size: var(--fs-sm);
   line-height: var(--lh-relaxed);
-  /* 留点上方间距，与上方 sort/新建笔记行拉开 */
+  /* 留点上方间距，与上方 sort 行拉开 */
   margin-top: var(--space-2);
   /* 避免一行字过长在窄侧栏里截断为半个字 */
   word-break: break-word;
@@ -260,6 +379,11 @@
   grid-template-columns: 16px 1fr;
   align-items: center;
   column-gap: 10px;
+  /* audit fix (R7a P1-15)：windowed 虚拟滚动需要固定高度做索引 × h 的
+     位置数学。padding 仍由 box-sizing:border-box 包含在 height 内。
+     49px (12 padding + 37 content) → 显式 50px，差 1px 由 align-items:center
+     吸收，视觉无变化但 JS 可以用 N * 50 直接算 top/总高。 */
+  height: 50px;
   /* 上下 padding 9px → 6px：原 9px 在 13px name + 13px meta 两行下让单条 file-item
      撑到 ~60px，50 个文件就要 3000px 滚动，太松。压到 6px 后 ~50px/item，
      列表更紧凑、可见项更多，仍保留点击区域与 hover 反馈呼吸 */
@@ -337,7 +461,17 @@
      纯色 accent 在 #2a325c 类 accent-soft 背景下，RGB 距离很短，
      加 4px 投影能把色条对比拉高一档 */
   box-shadow: 0 0 4px color-mix(in srgb, var(--accent) 40%, transparent);
+  /* 选中态色条从左侧滑入：切换当前文件时给一点"落位"的过渡，
+     比硬切更有手感，又不拖沓（200ms）。reduced-motion 下被全局 .01ms 规则收掉 */
+  transform-origin: left center;
+  animation: file-active-bar 200ms var(--ease-out);
 }
+
+@keyframes file-active-bar {
+  from { transform: translateY(-50%) scaleX(0); opacity: 0; }
+  to   { transform: translateY(-50%) scaleX(1); opacity: 1; }
+}
+
 
 .file-name {
   font-size: var(--fs-sm);
@@ -404,6 +538,9 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
+  /* 与 .sidebar-sort 同源：footer 顶 1px 分隔线在切主题时也需 fade，
+     避免与 main 320ms 慢淡变错位 */
+  transition: border-color var(--transition-slow);
 }
 
 /* ============================================================
@@ -432,6 +569,38 @@
   letter-spacing: 0.005em;
   word-wrap: break-word;
   overflow-wrap: break-word;
+}
+
+/* ============================================================
+   阅读进度条：viewer 顶部的 3px 细线，随滚动从左向右填充。
+   - sticky top:0：作为 .viewer 滚动容器的首个子元素，滚动时钉在顶部，
+     正文从它下方滑过（markdown-body 顶部有 48px padding，细线落在留白里不压字）。
+   - pointer-events:none：纯视觉反馈，不挡滚动 / 点击。
+   - 底色透明，只有填充段可见；90ms linear 跟随滚动手感顺滑。
+   - 宽度由 JS（updateStatusScroll）按 scrollTop / (scrollHeight-client) 写入。
+   ============================================================ */
+.reading-progress {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: 0 0 auto;
+  width: 100%;
+  height: 3px;
+  background: transparent;
+  pointer-events: none;
+}
+
+.reading-progress-bar {
+  display: block;
+  height: 100%;
+  width: 0%;
+  /* 渐变比纯 accent 多一档层次，末端圆角呼应 file-item 色条 */
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-hover) 100%);
+  border-radius: 0 2px 2px 0;
+  /* 极轻辉光，让细线在深色底上"浮"起来一点，但不喧宾夺主 */
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 50%, transparent);
+  transform-origin: left center;
+  transition: width 90ms linear;
 }
 
 /* 空状态：更有温度的视觉 */
@@ -538,9 +707,14 @@
   text-wrap: pretty;
 }
 
-/* 二级提示：用 tertiary + 略小字号，与主 hint 拉开视觉权重 */
+/* 二级提示：用 secondary + 略小字号，与主 hint 拉开视觉权重
+   P2-26：tertiary → secondary。dark palette 下
+     --fg-tertiary #8e95a1 vs --fg-secondary #b0b6c0
+   后者在 #08090a 底色上对比度 ~7.5:1（前者 ~5.0:1，边缘档）。
+   改 secondary 满足 WCAG AAA (7:1+)，且不破坏主 hint（用 tertiary 仍
+   区分"主 → 次"权重）。其他 4 个 palette 同理。 */
 .empty-state .hint.hint-secondary {
-  color: var(--fg-tertiary);
+  color: var(--fg-secondary);
   font-size: var(--fs-xs-readable);
   /* margin-top 6 → 10px：原 6px 让主 hint 与次 hint 之间几乎贴住，
      加上两行 lh-relaxed (1.7) 后视觉上更挤。提到 10px 让两组 hint
@@ -549,6 +723,62 @@
   max-width: 380px;
   /* 1.55 让次级提示的换行节奏与主 hint（1.6）接近，避免出现"次 hint 文字挤一行"的突兀感 */
   line-height: 1.55;
+}
+
+/* 空状态 CTA ——「+ 新建笔记」按钮（audit P2-25）
+   与 .sidebar-new-btn 共享 accent 配色语义但不走 width:100%：
+   空状态是居中布局，紧凑 auto-width 让视觉重心聚焦在按钮上，
+   不会撑满整行让空白左右显得"摊"。
+
+   设计选择：
+   - 颜色用 --accent + --btn-on-accent（与 .btn-primary 一致）—— 走主按钮语义，
+     让"下一步该做什么"的指令最强
+   - padding 9px 16px：比 .btn (12px 20px) 收紧一点，与 .sidebar-new-btn 视觉重量一致
+   - hover 不上 transform scale —— 空状态按钮是用户在"看到指引后第一次行动"，
+     缩放会让人犹豫到底点没点中；改用 box-shadow 上抬作"立起来"反馈
+   - focus-visible 沿用全局 .btn 的 2px accent outline（见 08-modal.css），
+     这里只声明 offset 让焦点环在按钮内贴边，与全局外 2px 视觉一致 */
+.empty-state-cta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  /* 9px 16px → 10px 18px：与下方 hint secondary 拉开一档垂直间距的同时，
+     比 .sidebar-new-btn (34px 高) 略紧凑 —— 空状态是「轻量引导」，
+     不需要 34px 那么"正式"的按钮高度 */
+  padding: 10px 18px;
+  margin-top: var(--space-4);
+  background: var(--accent);
+  color: var(--btn-on-accent, #ffffff);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: var(--tracking-tight);
+  cursor: pointer;
+  /* hover 时阴影抬升比 scale 更克制；同时阴影从 accent-soft 升级到
+     accent-soft-hover，给"按钮立起来"的微动效暗示 */
+  box-shadow: 0 2px 6px var(--accent-soft);
+  transition:
+    background var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+.empty-state-cta:hover {
+  background: var(--accent-hover);
+  box-shadow: 0 4px 12px var(--accent-soft-hover);
+}
+
+.empty-state-cta:active {
+  /* 0.97 比其它按钮的 0.96 略小 —— 空状态 CTA 是"重决策"，按下时
+     反馈更明显一点，避免用户怀疑"按了没生效" */
+  transform: scale(0.97);
+}
+
+.empty-state-cta:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .empty-state .hint kbd {
@@ -848,3 +1078,71 @@ body[data-editor-mode="split"] .splitter {
   opacity: 0.4;
 }
 
+/* ============================================================
+   Folder Browser：拖拽 + 剪贴板视觉反馈
+   - .file-item 默认 draggable=true（文件 / 文件夹 / 二进制都可拖）
+   - 拖拽中源项 .is-dragging 半透明；合法投放目标 folder .is-drop-target 给
+     accent 虚线描边 + 软底高亮；剪切到剪贴板的源项 .is-clipboard-cut 用
+     虚线 + 弱化提示「将被移走」。
+   ============================================================ */
+
+.file-item[draggable="true"] {
+  /* 默认已是 cursor:pointer；拖拽态单独给 grabbing 反馈 */
+  cursor: grab;
+}
+
+.file-item.is-dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+.file-item.is-drop-target {
+  /* 合法投放目标：accent 虚线描边 + 软底，明显区别于 hover 态 */
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: var(--accent-soft);
+}
+
+.file-item.is-clipboard-cut {
+  /* 已剪切待移动的源项：弱化 + 虚线边框，暗示「即将离开此处」 */
+  opacity: 0.6;
+  outline: 1px dashed var(--border-default);
+  outline-offset: -2px;
+}
+
+/* audit R7a P1-20：分页「加载更多」按钮
+   视觉上是一个普通 li 但居中、有虚线分隔；hover 时背景色加深 + cursor:pointer。
+   跟普通 .file-item 共享 padding / font 但不要 icon，简洁一些。 */
+.file-list-load-more {
+  list-style: none;
+  padding: 10px 12px;
+  margin: 4px 8px;
+  border: 1px dashed var(--border-default);
+  border-radius: 6px;
+  text-align: center;
+  color: var(--fg-secondary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.1s, border-color 0.1s;
+}
+.file-list-load-more:hover,
+.file-list-load-more:focus-visible {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--fg-primary);
+  outline: none;
+}
+
+
+/* audit R7a P1-15：windowed 虚拟滚动 —— JS 切到该模式时给 .file-item 加
+   .is-windowed 类，position:absolute 让 N*50 位置数学生效，left/right
+   撑满容器，padding 仍然在 .file-item 上（box-sizing:border-box，
+   height:50px 已含 padding）。
+   top 由 JS 直接 style.top = N*50+'px' 设置，不写进 CSS（每个 item 不同）。
+   切回 full 模式时 JS 移除 .is-windowed 与 style.top，flex 布局自然复位。 */
+.file-item.is-windowed {
+  position: absolute;
+  left: 10px;  /* 抵消 .file-list 的 padding-left 10px */
+  right: 10px; /* 抵消 .file-list 的 padding-right 10px */
+}

@@ -21,7 +21,7 @@
   color: #fff;
   text-decoration: none;
   border-radius: 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 500;
   /* 默认视觉隐藏但保留可访问性 —— 用 transform 移到屏外，不影响
      屏幕阅读器在第一个 Tab 焦点候选里看到它 */
@@ -65,5 +65,11 @@
     animation-duration: 0.01ms !important;
     animation-delay: 0 !important;
   }
+  /* 阅读进度条是 width 过渡（非 animation），上面的 .01ms 规则收不掉它。
+     关掉过渡让进度"瞬切"，避免每帧滚动触发持续的位置变化动画（前庭敏感用户）。 */
+  .reading-progress-bar { transition: none; }
+  /* 代码块复制按钮的 hover/active 颜色过渡 + 按下缩放也一并收掉 */
+  .code-copy-fab { transition: none; }
+  .code-copy-fab:active { transform: none; }
 }
 

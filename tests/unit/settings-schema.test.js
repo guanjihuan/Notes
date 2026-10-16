@@ -491,3 +491,47 @@ describe('SETTINGS_UI_OPTIONS.aiProvider[*].defaults (audit T-4)', () => {
     expect(p.defaults.baseUrl).toBe('https://api.openai.com/v1');
   });
 });
+
+// 2026-10 加：fileListSort 排序下拉的 schema 契约 —— enum 与 UI 选项表必须同源，
+// renderer 从两端派生（FILE_LIST_SORT_VALUES / FILE_LIST_SORT_OPTIONS）。
+// 任一端漏更新 → 排序下拉菜单少一项或多出非法值。
+describe('fileListSort 排序下拉契约（2026-10 dropdown 改造）', () => {
+  const schema = require('../../shared/settings-schema.js');
+  const { SETTINGS_UI_OPTIONS, SETTINGS_SCHEMA } = schema;
+  const sortSpec = SETTINGS_SCHEMA.fileListSort;
+  const uiOptions = SETTINGS_UI_OPTIONS.fileListSort;
+
+  it('SETTINGS_SCHEMA.fileListSort.enum 与 SETTINGS_UI_OPTIONS.fileListSort[*].value 完全一致', () => {
+    const enumValues = sortSpec.enum;
+    const uiValues = uiOptions.map((o) => o.value);
+    // 用 toEqual 而非 toBe —— 顺序也得一致（dropdown 顺序由 enum 决定）
+    expect(uiValues).toEqual(enumValues);
+  });
+
+  it('每项 UI 选项都含 value + label + hint 三个字段', () => {
+    uiOptions.forEach((opt) => {
+      expect(typeof opt.value).toBe('string');
+      expect(typeof opt.label).toBe('string');
+      expect(typeof opt.hint).toBe('string');
+      expect(opt.label.length).toBeGreaterThan(0);
+      expect(opt.hint.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('enum 至少 2 项 —— dropdown 设计要求比并排按钮更多选项', () => {
+    // 设计动机：原并排 2 按钮在 220px 侧栏下「修改时间」会被截断；改下拉后
+    // 至少要有「按名称 A→Z」「按修改时间 新→旧」两项作为基础集合。
+    expect(sortSpec.enum.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('DEFAULT_SETTINGS.fileListSort === schema.enum[0] === UI options[0].value（保证 fallback / 旧值不会静默被 coerce）', () => {
+    // 三处必须相等：
+    //   1) DEFAULT_SETTINGS.fileListSort —— 新装用户的初始值
+    //   2) schema.enum[0] —— validateAndSanitize 接受的默认值会回到这个
+    //   3) SETTINGS_UI_OPTIONS.fileListSort[0].value —— 下拉默认选中项
+    // 谁漏改谁静默失效：例如把 DEFAULT 改成 'mtime-desc' 但 enum/uiOptions 不动，
+    // validateAndSanitize 会把它强制降回 'name'，用户看 UI 永远停在 name。
+    expect(DEFAULT_SETTINGS.fileListSort).toBe(sortSpec.enum[0]);
+    expect(DEFAULT_SETTINGS.fileListSort).toBe(SETTINGS_UI_OPTIONS.fileListSort[0].value);
+  });
+});

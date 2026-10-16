@@ -267,7 +267,7 @@ body[data-focus-mode="true"] .ai-splitter {
   font-size: var(--fs-xs-readable);
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--transition-fast), border-color var(--transition-fast);
+  transition: background var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
 }
 
 .ai-diff-apply-all:hover {
@@ -429,7 +429,7 @@ body[data-focus-mode="true"] .ai-splitter {
   font-size: var(--fs-xs);
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition: background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
 }
 
 .ai-diff-region-apply:hover:not([disabled]) {
@@ -466,7 +466,7 @@ body[data-focus-mode="true"] .ai-splitter {
   font-size: var(--fs-xs);
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
 }
 
 .ai-diff-region-skip:hover {
@@ -645,6 +645,32 @@ body[data-focus-mode="true"] .ai-splitter {
   color: var(--fg-tertiary);
 }
 
+/* P2-23：「⚙ 设置」内联链 —— 未配置时显示在 input 右侧，提示用户去填 Base URL / API Key。
+   小尺寸 + accent 色，与 submit 按钮拉开视觉权重（链接 ≠ 操作）。hidden 时
+   [hidden] 默认 display:none 即可，无需额外 display 控制。 */
+.ai-chat-configure-link {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  height: 28px;
+  padding: 0 10px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.ai-chat-configure-link:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.ai-chat-configure-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .ai-chat-submit {
   height: 32px;
   /* P2-6 fix (audit)：min-width 锁定宽度，防止"生成修改"（4字）和
@@ -661,7 +687,7 @@ body[data-focus-mode="true"] .ai-splitter {
      文字在同一基线垂直居中。 */
   line-height: 30px;
   cursor: pointer;
-  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
 }
 
 .ai-chat-submit:hover:not([disabled]) {
@@ -697,7 +723,7 @@ body[data-focus-mode="true"] .ai-splitter {
 /* ============================================================
    AI 按钮激活态（侧栏底部）
    当 AI 面板展开时给 btn-ai 一个明显区别于"主操作描边态"的实心强调态：
-     - 关闭：沿用 .sidebar-new-btn 的描边 + 8% accent 底（与「新建笔记」同款）
+     - 关闭：沿用 .sidebar-new-btn 的描边 + 8% accent 底（与基类同款）
      - 打开：实心 accent 底 + 白字 + accent 边，让用户一眼看出 AI dock 已开
    用 #btn-ai.sidebar-new-btn 这种 ID+class 组合是为了 specificity 高过
    .sidebar-new-btn:hover（0,2,0），保证 hover 时不会把"已打开"的视觉态冲掉。

@@ -143,7 +143,7 @@ export function showPromptDialog({
       // （'prompt() is and will not be supported'），正好是我们要绕开的坑。
       // 兜底行为：当作取消处理（resolve null），并 toast 提示用户，让重要
       // 操作（重命名 / 新建文件）不会静默无反应（audit L2 #7）。
-      showToast('当前操作被另一个对话框占用，请先关闭后再试', 'warning');
+      showToast('已有对话框打开，请先关闭后再试', 'warning');
       resolve(null);
       return;
     }

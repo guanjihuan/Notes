@@ -19,7 +19,6 @@
 const { contextBridge, ipcRenderer, nativeImage } = require('electron');
 const { marked } = require('marked');
 const nodePath = require('path');
-const nodeFs = require('fs');
 
 // 把 icon.ico 在 preload 启动时一次性转成 PNG data URL，渲染端作为 <img src> 用。
 // nativeImage 直接读 .ico 会拿到 Windows 编码，<img> 不一定能渲染；toDataURL()
@@ -27,12 +26,14 @@ const nodeFs = require('fs');
 // 打包后路径仍指向资源目录。读不到 → 返回 null，渲染端继续走 .app-title::before 占位。
 let APP_ICON_DATA_URL = null;
 try {
+  // P2-11：去掉 nodeFs.existsSync(iconPath) 同步 syscall。
+  // nativeImage.createFromPath 本身就安全 —— 不存在的路径返 empty image 不抛，
+  // 下面 isEmpty() 守卫拦下空 image。existsSync 一次 preload 启动只跑一次，但
+  // 在冷启动 path 上属于可省的 IO；删了不改变行为，启动期少一次 stat。
   const iconPath = nodePath.join(__dirname, 'icon.ico');
-  if (nodeFs.existsSync(iconPath)) {
-    const img = nativeImage.createFromPath(iconPath);
-    if (img && !img.isEmpty()) {
-      APP_ICON_DATA_URL = img.toDataURL();
-    }
+  const img = nativeImage.createFromPath(iconPath);
+  if (img && !img.isEmpty()) {
+    APP_ICON_DATA_URL = img.toDataURL();
   }
 } catch {
   // nativeImage 在某些 headless 测试 / 非 Electron 上下文里会失败；吞掉走 null 路径
@@ -251,6 +252,8 @@ contextBridge.exposeInMainWorld('api', {
 
   // 文件操作（只读 + 写入 + 文件管理）
   listFiles: () => ipcRenderer.invoke('file:list'),
+  // R7a P1-20：分页后续页。offset 必填（首屏由 listFiles 拿），limit 默认 200。
+  listFilesMore: (offset, limit) => ipcRenderer.invoke('file:list:more', { offset, limit }),
   // Folder Browser（Stage 8）：扫一个相对目录的一层条目（含文件夹 + 文件 + binary）。
   // relDir 是 dataRoot 下的 POSIX 相对路径（如 'notes/2026'），空串代表根。
   // 返回 { ok, dir, relDir, entries } 或 { ok:false, error, message? }。
@@ -277,6 +280,18 @@ contextBridge.exposeInMainWorld('api', {
   },
   renameFile: (oldPath, newName) => ipcRenderer.invoke('file:rename', oldPath, newName),
   deleteFile: (filePath) => ipcRenderer.invoke('file:delete', filePath),
+  // 拖拽到文件夹 / 右键「剪切 → 粘贴」用：把 srcPath（文件或文件夹）移动到 destDir。
+  moveFile: (srcPath, destDir) => ipcRenderer.invoke('file:move', srcPath, destDir),
+  // 拖拽（按住 Ctrl/Cmd）/ 右键「复制 → 粘贴」用：把 srcPath 复制到 destDir。
+  copyFile: (srcPath, destDir) => ipcRenderer.invoke('file:copy', srcPath, destDir),
+
+  // 文件夹管理（folder: 系列）：
+  //   folder:create — 在 opts.dir（或 dataRoot）下新建文件夹，自动避让重名
+  //   folder:rename — 在父目录下重命名（不跨父目录），校验 + 避让同 folder:create
+  // 删除复用 file:delete（主进程已支持 folder 分支：trashItem + rmdir 兜底），
+  //   通过 result.isFolder 让 renderer 区分后续行为（导航到父级）
+  createFolder: (name, opts) => ipcRenderer.invoke('folder:create', name, opts || {}),
+  renameFolder: (oldPath, newName) => ipcRenderer.invoke('folder:rename', oldPath, newName),
   openDataDir: () => ipcRenderer.invoke('app:open-data-dir'),
   // 打开任意路径（不修改设置）—— 设置对话框的"打开预览"按钮使用
   openPath: (target) => ipcRenderer.invoke('app:open-path', target),
@@ -329,15 +344,23 @@ contextBridge.exposeInMainWorld('api', {
   //   - 兜底路径：pagehide 没跑 → beforeunload 触发，主进程侧 listener 被清
   // 每个 on* 单独挂 listener + beforeunload（共享 cleanupOn helper，见顶部）。
 
-  onMenuCommand: (callback) => {
-    // menu 事件是「无 payload 只有 channel 名」语义
-    const events = ['menu:toggle-theme', 'menu:settings'];
-    const handlers = events.map(name => {
-      const handler = () => callback(name);
-      ipcRenderer.on(name, handler);
-      return { name, handler, cleanup: cleanupOn(name, handler) };
-    });
-    return () => handlers.forEach(({ cleanup }) => cleanup());
+  onThemeToggle: (callback) => {
+    // P2-3：拆 onMenuCommand → 各事件单独 API，每个 API 只挂 1 个 listener。
+    // 旧版 onMenuCommand 一次性挂 2 个 listener + 字符串分发，订阅 N 次就 2N
+    // 个 listener；拆分后每个 on* 严格 1 个 listener，与「一个 on* 一个 channel」
+    // 1:1 对应，pagehide 清理路径可点对点核对。
+    const handler = () => callback();
+    ipcRenderer.on('menu:toggle-theme', handler);
+    const cleanup = cleanupOn('menu:toggle-theme', handler);
+    return cleanup;
+  },
+
+  onSettings: (callback) => {
+    // P2-3：同上，拆 onMenuCommand。
+    const handler = () => callback();
+    ipcRenderer.on('menu:settings', handler);
+    const cleanup = cleanupOn('menu:settings', handler);
+    return cleanup;
   },
 
   onFilesChanged: (callback) => {

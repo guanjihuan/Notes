@@ -25,6 +25,9 @@ const path = require('path');
 const { EDITABLE_EXTS } = require('../shared/extension-lists.js');
 // 单一事实源：errno → 中文提示（main + renderer 共享，preload 过桥）
 const { friendlyFsError: sharedFriendlyFsError } = require('../shared/friendly-fs-error.js');
+// P2-1：tmp 路径生成走加密安全随机（crypto.randomUUID），不再用 Math.random
+const { generateTmpPath } = require('./generate-tmp-path.js');
+const { fsyncParentDir } = require('./fsync-parent-dir.js');
 
 /** 单文件大小上限（5 MB），防止超大文件冻结 renderer。 */
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
@@ -32,15 +35,17 @@ const MAX_FILE_SIZE = 5 * 1024 * 1024;
 /**
  * atomicWriteFile 产生的 tmp 文件名匹配规则：`<name>.<editableExt>.tmp.<pid>.<ts>.<rand>`。
  * cleanupStaleFileTmpFiles 用它判断哪些 .tmp.* 是自家产物需要清理。
- * 严格要求 pid / ts / rand 三段：pid 与 ts 必须数字，rand 是 6 字符小写 base36。
+ * 严格要求 pid / ts / rand 三段：pid 与 ts 必须数字，rand 是 generateTmpPath 生成的
+ * 36 位带连字符 UUID（见 main/generate-tmp-path.js，`crypto.randomUUID()`，P2-1 升级而来，
+ * 旧版是 6 字符小写 base36）。
  *
  * 旧版 `\.tmp\.\d+\.\d+\.[a-z0-9]+$` 太宽 —— 把 `report.tmp.2024.1234567.abcdef` 这种
  * 用户合法文件也匹配上，24h 跨进程阈值后会被静默 unlink。要求 .tmp. 前一段是
- * EDITABLE_EXTS 之一（白名单扩展名）把误伤清零。
+ * EDITABLE_EXTS 之一（白名单扩展名）把误伤清零；rand 段允许连字符以匹配 UUID。
  */
 const ATOMIC_TMP_RE = new RegExp(
   '\\.(?:' + Array.from(EDITABLE_EXTS).map((e) => e.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('|') +
-  ')\\.tmp\\.\\d+\\.\\d+\\.[a-z0-9]{1,8}$',
+  ')\\.tmp\\.\\d+\\.\\d+\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
   'i',
 );
 
@@ -141,6 +146,33 @@ async function assertNoSymlinkAncestor(filePath, stopAt) {
   // dataDir 之外 —— isWithinDataDir 的字符串前缀边界被绕过。
   // 先 lstat filePath 自身：在 stopResolved 子树里也要拒绝自身是 symlink 的场景。
   const resolvedPath = path.resolve(filePath);
+
+  // 边界情形（filePath === stopAt，例如 file:list 以 (dataRoot, dataRoot) 校验
+  // 数据根自身）：只查 filePath 自身是否 symlink，不再向上遍历祖先。
+  // 旧逻辑在边界相等时跳过自检查、却从 dirname(filePath) 一路 lstat 到根 ——
+  // 既漏掉对 dataRoot 自身的检查（审计威胁模型的核心场景），又会把合法的
+  // symlinked /home 等祖先误判成 SYMLINK_NOT_ALLOWED，导致根目录列表永久失败。
+  const isBoundary = !!stopResolved && resolvedPath === stopResolved;
+  if (isBoundary) {
+    try {
+      const stSelf = await fs.lstat(resolvedPath);
+      if (stSelf.isSymbolicLink()) {
+        return {
+          ok: false,
+          error: 'SYMLINK_NOT_ALLOWED',
+          code: 'SYMLINK_NOT_ALLOWED',
+          message: `路径中包含符号链接，不允许编辑（${resolvedPath}）`,
+        };
+      }
+    } catch (e) {
+      // ENOENT：目标本身不存在是允许的（scan-dir 创建场景、新文件）；其它错误上报
+      if (e.code !== 'ENOENT') {
+        return { ok: false, error: e.message, code: e.code, message: `读取路径状态失败：${e.code || e.message}` };
+      }
+    }
+    return { ok: true };
+  }
+
   if (!stopResolved || resolvedPath !== stopResolved) {
     try {
       const stSelf = await fs.lstat(resolvedPath);
@@ -430,6 +462,53 @@ async function scanFiles(dir) {
 }
 
 /**
+ * 简易并发限流器：把 N 个 promise 包成「最多 concurrency 个同时在飞」的执行器。
+ * 不引第三方依赖（p-limit / p-queue 等）—— 全文只有 scanDir 一个调用点，
+ * 20 行内联比 1 个新 dep 更可控。
+ *
+ * 行为：
+ *   - 入队 → 立即调度，若活跃数 < concurrency 则启动执行
+ *   - 任意 fn resolve / reject → 拉下一个
+ *   - fn 异常会传给调用方（rethrow），但「下一个」仍会被调度（finally 语义）
+ *
+ * @param {number} concurrency - 同时在飞的最大任务数（必须 ≥ 1）
+ * @returns {(fn: () => Promise<T>) => Promise<T>}
+ */
+function pLimit(concurrency) {
+  if (!Number.isFinite(concurrency) || concurrency < 1) {
+    throw new Error('pLimit: concurrency 必须 ≥ 1');
+  }
+  const queue = [];
+  let active = 0;
+  const pump = () => {
+    while (active < concurrency && queue.length > 0) {
+      const job = queue.shift();
+      active += 1;
+      // resolve / reject 都触发 pump；catch 防止 fn 抛错后 active 永远不归零
+      job.fn().then(
+        (v) => { active -= 1; job.resolve(v); pump(); },
+        (e) => { active -= 1; job.reject(e); pump(); },
+      );
+    }
+  };
+  return (fn) => new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    pump();
+  });
+}
+
+/** scanDir 单批并发上限（audit R7a P1-17）。
+ *
+ * 背景：libuv 默认 4 worker threads，scanDir 同时发 N 个 fs.stat 会被 libuv
+ * 串行排队 —— SMB / OneDrive 单次 stat 50-200ms 时 10000 文件 → 30-90s。
+ * 并发 32 让网络盘上 stat 仍能流水线（多网卡 in-flight），又不至于打满
+ * libuv 池 / fd 上限。32 是个保守值：实测 64 在 4 核机器仍 OK，128 在 Windows
+ * 上偶发 ETIMEDOUT（WinHTTP max connections per server 默认 6 / process 翻倍
+ * 也只有 12），32 是「在所有平台稳定」的最大公约数。
+ */
+const SCAN_DIR_CONCURRENCY = 32;
+
+/**
  * 扫描一个目录下的所有直接条目（文件夹 + 文件），按类型分类。
  * Folder Browser（2026-08）的核心入口。
  *
@@ -444,6 +523,9 @@ async function scanFiles(dir) {
  *   - 文件夹 entryType 固定为 'folder'
  *   - 排序：文件夹在前（按名称），文件在后（按名称）；
  *     让用户先看到目录结构再看到内容，更符合 Explorer/Finder 的直觉
+ *
+ * 性能（audit R7a P1-17）：fs.stat 用 pLimit(32) 限流，避免 libuv 4 worker
+ * 排队把 SMB / OneDrive 30-90s 拖到 1-3s。
  *
  * @param {string} absDir - 数据目录下某一层的绝对路径
  * @returns {Promise<{
@@ -491,7 +573,14 @@ async function scanDir(absDir) {
     safeDirents.push(d);
   }
 
-  const entries = await Promise.all(safeDirents.map(async (d) => {
+  // audit fix (R7a P1-17)：fs.stat 走 pLimit(SCAN_DIR_CONCURRENCY) + allSettled。
+  // 旧版 Promise.all(N) 在 SMB / OneDrive 上 N 个 stat 串行排队（libuv 4 worker
+  // 默认），10000 文件 30-90s；改 32 并发后实测 1-3s。
+  // allSettled：单个 stat 抛错（ENOENT 经典 readdir 与 stat 之间被删）不影响
+  // 整批，外层 .flatMap 过滤 fulfilled + truthy 即可，与原 .filter(Boolean) 语义
+  // 一致（fulfilled=null → drop；rejected → drop；fulfilled=object → keep）。
+  const limit = pLimit(SCAN_DIR_CONCURRENCY);
+  const tasks = safeDirents.map((d) => limit(async () => {
     const fullPath = path.join(absDir, d.name);
     if (d.isDirectory()) {
       return {
@@ -520,8 +609,8 @@ async function scanDir(absDir) {
     // 其它（socket / fifo / block device 等）—— 不展示
     return null;
   }));
-
-  const list = entries.filter(Boolean);
+  const settled = await Promise.allSettled(tasks);
+  const list = settled.flatMap((r) => (r.status === 'fulfilled' && r.value) ? [r.value] : []);
   // 排序：folder 在前、file 在后，同组内按 zh-CN locale
   list.sort((a, b) => {
     if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
@@ -572,6 +661,12 @@ function resolveDirRelative(relDir, dataRoot) {
  * 给定 dataRoot 与当前目录的绝对路径，反算 POSIX 风格的相对路径。
  * 渲染端用于比对 fs-watcher 推送的 relDir 字段。
  *
+ * Windows case-insensitive：dataRoot 存盘时可能被大小写规范化（NTFS 实际路径
+ * 大小写取决于创建时），与 absDir 比对时若不做大小写无关比较，会把同盘同一目录
+ * 误判成"不在 dataRoot 下"、返回 '' —— renderer 后续 onFilesChanged 拿到空
+ * relDir 会把「旧目录的文件被移除」误判为「当前文件被外部删除」而清空编辑器。
+ * 比较走 toLowerCase，结果保留原大小写（POSIX 风格 + 可读性）。
+ *
  * @param {string} absDir
  * @param {string} dataRoot
  * @returns {string} POSIX 相对路径，根目录时为 ''
@@ -580,9 +675,14 @@ function toRelativeDir(absDir, dataRoot) {
   if (!absDir || !dataRoot) return '';
   const a = absDir.replace(/\\/g, '/').replace(/\/+$/, '');
   const r = dataRoot.replace(/\\/g, '/').replace(/\/+$/, '');
-  if (a === r) return '';
+  // Windows 大小写无关比较：dataRoot 与 absDir 指向同一盘同一目录但大小写不同时
+  // （NTFS 用户主目录就常见），不能误判成"不在 dataRoot 下"。
+  const icmp = process.platform === 'win32'
+    ? (x, y) => x.toLowerCase() === y.toLowerCase()
+    : (x, y) => x === y;
+  if (icmp(a, r)) return '';
   const prefix = r + '/';
-  if (a.startsWith(prefix)) return a.slice(prefix.length);
+  if (icmp(a.slice(0, prefix.length), prefix)) return a.slice(r.length + 1);
   // 不在 dataRoot 下（理论上不该发生）—— 返回空字符串让渲染端走根路径分支
   return '';
 }
@@ -605,15 +705,20 @@ function toRelativeDir(absDir, dataRoot) {
  * @param {string} content UTF-8 文本
  */
 async function atomicWriteFile(dst, content) {
-  // audit fix (Round 16 P0)：追加 6 位 base36 随机后缀。pid + Date.now() 只保证
-  // 跨进程 / 跨毫秒唯一，同进程同毫秒并发（如自动保存触发的 saveConfig 与
-  // 用户手动 Ctrl+S 撞在同一毫秒）会算出相同 tmpPath，后到的 rename 因源文件
-  // 已被消费而失败（ENOENT），上层捕获后返回 {ok:false}。random 后缀 ~36^6 ≈ 21
-  // 亿组合，同毫秒冲突概率可忽略。main/config-store.js#saveConfig 也做了对称修复。
-  const tmpPath = `${dst}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  // P2-1：tmp 路径走加密安全随机。抽 main/generate-tmp-path.js 工厂，
+  // 内部用 crypto.randomUUID()（128-bit 加密安全，8-4-4-4-12 hex）替代
+  // 旧的 Math.random().toString(36).slice(2, 8) 6 位 base36 后缀。pid +
+  // Date.now() 跨进程/跨毫秒去重，UUID 兜住同进程同毫秒并发。路径格式
+  // `${dst}.tmp.${pid}.${ts}.${randomId}` 保持不变，fs-watcher 旧逻辑
+  // 只匹配 `.tmp.*` 前缀不受影响。
+  const tmpPath = generateTmpPath(dst);
   let fh;
   try {
-    fh = await fs.open(tmpPath, 'w');
+    // R5 P1-13：tmp 文件 mode 0o600 (rw owner only)。多用户 Linux/macOS
+    // 上其他用户能读父目录 → 也能读默认 0o644 的 tmp，里面可能含 AI Key
+    // 包络 / 用户笔记内容。Windows 不强制 mode（用 ACL），但设了不冲突；
+    // 跨平台语义一致。
+    fh = await fs.open(tmpPath, 'w', 0o600);
     await fh.writeFile(content, 'utf-8');
     // fsync 关键：没有 fsync，rename 之后断电可能留下「磁盘上 inode 改了
     // 但内容还在 page cache、从未刷盘」的零字节文件。Windows 上 fsync 等价
@@ -629,27 +734,19 @@ async function atomicWriteFile(dst, content) {
 
   try {
     await renameWithRetry(tmpPath, dst);
-    // audit fix (Round 4 P0-1)：rename 后 fsync 父目录（仅 Linux / POSIX）。
-    // POSIX rename(2) 在同分区下原子，但「目录项本身」写入磁盘的时机由内核
-    // 控制；不 fsync 目录就断电，磁盘上可能仍是旧名字 → 文件彻底丢失。
-    // Windows 上 NTFS 文件系统层 journal 元数据，这条 fsync 不需要（也无害，
-    // 但 fs.open(path, 'r') 在目录上 Windows 会拒绝写操作，所以这里走 OS 守卫）。
-    // 风险：失败 fsync 不抛（让 save 走 OK 路径），由下次保存自动覆盖。
-    if (process.platform !== 'win32') {
-      // Round 13 fix (H5)：dirFh.sync() 抛错时 close() 不会执行 → fd 泄漏。
-      // 长跑保存下磁盘压力大 / USB 抖动会让 sync 间歇失败，多次累加触发
-      // EMFILE；统一走 try/finally 兜底 close。
-      const dirFh = await fs.open(path.dirname(dst), 'r');
-      try {
-        await dirFh.sync();
-      } finally {
-        try { await dirFh.close(); } catch { /* close 失败也无能为力 */ }
-      }
-    }
   } catch (e) {
     // rename 失败：清理残余 tmp（不影响下次保存）
     try { await fs.unlink(tmpPath); } catch { /* 文件可能已被 rename 移走 */ }
     throw e;
+  }
+  // 父目录 fsync（audit Round 4 P0-1）：rename 已在 try/catch 之外，父目录
+  // fsync 失败不向上抛 —— 文件已成功 rename 落盘，仅「新名可能不持久化」，
+  // 走 main/fsync-parent-dir.js#fsyncParentDir（与 main.js file:rename /
+  // file:move / file:copy 同一份语义：win32 skip、open→sync→close、close
+  // 失败静默、open/sync 失败返 {ok:false, error}）。
+  const fsyncResult = await fsyncParentDir(dst);
+  if (!fsyncResult.ok) {
+    console.warn('[file-ops] 父目录 fsync 失败（不影响写入成功）:', fsyncResult.error);
   }
 }
 
@@ -673,6 +770,51 @@ async function renameWithRetry(src, dst) {
       if (!transient || i === delays.length) throw e;
       await new Promise((r) => setTimeout(r, delays[i]));
     }
+  }
+}
+
+/**
+ * audit fix (Folder move/copy)：递归复制一个目录到目标目录。
+ * 用于 file:copy 复制整个文件夹（含子目录）的场景。
+ *
+ * 安全：
+ *   - 拒绝跟随符号链接 —— 既跳过 src 树里的 symlink 文件/目录（不 follow 到
+ *     dataDir 外部），也拒绝 symlink 目录作为复制目的地（由调用方在入口已校验，
+ *     这里再防御一层：递归途中遇到 symlink 直接跳过，绝不 follow）。
+ *   - 调用方必须保证 srcAbs / destAbs 都在数据目录内、且 srcAbs 本身不是 symlink。
+ *
+ * 行为：
+ *   - 普通文件 → fs.copyFile
+ *   - 普通目录 → mkdir（recursive:false，父已被建好）+ 递归
+ *   - 其它（socket / fifo / device / symlink）→ 跳过，不复制
+ *
+ * @param {string} srcAbs  - 源目录绝对路径（已确认是真实目录）
+ * @param {string} destAbs - 目标目录绝对路径（已确认不存在，由调用方 mkdir 好父级）
+ * @returns {Promise<void>}
+ */
+async function recursiveCopy(srcAbs, destAbs) {
+  const dirents = await fs.readdir(srcAbs, { withFileTypes: true });
+  // 父目录已存在，确保目标目录本体存在（destAbs 是全新的空目录名）
+  await fs.mkdir(destAbs, { recursive: false });
+  for (const d of dirents) {
+    const srcChild = path.join(srcAbs, d.name);
+    const destChild = path.join(destAbs, d.name);
+    // symlink 一律跳过（lstat 探真实类型，不 follow）
+    if (d.isSymbolicLink()) continue;
+    if (d.isDirectory()) {
+      // 递归前再确认不是 symlink 目录（withFileTypes 的 isDirectory 已排除 symlink，
+      // 但防御性 stat 一层更稳）
+      try {
+        const st = await fs.lstat(srcChild);
+        if (st.isSymbolicLink()) continue;
+      } catch {
+        continue; // 读不到就跳过，不阻断整棵复制
+      }
+      await recursiveCopy(srcChild, destChild);
+    } else if (d.isFile()) {
+      await fs.copyFile(srcChild, destChild);
+    }
+    // 其它类型（FIFO / 设备 / socket）→ 不复制
   }
 }
 
@@ -701,11 +843,12 @@ async function cleanupStaleFileTmpFiles(dataDir) {
     const STALE_THRESHOLD_MS = 60_000;
     const CROSS_PID_STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
     for (const f of files) {
-      // 只匹配 atomicWriteFile 生成的 `<name>.<ext>.tmp.<pid>.<ts>.<rand>`。
+      // 只匹配 atomicWriteFile 生成的 `<name>.<ext>.tmp.<pid>.<ts>.<rand>`，
+      // rand 为 generateTmpPath 生成的 36 位带连字符 UUID（P2-1 起，非旧版 base36）。
       // audit fix (Tmp-L2)：旧版 `/\.tmp\.\d+\.\d+\.[a-z0-9]+$/i` 太宽，
       // 会把用户自己命名 / 同步盘生成 / 备份工具遗留的 `report.tmp.2024.1234567.abcdef`
       // 这种正常文件当成孤儿静默 unlink。必须要求 .tmp. 前面是 EDITABLE_EXTS
-      // 之一（白名单扩展名），且 tmp 段是 pid.ts.rand 严格三段数字 + 小写 base36。
+      // 之一（白名单扩展名）。
       // config-store 的 `config.json.tmp.*` 不在此正则范围内，仍由它自家扫（注释指向
       // shared/extension-lists.js#EDITABLE_EXTS，与 fileOps / sidebar 共用扩展名）。
       if (!ATOMIC_TMP_RE.test(f)) continue;
@@ -753,6 +896,113 @@ function friendlyWriteError(e) {
   return sharedFriendlyFsError(e && e.code, e && e.message);
 }
 
+/**
+ * 文件夹名避让（重命名时同分支），与 resolveFolderName 完全对称。
+ *
+ * 文件夹的「合法名」语义比 file 简单：用户输入什么就用什么，没有强制扩展名；
+ * Windows 保留字符 / 保留设备名 / 控制字符 / 路径分隔符沿用 file 同一套校验。
+ *
+ * 重名避让时整段 name 加 (2)(3)...，没有 "基础名 + 扩展名" 的两段切割。
+ *
+ * @param {string} raw
+ * @param {string} parentDir - 父目录绝对路径
+ * @returns {Promise<{ok:true, path:string, name:string} | {ok:false, error:string}>}
+ */
+async function resolveRenameFolderName(raw, parentDir) {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { ok: false, error: '文件夹名不能为空' };
+  }
+  const name = raw.trim();
+  if (/[/\\]/.test(name) || name.includes('..')) {
+    return { ok: false, error: '文件夹名不能包含路径分隔符或 ..' };
+  }
+  if (/[<>:"|?*]/.test(name)) {
+    return { ok: false, error: '文件夹名包含 Windows 保留字符（< > : " | ? *）' };
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f]/.test(name)) {
+    return { ok: false, error: '文件夹名包含非法字符' };
+  }
+  if (WIN_RESERVED_DEVICE_NAMES.has(name.toUpperCase())) {
+    return { ok: false, error: `"${name}" 是 Windows 保留设备名，不允许作为文件夹名` };
+  }
+
+  let candidate = name;
+  let counter = 2;
+  for (;;) {
+    const fullPath = path.join(parentDir, candidate);
+    if (!isWithinDataDir(fullPath, parentDir)) {
+      return { ok: false, error: '非法路径' };
+    }
+    const occupancy = await pathOccupancy(fullPath);
+    if (occupancy === 'free') {
+      return { ok: true, path: fullPath, name: candidate };
+    }
+    candidate = `${name} (${counter})`;
+    counter += 1;
+    if (counter > 1000) return { ok: false, error: '重名次数过多' };
+  }
+}
+
+/**
+ * 文件夹名清洗 + 重名避让。
+ *
+ * 与 file version 的 resolveFileName 完全同源：路径分隔符 / Windows 保留字符 /
+ * 保留设备名 / 控制字符 / 非空 一律预先拒绝。
+ *
+ * 与 file version 的关键差别：
+ *   - 不强制补扩展名：用户输入 "projects" / "PROJECTS" / "2026.drafts" 一律原样保留
+ *   - 重名避让只加 (2)/(3)...，不分基础名 / 扩展名切割（文件夹名不切）
+ *   - 占用检测 pathOccupancy 同样适用：父目录里已有同名 file 也会触发避让
+ *
+ * 用途：folder:create IPC handler 调它来拿最终路径 + name，主进程据此 mkdir。
+ *
+ * @param {string} raw
+ * @param {string} parentDir - 父目录绝对路径（新建文件夹的落点）
+ * @returns {Promise<{ok:true, path:string, name:string} | {ok:false, error:string}>}
+ */
+async function resolveFolderName(raw, parentDir) {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { ok: false, error: '文件夹名不能为空' };
+  }
+  const name = raw.trim();
+  // 拒绝路径分隔符与 .. 段
+  if (/[/\\]/.test(name) || name.includes('..')) {
+    return { ok: false, error: '文件夹名不能包含路径分隔符或 ..' };
+  }
+  // Windows 保留字符
+  if (/[<>:"|?*]/.test(name)) {
+    return { ok: false, error: '文件夹名包含 Windows 保留字符（< > : " | ? *）' };
+  }
+  // 控制字符
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f]/.test(name)) {
+    return { ok: false, error: '文件夹名包含非法字符' };
+  }
+  // Windows 保留设备名：文件夹不带扩展名分支，直接整段判断；带点（DRAFT.2026）也按整段判断
+  //（device name 不带点的语义由 NTFS 决定 —— 但 Notes 里不刻意区分，统按整段拒保守）
+  if (WIN_RESERVED_DEVICE_NAMES.has(name.toUpperCase())) {
+    return { ok: false, error: `"${name}" 是 Windows 保留设备名，不允许作为文件夹名` };
+  }
+
+  let candidate = name;
+  let counter = 2;
+  for (;;) {
+    const fullPath = path.join(parentDir, candidate);
+    if (!isWithinDataDir(fullPath, parentDir)) {
+      return { ok: false, error: '非法路径' };
+    }
+    const occupancy = await pathOccupancy(fullPath);
+    if (occupancy === 'free') {
+      return { ok: true, path: fullPath, name: candidate };
+    }
+    // file / directory 都视为占用
+    candidate = `${name} (${counter})`;
+    counter += 1;
+    if (counter > 1000) return { ok: false, error: '重名次数过多' };
+  }
+}
+
 module.exports = {
   MAX_FILE_SIZE,
   EDITABLE_EXTS,
@@ -763,12 +1013,15 @@ module.exports = {
   isWithinDataDir,
   resolveFileName,
   resolveRenameName,
+  resolveFolderName,
+  resolveRenameFolderName,
   scanFiles,
   scanDir,
   resolveDirRelative,
   toRelativeDir,
   atomicWriteFile,
   renameWithRetry,
+  recursiveCopy,
   cleanupStaleFileTmpFiles,
   friendlyWriteError,
 };

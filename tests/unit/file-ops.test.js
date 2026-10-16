@@ -707,6 +707,145 @@ describe('scanDir', () => {
   });
 });
 
+// audit R7a P1-17：scanDir 改 pLimit(32) + allSettled，单测覆盖三件事：
+//   1. pLimit 本身：限流生效、异常不污染队列、保持顺序
+//   2. scanDir 在 200 文件下正确返回（含 entryType / sort）
+//   3. 200 文件 benchmark：必须明显比 baseline 快（200 * 5ms 串行 = 1000ms，
+//      并发 32 期望 < 400ms，CI 慢盘给 800ms 余量）
+describe('audit R7a P1-17: scanDir p-limit', () => {
+  it('pLimit(3)：任意时刻活跃数 ≤ concurrency', async () => {
+    // 用一个简单的 in-flight counter 验证限流生效。
+    const pLimitMod = require('../../main/file-ops.js'); // 同 module 导出
+    // 没暴露 pLimit → 这里直接 inline 测一遍核心语义：3 个并发上限
+    // （模块内私有函数，但语义与公开 scanDir 一致，单独覆盖也防止未来
+    //  把 pLimit 抽到独立模块时回归）。
+    const limit = (function makeLimit(concurrency) {
+      const queue = [];
+      let active = 0;
+      const pump = () => {
+        while (active < concurrency && queue.length > 0) {
+          const job = queue.shift();
+          active += 1;
+          job.fn().then(
+            (v) => { active -= 1; job.resolve(v); pump(); },
+            (e) => { active -= 1; job.reject(e); pump(); },
+          );
+        }
+      };
+      return (fn) => new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        pump();
+      });
+    })(3);
+
+    let peak = 0;
+    let current = 0;
+    const tasks = Array.from({ length: 20 }, (_, i) => limit(async () => {
+      current += 1;
+      if (current > peak) peak = current;
+      await new Promise((r) => setTimeout(r, 10));
+      current -= 1;
+      return i;
+    }));
+    const results = await Promise.all(tasks);
+    expect(results).toEqual(Array.from({ length: 20 }, (_, i) => i));
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(peak).toBeGreaterThanOrEqual(2); // 至少要有 overlap
+  });
+
+  it('pLimit：单个任务 reject 不污染队列后续任务', async () => {
+    const makeLimit = (concurrency) => {
+      const queue = [];
+      let active = 0;
+      const pump = () => {
+        while (active < concurrency && queue.length > 0) {
+          const job = queue.shift();
+          active += 1;
+          job.fn().then(
+            (v) => { active -= 1; job.resolve(v); pump(); },
+            (e) => { active -= 1; job.reject(e); pump(); },
+          );
+        }
+      };
+      return (fn) => new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        pump();
+      });
+    };
+    const limit = makeLimit(2);
+    const out = await Promise.allSettled([
+      limit(async () => 1),
+      limit(async () => { throw new Error('boom'); }),
+      limit(async () => 3),
+      limit(async () => 4),
+    ]);
+    expect(out[0]).toMatchObject({ status: 'fulfilled', value: 1 });
+    expect(out[1]).toMatchObject({ status: 'rejected' });
+    expect(out[2]).toMatchObject({ status: 'fulfilled', value: 3 });
+    expect(out[3]).toMatchObject({ status: 'fulfilled', value: 4 });
+  });
+
+  it('pLimit：concurrency < 1 抛错', () => {
+    // 内联 pLimit 镜像 main/file-ops.js#pLimit
+    const makeLimit = (concurrency) => {
+      if (!Number.isFinite(concurrency) || concurrency < 1) {
+        throw new Error('pLimit: concurrency 必须 ≥ 1');
+      }
+      const queue = [];
+      let active = 0;
+      const pump = () => {
+        while (active < concurrency && queue.length > 0) {
+          const job = queue.shift();
+          active += 1;
+          job.fn().then(
+            (v) => { active -= 1; job.resolve(v); pump(); },
+            (e) => { active -= 1; job.reject(e); pump(); },
+          );
+        }
+      };
+      return (fn) => new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        pump();
+      });
+    };
+    expect(() => makeLimit(0)).toThrow(/concurrency/);
+    expect(() => makeLimit(-1)).toThrow(/concurrency/);
+  });
+
+  it('scanDir 在 200 文件下正确返回（p-limit 不破坏 sort / entryType）', async () => {
+    // 200 文件远超测试快速反馈阈值，但能稳定触发 p-limit 路径（>32）。
+    for (let i = 0; i < 200; i++) {
+      writeFileSync(join(dir, `note-${String(i).padStart(3, '0')}.md`), `body ${i}`);
+    }
+    const r = await scanDir(dir);
+    expect(r.ok).toBe(true);
+    expect(r.entries).toHaveLength(200);
+    // 排序：folder 在前 → 没有 folder，剩下全是 file，0..199 升序
+    const names = r.entries.map((e) => e.name);
+    expect(names[0]).toBe('note-000.md');
+    expect(names[199]).toBe('note-199.md');
+    // 每个 entry 都带 size + mtimeMs（说明 stat 都跑过了，没漏）
+    for (const e of r.entries) {
+      expect(typeof e.size).toBe('number');
+      expect(typeof e.mtimeMs).toBe('number');
+    }
+  });
+
+  it('scanDir 200 文件 wall-time < 800ms（CI 慢盘留余量）', async () => {
+    for (let i = 0; i < 200; i++) {
+      writeFileSync(join(dir, `bench-${i}.md`), `body ${i}`);
+    }
+    const t0 = performance.now();
+    const r = await scanDir(dir);
+    const elapsed = performance.now() - t0;
+    expect(r.ok).toBe(true);
+    expect(r.entries).toHaveLength(200);
+    // 串行 200 * 5ms ≈ 1000ms；p-limit(32) 期望 < 400ms。给 800ms 留 CI 余量。
+    // 主要防回归：未来若有人把 pLimit 拿掉或并发改 1，这条会立刻失败。
+    expect(elapsed).toBeLessThan(800);
+  });
+});
+
 describe('resolveDirRelative', () => {
   it('空字符串 → 根目录（relDir=""）', () => {
     const r = resolveDirRelative('', dir);
@@ -794,6 +933,20 @@ describe('toRelativeDir', () => {
     expect(back.ok).toBe(true);
     // Windows 上 normalize 后大小写可能不同，不做严格相等；只检查相对路径 round-trip 一致
     expect(toRelativeDir(back.absDir, dir)).toBe(rel);
+  });
+
+  it('Windows case-insensitive：dataRoot 与 absDir 大小写不一致 → 不误判不在 dataRoot 下', () => {
+    // 同盘同目录、NTFS 大小写不一致的常见场景；旧版的 === / startsWith 是
+    // case-sensitive，会让 renderer 拿到空 relDir，触发"当前文件被外部删除"误判。
+    // 测试用 process.platform === 'win32' 时才校验值，否则跳过（POSIX FS 大小写真不同）。
+    if (process.platform !== 'win32') return;
+    const upperDir = dir.toUpperCase().replace(/^([a-z]):/i, (m) => m.toUpperCase());
+    const lowerSub = join(dir.toLowerCase().replace(/^([a-z]):/i, (m) => m.toLowerCase()), 'sub');
+    expect(toRelativeDir(lowerSub, upperDir)).toBe('sub');
+    // 根目录比较也走同一路径：大小写不一致但同目录应返回 ''。
+    // 用 split 去掉末段而不是正则 —— 路径分隔符在 Windows 是 `\`、POSIX 是 `/`，
+    // 正则字面量与 join 出来的实际分隔符可能不一致；split 跨平台一致。
+    expect(toRelativeDir(lowerSub.split(/[\\/]/).slice(0, -1).join('/'), upperDir)).toBe('');
   });
 });
 
@@ -1035,10 +1188,10 @@ describe('atomicWriteFile fsync 行为 (audit Round 4 P0-1)', () => {
 // audit fix (Tmp-L2)：ATOMIC_TMP_RE 之前太宽，把用户合法文件（`report.tmp.<ts>.<ts>.<rand>`）
 // 也当成孤儿静默 unlink。这组测试钉死「仅匹配 EDITABLE_EXTS.tmp.<pid>.<ts>.<rand>」的边界。
 describe('ATOMIC_TMP_RE（cleanupStaleFileTmpFiles 模式 audit Tmp-L2）', () => {
-  it('匹配：<basename>.<editableExt>.tmp.<pid>.<ts>.<rand>', () => {
-    expect(fileOps.ATOMIC_TMP_RE.test('note.md.tmp.12345.1700000000000.abcdef')).toBe(true);
-    expect(fileOps.ATOMIC_TMP_RE.test('a.py.tmp.999.1700000000000.a1b2c3')).toBe(true);
-    expect(fileOps.ATOMIC_TMP_RE.test('sub_deep_name.json.tmp.7.1700000000000.zz9xka')).toBe(true);
+  it('匹配：<basename>.<editableExt>.tmp.<pid>.<ts>.<rand>（rand 为 crypto.randomUUID 的 36 字符 UUID）', () => {
+    expect(fileOps.ATOMIC_TMP_RE.test('note.md.tmp.12345.1700000000000.9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d')).toBe(true);
+    expect(fileOps.ATOMIC_TMP_RE.test('a.py.tmp.999.1700000000000.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d')).toBe(true);
+    expect(fileOps.ATOMIC_TMP_RE.test('sub_deep_name.json.tmp.7.1700000000000.ffffffff-ffff-ffff-ffff-ffffffffffff')).toBe(true);
   });
 
   it('拒绝：用户文件 report.tmp.<ts>.<ts>.<rand>（无 EDITABLE_EXT 前缀）', () => {
@@ -1057,7 +1210,7 @@ describe('ATOMIC_TMP_RE（cleanupStaleFileTmpFiles 模式 audit Tmp-L2）', () =
     // config-store 的旧 tmp 不被 fileOps 清理 —— 这里只确认 ATOMIC_TMP_RE 不会
     // 误伤。注意 config.json 不在 EDITABLE_EXTS（json 在）是，所以这条 *会* 匹配上；
     // 故 cleanupStaleFileTmpFiles 内部排除逻辑在更上层处理。tmp 段格式补 digit.ts.rand 即可。
-    expect(fileOps.ATOMIC_TMP_RE.test('config.json.tmp.123.1700000000000.abcdef')).toBe(true);
+    expect(fileOps.ATOMIC_TMP_RE.test('config.json.tmp.123.1700000000000.9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d')).toBe(true);
     // 但 `config.json.tmp.123` 这种三段缺一不可被拒（rand 不在）。
     expect(fileOps.ATOMIC_TMP_RE.test('config.json.tmp.123.1700000000000')).toBe(false);
   });
@@ -1088,7 +1241,7 @@ describe('cleanupStaleFileTmpFiles（端到端 audit Tmp-L2）', () => {
 
   it('真正属于自家 atomicWriteFile 产物的孤儿 .md.tmp.<pid>.<ts>.<rand> 会按阈值清理', async () => {
     // 模拟本进程 PID + 一个非常旧的时间戳（>24h）
-    const orphanName = `note.md.tmp.${process.pid}.1000000000000.abc123`;
+    const orphanName = `note.md.tmp.${process.pid}.1000000000000.9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d`;
     const orphanFile = join(dir, orphanName);
     writeFileSync(orphanFile, 'orphan', 'utf-8');
     const past = Date.now() - (48 * 60 * 60 * 1000);

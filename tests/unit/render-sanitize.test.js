@@ -86,10 +86,20 @@ describe('ALLOWED_URI_REGEXP 单测', () => {
     ['.\\foo.png', true],
     ['..\\up.md', true],
     ['\\abs\\x.png', true],
+    // Mac/Linux 文件名 / 路径段内允许 `:` —— 之前 `[^/\\:]*` 把整个 Mac 截图命名
+    // 习惯（`image:001.jpg` 等）拒掉，正则分支 A 用 `(?![/\\])` 守住
+    // `data:text/html` / `javascript:foo/bar` 同形态，外层 `(?!)` 显式拒已
+    // 知危险 / 未授权 scheme，IMG 分支再 defense-in-depth。
+    ['image:001.jpg', true],
+    ['screenshot:1.png', true],
+    ['dir/sub:dir/file.png', true],
+    // 即使危险 scheme 后只接字母（无 `/`），正则仍拒绝：顶层 `(?!)` 拦掉。
+    ['javascript:foo', false],
+    ['vbscript:foo', false],
+    ['about:blank', false],
     ['javascript:alert(1)', false],
     ['vbscript:msgbox(1)', false],
     ['data:text/html,xxx', false],
-    ['about:blank', false],
     ['chrome-extension://x/y', false],
     // 协议相对 URL：// 或 \\ 开头会被浏览器解析为「继承当前 scheme」，
     // 攻击面是「静默导航到外站 / 把用户隐私发给 evil.com」。
@@ -189,6 +199,26 @@ describe('<img src> 保留策略', () => {
     // 一致性差，且与 ALLOWED_URI_REGEXP 单点策略不一致。现在统一被剥。
     const html = render('![a](data:text/html,<script>x</script>)');
     expect(html).not.toMatch(/src="data:text\/html/i);
+  });
+
+  // Mac/Linux 文件名 / 路径段内允许 `:`（修复前会被剥）。分支 A `(?![/\\])`
+  // 让 `image:001.jpg` 通过、`data:text/html` 拒掉；外层 `(?!)` 与 IMG 兜底把
+  // 形如 `javascript:foo` / `vbscript:foo` / `about:blank` 拦死。
+  it.each([
+    ['image:001.jpg', 'image:001.jpg'],
+    ['screenshot:1.png', 'screenshot:1.png'],
+    ['dir/sub:dir/file.png', 'dir/sub:dir/file.png'],
+  ])('Mac/Linux 文件名带 : 保留 src（%s）', (_label, src) => {
+    const html = render(`![a](${src})`);
+    expect(html).toContain(`src="${src}"`);
+  });
+
+  it('javascript:foo / vbscript:foo / about:blank（无括号变体）在 <img src> 被剥', () => {
+    // 这些形态与新增的 Mac 文件名分支 A 同结构 —— 分支 A `(?![/\\])` 不会拒它们
+    // （没有 `/` 紧跟 `:`），靠外层 `(?!)` 兜底。测试保证这条防御路径覆盖到。
+    expect(render('![a](javascript:foo)')).not.toMatch(/src="javascript:/);
+    expect(render('![a](vbscript:foo)')).not.toMatch(/src="vbscript:/i);
+    expect(render('![a](about:blank)')).not.toMatch(/src="about:/i);
   });
 
   // fix(audit 2026-08)：SVG 数据 URL 在 <a href> 上点击会导航到 top-level SVG

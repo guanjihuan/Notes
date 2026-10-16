@@ -23,8 +23,10 @@
   position: fixed;
   inset: 0;
   background: var(--scrim);
-  -webkit-backdrop-filter: blur(4px);
-  backdrop-filter: blur(4px);
+  /* audit P3 一致性：去掉 backdrop-filter blur(4) —— 与 toolbar / statusbar /
+     toast / context-menu 同源：实色 --scrim 看不出毛玻璃，每帧重算 4px 模糊
+     区域的 GPU 成本却是真实的。modal 内是 bg-elevated 实色卡片，背景 scrim
+     本就被压成纯黑，再糊一次无视觉差异。 */
   z-index: var(--z-modal);
   display: flex;
   align-items: center;
@@ -183,8 +185,9 @@
 /* 文件路径 / 配置 id 等"代码类"内容才用等宽字体 */
 .form-input-mono {
   font-family: var(--font-mono);
-  /* 13 → 12.5：mono 字符本身比 sans 宽，略缩小避免路径溢出按钮 */
-  font-size: 12.5px;
+  /* 13 → 12：mono 字符比 sans 宽，用标准令牌 --fs-xs-readable(12px) 略缩小避免路径溢出按钮，
+     同时对齐设计令牌体系（不再用非标 12.5px） */
+  font-size: var(--fs-xs-readable);
 }
 
 /* M-series fix (audit Phase M-CSS-11)：AI 系统提示词框等 textarea 之前
@@ -193,7 +196,7 @@
    JSON / 模板）+ 最小 4 行高度，避免双击 textarea 后立刻只有 1 行。 */
 .form-input.form-textarea {
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: var(--fs-xs-readable);
   line-height: 1.5;
   min-height: calc(1.5em * 4 + 20px); /* 4 行 + 上下 padding */
   resize: vertical;
@@ -230,7 +233,7 @@
 }
 .form-error {
   margin: 4px 0 0;
-  font-size: 12px;
+  font-size: var(--fs-xs-readable);
   line-height: 1.45;
   color: var(--accent-text);
 }
@@ -501,7 +504,7 @@
 
 .settings-callout-text code {
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-xs-readable);
   padding: 1px 5px;
   background: var(--bg-hover);
   border-radius: 3px;
@@ -557,8 +560,8 @@
   background: var(--bg-hover);
   padding: 1px 5px;
   border-radius: 3px;
-  /* 11 → 12：与外层 subtitle 一致，避免 code 反而更小 */
-  font-size: 12px;
+  /* 12 = --fs-xs-readable：与外层 subtitle 一致，避免 code 反而更小 */
+  font-size: var(--fs-xs-readable);
 }
 
 /* 关于段：开发者信息 + 主页链接 —— 不可改，只展示。 */
@@ -593,8 +596,7 @@
 .about-link {
   margin-left: 0;
   font-family: var(--font-mono);
-  /* URL 一般偏长，13px 即可；与 .form-input-mono 同字号 */
-  font-size: 12.5px;
+  font-size: var(--fs-xs-readable);
   /* 长 URL 默认会在空格 / 标点断行；强制按字符断，避免撑出右侧 padding */
   word-break: break-all;
 }
@@ -942,9 +944,10 @@
 
 .aiprovider-card {
   display: grid;
-  /* icon 24px + body 1fr：去掉旧版的 `auto` 第三列（.aiprovider-protocol），
-     那列重复了 hint 文本里的协议路径，且把 body 挤窄。 */
-  grid-template-columns: 24px 1fr;
+  /* icon 列用 auto 而非固定 24px：wordmark "Claude"（约 50px 宽）放进 24px 轨道
+     会被裁切；auto 让轨道按药丸实际内容宽度撑开，同时 body(1fr) 仍占满剩余宽度。
+     去掉旧版第三列 .aiprovider-protocol（重复 hint 协议路径）。 */
+  grid-template-columns: auto 1fr;
   align-items: center;
   gap: 10px;
   /* 沿用 .picker-card 通用 padding 即可；AI 卡片是横向布局，
@@ -957,8 +960,11 @@
 }
 
 .aiprovider-icon {
-  width: 24px;
+  /* 轨道改 auto 后，药丸按内容宽度撑开（"Claude" 约 50px），不再被裁切；
+     高度仍 24px 与其余 picker 图标对齐，white-space:nowrap 保证字样不换行。 */
   height: 24px;
+  padding: 0 7px;
+  white-space: nowrap;
   border-radius: var(--radius-sm);
   background: var(--accent-soft);
   color: var(--accent);

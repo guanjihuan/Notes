@@ -10,21 +10,32 @@
   <!-- viewport meta (Round 12 P1 audit)：桌面 Electron 也有 webview / web mode 兼容场景 -->
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!--
-    Content Security Policy (加固版):
+    Content Security Policy (加固版 · audit P0-2):
     - default-src 'self' 只允许加载同源资源
     - style-src 'self' 'unsafe-inline' 允许 inline style（marked 渲染的代码块可能会用到）
-    - script-src 'self' 'unsafe-inline' 允许同源 + 内联脚本（用于 importmap）
+    - script-src 'self' 'sha256-XXX=' 仅同源 + importmap 内联块（hash 锁死）
     - img-src 'self' data: file: 允许 markdown 内嵌图片（本地 + base64）
     - object-src 'none' 禁止 <object>/<embed>/<applet>（插件 XSS 通道）
     - base-uri 'none' 禁止 <base> 标签劫持相对 URL
     - form-action 'none' 禁止 form 提交外发（即使有 <form> 也是死链）
 
-    关于 'unsafe-inline'：本应用唯一的内联脚本是 importmap（用于映射 CodeMirror 包）。
-    渲染端的实际代码全部走 .js 文件加载。Markdown 内容经 DOMPurify 清洗，<script> 会被剥离。
-    在 contextIsolation + nodeIntegration:false 下，加 'unsafe-inline' 不引入额外 XSS 风险。
-    未来若改用 nonce 或 hash，可去除 'unsafe-inline'。
+    关于 script-src：原 'unsafe-inline' 留下 XSS 后续路径（任何位置注入的
+    inline script 都被放行）。本应用唯一的内联脚本是 importmap（用于映射
+    CodeMirror 包），所以给 importmap inner content 算 SHA-256，写到 CSP
+    里精确放行它一个。改 importmap 必须重算 hash 并同步本行 —— 否则 renderer
+    启动会「Refused to execute inline script」/ importmap 失效 → 大量
+    「Failed to resolve module specifier」。测试 csp-importmap-hash.test.js
+    锁死这条契约。
+
+    ⚠️ CRLF 坑（2026-10-16 实踩）：本仓库所有源文件是 CRLF 换行，但浏览器
+    HTML tokenizer 在算 CSP hash 前会把脚本内容里的 \r\n / \r 归一化成 \n。
+    所以 CSP 里的 hash 必须是「CRLF→LF 归一化后」的 importmap 内容 SHA-256，
+    而不是 Node 直接读原始 CRLF 字节算出的 hash——两者不同（旧值 7pe/... 是
+    CRLF 字节 hash，浏览器实际算出来是 Fmcb...）。csp-importmap-hash.test.js
+    已改为先归一化换行再算 hash，与浏览器行为一致，避免再次静默漂移。
+    结论：永远用浏览器归一化后的 hash；改 importmap 后必须重算并同步本行。
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: file:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-FmcbAaTwesLByPTe0spZSvAlhuyc5I6BR4OJt6o0fB0='; img-src 'self' data: file:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none';">
   <title>Notes</title>
 
   <!--
@@ -79,7 +90,27 @@
   }
   </script>
 
-  <link rel="stylesheet" href="src/styles.css">
+  <!-- P2-8（audit）：12 个分片直接 <link> 并列，替代 styles.css 单入口 + 12 条 @import。
+       @import 是「解析到才发现」的串行瀑布（styles.css 回来 → 才发现 01 → …）；
+       12 个 <link> 在 HTML parse 时一次性全部发现，并行 fetch。
+       不用 audit 建议的 preload + onload=this.rel='stylesheet' 异步 hack ——
+       那是「不阻塞渲染」换 FOUC（无样式闪烁），应用外壳首屏白一下比 12 个
+       本地文件并行 fetch 的 ~10ms 更难看。link 仍阻塞渲染，但并行后总耗时
+       ≈ 最慢一片，而非 12 片串行之和。
+       级联顺序 = 文档顺序，与原 @import 顺序严格一致（01 tokens 最先 … 12 print 最后）。
+       新增分片时：这里 + src/styles.css（tests/manual 页面仍走单入口）两处同步。 -->
+  <link rel="stylesheet" href="src/styles/01-tokens.css">
+  <link rel="stylesheet" href="src/styles/02-palettes.css">
+  <link rel="stylesheet" href="src/styles/03-base.css">
+  <link rel="stylesheet" href="src/styles/04-toolbar.css">
+  <link rel="stylesheet" href="src/styles/05-sidebar.css">
+  <link rel="stylesheet" href="src/styles/06-markdown.css">
+  <link rel="stylesheet" href="src/styles/07-statusbar.css">
+  <link rel="stylesheet" href="src/styles/08-modal.css">
+  <link rel="stylesheet" href="src/styles/09-misc.css">
+  <link rel="stylesheet" href="src/styles/10-a11y.css">
+  <link rel="stylesheet" href="src/styles/11-ai.css">
+  <link rel="stylesheet" href="src/styles/12-print.css">
 </head>
 <body data-theme="dark" data-theme-palette="default" data-focus-mode="false">
 
@@ -133,12 +164,16 @@
           <circle cx="11" cy="11" r="7"></circle>
           <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
         </svg>
+        <!-- aria-controls="file-list"：让屏幕阅读器在输入时宣告"过滤文件列表"，
+             也让用户知道输入框控制的列表元素 id（audit P2-22）。
+             仅声明关系，不改变视觉/键盘行为。 -->
         <input
           type="search"
           id="search-input"
           class="search-input"
           placeholder="搜索文件..."
           aria-label="搜索文件"
+          aria-controls="file-list"
         >
       </div>
       <span class="toolbar-divider" aria-hidden="true"></span>
@@ -146,7 +181,7 @@
       <!-- 应用组：主题 + 置顶 -->
       <div class="toolbar-group">
         <div class="btn-group" role="group" aria-label="外观">
-          <button class="btn-icon btn-group-item" id="btn-theme" title="切换主题 (当前: 暗色主题)" aria-label="切换主题">
+          <button class="btn-icon btn-group-item" id="btn-theme" title="切换主题 (当前: 暗色主题)" aria-label="切换主题" data-shortcut="Ctrl+Shift+T">
             <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="12" cy="12" r="5"></circle>
               <line x1="12" y1="1" x2="12" y2="3"></line>
@@ -176,21 +211,21 @@
       <!-- 视图组：预览 / 编辑 / 双栏（图标 + 文字按钮，比纯图标更易识别） -->
       <div class="toolbar-group">
         <div class="btn-group btn-group-text" role="group" aria-label="视图模式">
-          <button class="btn-icon-text btn-group-item" id="btn-mode-preview" title="预览模式 (Ctrl+E 切换)" aria-label="预览模式" aria-pressed="true">
+          <button class="btn-icon-text btn-group-item" id="btn-mode-preview" title="预览模式 (Ctrl+E 切换)" aria-label="预览模式" aria-pressed="true" data-shortcut="Ctrl+E">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
               <circle cx="12" cy="12" r="3"></circle>
             </svg>
             <span class="btn-label">预览</span>
           </button>
-          <button class="btn-icon-text btn-group-item" id="btn-mode-edit" title="编辑模式 (Ctrl+E 切换)" aria-label="编辑模式" aria-pressed="false">
+          <button class="btn-icon-text btn-group-item" id="btn-mode-edit" title="编辑模式 (Ctrl+E 切换)" aria-label="编辑模式" aria-pressed="false" data-shortcut="Ctrl+E">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M12 20h9"></path>
               <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
             </svg>
             <span class="btn-label">编辑</span>
           </button>
-          <button class="btn-icon-text btn-group-item" id="btn-mode-split" title="双栏模式 (Ctrl+E 切换)" aria-label="双栏模式" aria-pressed="false">
+          <button class="btn-icon-text btn-group-item" id="btn-mode-split" title="双栏模式 (Ctrl+E 切换)" aria-label="双栏模式" aria-pressed="false" data-shortcut="Ctrl+E">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect x="3" y="3" width="18" height="18" rx="2"></rect>
               <line x1="12" y1="3" x2="12" y2="21"></line>
@@ -203,7 +238,7 @@
       <span class="toolbar-divider" aria-hidden="true"></span>
 
       <!-- 布局组：恢复默认侧栏宽度 + 双栏比例 -->
-      <div class="toolbar-group">
+      <div class="toolbar-group" id="tg-reset-layout">
         <button class="btn-icon" id="btn-reset-layout" title="重置布局（恢复默认侧栏宽度 + 双栏比例）" aria-label="重置布局">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <rect x="3" y="3" width="18" height="18" rx="2"></rect>
@@ -245,7 +280,7 @@
           保存按钮始终显示在工具栏；需要保存（脏）时进入 is-dirty 提醒态（warning 色 + 脉动）。
           见 [[feedback-save-button-always-visible]]。
         -->
-        <button class="btn-icon" id="btn-save" title="保存 (Ctrl+S)" aria-label="保存">
+        <button class="btn-icon" id="btn-save" title="保存 (Ctrl+S)" aria-label="保存" data-shortcut="Ctrl+S">
           <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
             <polyline points="17 21 17 13 7 13 7 21"></polyline>
@@ -267,7 +302,7 @@
             <line x1="14.5" y1="13" x2="9.5" y2="18"></line>
           </svg>
         </button>
-        <button class="btn-icon" id="btn-settings" title="设置 (Ctrl+,)" aria-label="设置">
+        <button class="btn-icon" id="btn-settings" title="设置 (Ctrl+,)" aria-label="设置" data-shortcut="Ctrl+,">
           <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"></circle>
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
@@ -306,32 +341,58 @@
   <div class="app-shell" id="app">
     <aside class="sidebar" id="sidebar" aria-label="文件与目录">
       <!-- 搜索框已上移到工具栏（见 .toolbar-search），侧栏不再保留 header。
-           排序工具条 + 新建笔记合并行作为首屏唯一入口，垂直空间专注于文件列表 -->
-      <!-- 排序工具条 + 新建笔记：紧贴它作用的列表，避免埋进设置对话框（见 [[feedback-prefer-near-affected-area]]）。
-           新建笔记从独立行合并到排序条右端：节省垂直空间，让侧栏首屏只剩「工具条」一行，
-           主操作 + 列表工具就近成组，视觉密度更紧凑 -->
-      <div class="sidebar-sort" role="group" aria-label="文件列表排序与新建">
-        <button id="btn-sort-name" type="button" class="sidebar-sort-btn is-active" aria-pressed="true" title="按名称 A → Z 排序">
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 6h13M3 12h9M3 18h5"></path>
-            <path d="M19 4v16M16 17l3 3 3-3"></path>
-          </svg>
-          <span>名称</span>
-        </button>
-        <button id="btn-sort-mtime" type="button" class="sidebar-sort-btn" aria-pressed="false" title="按修改时间排序（最近修改在前）">
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="9"></circle>
-            <polyline points="12 7 12 12 15 14"></polyline>
-          </svg>
-          <span>修改时间</span>
-        </button>
-        <button id="btn-new-file" class="sidebar-new-btn sidebar-new-btn--inline" type="button" title="新建笔记 (Ctrl+N)" aria-label="新建笔记">
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <line x1="12" y1="5" x2="12" y2="19"></line>
-            <line x1="5" y1="12" x2="19" y2="12"></line>
-          </svg>
-          <span>新建笔记</span>
-        </button>
+           排序工具条作为首屏唯一入口，垂直空间专注于文件列表 -->
+      <!-- 排序工具条：紧贴它作用的列表，避免埋进设置对话框（见 [[feedback-prefer-near-affected-area]]）。
+           新建文件 / 新建文件夹已挪到右键菜单（侧栏空白右键、文件夹条目右键），
+           侧栏首屏只剩「排序工具条」一行，主操作 + 列表工具就近成组，视觉密度更紧凑。
+           排序模式改用下拉：触发器显示当前排序 + 向下箭头，点击展开 4 项菜单
+           （名称 A→Z / Z→A、修改时间 新→旧 / 旧→新）。多选项用下拉比并排按钮更紧凑，
+           加新排序时只要往 SETTINGS_UI_OPTIONS.fileListSort 加一项。 -->
+      <div class="sidebar-sort" role="group" aria-label="文件列表排序">
+        <div class="sidebar-sort-dropdown" id="sidebar-sort-dropdown">
+          <button id="btn-sort-trigger" type="button" class="sidebar-sort-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="sidebar-sort-menu" title="点击切换排序方式">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 6h13M3 12h9M3 18h5"></path>
+              <path d="M19 4v16M16 17l3 3 3-3"></path>
+            </svg>
+            <span class="sidebar-sort-trigger-label" id="sidebar-sort-trigger-label">排序：按名称</span>
+            <svg class="sidebar-sort-trigger-chevron" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </button>
+          <ul class="sidebar-sort-menu" id="sidebar-sort-menu" role="menu" hidden>
+            <!-- 4 个选项互斥单选（同一时刻只有一种 sort），
+                 role="menuitemradio" + aria-checked 是 ARIA 1.1 标准模式，
+                 比 menuitem 更准（menuitem 用于「执行动作」的项） -->
+            <li role="menuitemradio" class="sidebar-sort-menu-item" data-sort="name" tabindex="-1" aria-checked="true">
+              <span class="sidebar-sort-menu-check" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </span>
+              <span class="sidebar-sort-menu-text">按名称<span class="sidebar-sort-menu-hint">A → Z</span></span>
+            </li>
+            <li role="menuitemradio" class="sidebar-sort-menu-item" data-sort="name-desc" tabindex="-1" aria-checked="false">
+              <span class="sidebar-sort-menu-check" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </span>
+              <span class="sidebar-sort-menu-text">按名称<span class="sidebar-sort-menu-hint">Z → A</span></span>
+            </li>
+            <!-- 分组分隔：「名称」与「修改时间」两类排序之间加 1px line —— 选项一多时
+                 视觉分组让扫读速度显著提升；separator role 给读屏「这两组」语义 -->
+            <li role="separator" class="sidebar-sort-menu-separator" aria-hidden="true"></li>
+            <li role="menuitemradio" class="sidebar-sort-menu-item" data-sort="mtime-desc" tabindex="-1" aria-checked="false">
+              <span class="sidebar-sort-menu-check" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </span>
+              <span class="sidebar-sort-menu-text">按修改时间<span class="sidebar-sort-menu-hint">新 → 旧</span></span>
+            </li>
+            <li role="menuitemradio" class="sidebar-sort-menu-item" data-sort="mtime-asc" tabindex="-1" aria-checked="false">
+              <span class="sidebar-sort-menu-check" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </span>
+              <span class="sidebar-sort-menu-text">按修改时间<span class="sidebar-sort-menu-hint">旧 → 新</span></span>
+            </li>
+          </ul>
+        </div>
       </div>
 
       <!-- Folder Browser（Stage 8）：面包屑 + 「回到根」按钮，贴近它作用的文件列表。
@@ -424,6 +485,10 @@
     <div id="ai-splitter" class="ai-splitter" role="separator" aria-orientation="vertical" aria-label="拖动调整 AI 面板宽度" aria-controls="app-ai" title="拖动调整 AI 面板宽度" hidden></div>
 
     <main class="viewer" id="viewer-main" tabindex="-1">
+      <!-- 阅读进度条：紧贴阅读区顶部，随滚动从左向右填充。
+           视觉上把「当前读到哪」从状态栏的百分比文本升级成一条细线，
+           比数字更直觉；stored 在 .viewer 滚动容器里，滚动时钉在顶部不随内容走。 -->
+      <div class="reading-progress" id="reading-progress" aria-hidden="true"><span class="reading-progress-bar" id="reading-progress-bar"></span></div>
       <article id="markdown-body" class="markdown-body" hidden>
         <!-- markdown 渲染输出 -->
       </article>
@@ -441,6 +506,16 @@
           把 <code>.md</code> 文件放入数据文件夹后，<br>
           会自动出现在左侧列表。
         </p>
+        <!-- 空状态 CTA：让"还没动手"的用户有一个最直接的下一步。
+             与 .sidebar-new-btn 共享配色 token，但不复用 width:100% —— 这是居中布局，
+             紧凑的「auto width」按钮视觉重心更聚焦；hover/active 反馈继承全局 .btn 语义。 -->
+        <button id="empty-state-new-btn" class="empty-state-cta" type="button" aria-label="新建笔记 (Ctrl+N)">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          <span>新建笔记</span>
+        </button>
         <p class="hint hint-secondary">
           <kbd>Ctrl</kbd>+<kbd>N</kbd> 新建笔记 · <kbd>Ctrl</kbd>+<kbd>F</kbd> 搜索<br>
           底部状态栏可切换数据文件夹
@@ -470,6 +545,8 @@
           autocapitalize="off"
           spellcheck="false"
         />
+        <!-- P2-23：未配置时显示，点击直接打开设置对话框（onOpenSettings 回调） -->
+        <button class="ai-chat-configure-link" type="button" hidden>⚙ 设置</button>
       </div>
       <button class="ai-chat-submit" type="button" data-mode="submit" disabled>生成修改</button>
     </div>

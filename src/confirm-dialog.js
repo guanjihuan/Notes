@@ -117,7 +117,7 @@ export function showConfirmDialog({ title, message, buttons = [], icon }) {
       // （app.js 外部修改冲突）把 modal-occupied 误识别为用户主动选择「暂不处理」
       // → 静默推进 lastSavedMtimeMs → 后续外部修改被吞。改为返回 null，让调用方
       // 能区分「对话框没出来」与「用户主动取消」。
-      showToast('当前操作被另一个对话框占用，请先关闭后再试', 'warning');
+      showToast('已有对话框打开，请先关闭后再试', 'warning');
       resolve(null);
       return;
     }

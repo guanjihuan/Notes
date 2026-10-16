@@ -127,6 +127,7 @@ module.exports = [
         MutationObserver: 'readonly',
         crypto: 'readonly',
         Element: 'readonly',
+        Node: 'readonly',
         HTMLElement: 'readonly',
         HTMLInputElement: 'readonly',
         HTMLTextAreaElement: 'readonly',

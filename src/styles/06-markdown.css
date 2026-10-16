@@ -24,6 +24,8 @@
   letter-spacing: var(--tracking-tight);
   scroll-margin-top: var(--space-5);
   font-family: var(--font-sans);
+  /* 多行标题均匀分布，避免末行孤字；仅优化换行分布，不改量 */
+  text-wrap: balance;
 }
 
 .markdown-body h1 {
@@ -78,8 +80,16 @@
 
 .markdown-body p {
   margin: 0;
-  text-align: justify;
+  /* 行高 / 长串断行已由 05-sidebar.css 的 .markdown-body 基础规则统一处理
+     （line-height: var(--reader-line-height)、overflow-wrap: break-word），
+     这里不再重复。 */
+  /* justify + CJK/emoji 在窄栏下会出现"两端对齐、字间距爆炸"；改回 start
+     后长行左对齐、短行自然断行，整体节奏更稳。hyphens 保留：英文单词在
+     窄 viewport 下仍可被连字符断开 */
+  text-align: start;
   hyphens: auto;
+  /* 避免段落末行只剩一个孤字/孤标点，提升阅读收尾的舒适感 */
+  text-wrap: pretty;
 }
 
 .markdown-body a {
@@ -208,6 +218,42 @@
   font-size: inherit;
   white-space: pre;
   font-weight: 400;
+}
+
+/* 代码块复制按钮：浮动 FAB，悬浮代码块时贴到右上角外缘浮出。
+   刻意不进 <pre> 子树（见 MarkdownViewer._setupContentInteractions），
+   以免破坏 loadContentLive 的 isEqualNode 前缀/后缀 diff。
+   hidden 属性负责显隐（同时移出 tab 顺序 + 可访问性正确）。 */
+.code-copy-fab {
+  position: fixed;
+  z-index: 30;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--fg-secondary);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+}
+.code-copy-fab:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.code-copy-fab:active { transform: scale(0.94); }
+.code-copy-fab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.code-copy-fab.is-copied {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 40%, transparent);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
 }
 
 /* 水平分割线 */

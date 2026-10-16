@@ -21,6 +21,16 @@
      视觉上完全无差异（实色背景上看不出毛玻璃），但每次滚动都是几十 KB 像素的
      重复 GPU 工作。 */
   border-bottom: 1px solid var(--border-subtle);
+  /* 切主题时与 body 同步淡入淡出：03-base.css body 已声明
+     transition: background var(--transition-slow), color var(--transition-slow)；
+     不在 .toolbar 显式声明会让 --bg-toolbar 跳色而 body 还在过渡，
+     形成 ~320ms 的色块错位（顶部硬切、主区淡变）。
+     border-color 同理：1px 底分隔线用 --border-subtle 不加 transition 会
+     出现"主色在淡、这条 1px 边线硬切"的视觉跳变。background 已经在 body 那条
+     慢节奏下淡变，border-color 用同样的 --transition-slow 节奏保持一致。 */
+  transition:
+    background var(--transition-slow),
+    border-color var(--transition-slow);
   z-index: var(--z-toolbar);
   position: relative;
   /*
@@ -202,18 +212,24 @@ body.has-app-icon .app-title::before {
 .window-controls {
   display: flex;
   align-items: center;
-  margin-left: 4px;
-  /* 让最右侧的关闭按钮贴齐视口右沿（沿用平台常见 UX），但避免裁掉 hover 区；
-     之前用 -8px 时会把按钮裁进视口外 8px。改为 -2px 把贴边视觉压回视口内 */
-  margin-right: -2px;
+  /* 左侧 4px padding + 0 右侧：让最小化按钮与上一组 toolbar-divider 之间
+     留出和 chip 一致的呼吸（原本用 margin-left:4px），但保留右侧 flush
+     视觉（贴近视口右沿，沿用 Win/Linux 平台 UX）。原来用 margin-right:-2px
+     把关闭按钮"挤"到视口边；改 padding-right:0 让容器本身在 toolbar 4px
+     右 padding 之内、关闭按钮不再依赖负 margin 也能落在合理边缘。 */
+  padding-left: 4px;
+  padding-right: 0;
+  margin-left: 0;
   gap: 0;
   /* 用渐变分隔线替代纯色 —— 比 border 精致，符合 macOS 视觉 */
   position: relative;
 }
 .window-controls::before {
+  /* 分隔线相对容器定位在 -4px：与 padding-left 等距，让「上一组按钮 →
+     divider → 窗口控制组」节奏与工具栏内其他 divider 间距一致。 */
   content: "";
   position: absolute;
-  left: -8px;
+  left: -4px;
   top: 50%;
   transform: translateY(-50%);
   height: 20px;
@@ -491,7 +507,7 @@ body[data-theme="light"] #btn-theme .theme-icon-sun {
    Toolbar Search（设计优化 2026-09：从侧栏 header 迁来）
    ------------------------------------------------------------
    把搜索文件框从侧栏上移到底部顶栏首位，让侧栏垂直空间专注于文件列表
-   （侧栏同时把「+ 新建笔记」合并进 sort 行 —— 双重省空间）。
+   （侧栏的新建按钮已挪到右键菜单，首屏只留排序条）。
    - flex:0 1 240px：理想宽度 240px，可缩不可涨 —— 窗口变窄时它先缩，
      不挤右侧按钮组；不抢占侧栏上方视觉重量
    - min-width:160px：极限窄窗口下保留可用宽度（低于此值键盘用户看不清）
@@ -614,6 +630,35 @@ body[data-theme="light"] #btn-theme .theme-icon-sun {
   .toolbar-search {
     flex: 0 1 140px;
     min-width: 96px;
+  }
+}
+
+/* 极窄窗口（≤ 720px，含 600px 最小窗口）：工具栏右簇（搜索 + 外观 + 视图 +
+   重置布局 + 自动保存 + 保存/关闭/设置 + 窗口控件）在 600px 视口下会溢出约 90px，
+   把最右侧的窗口控件（最小化/最大化/关闭）挤出视口 —— frameless 窗口下这是唯一
+   的关闭入口，被裁掉等于「关不掉窗口」。这里只收起最低优先级的控件腾出空间，
+   保证窗口控件始终可达：
+   - 隐藏「重置布局」按钮组 + 它后面的分隔线（低频操作，仍可经右键菜单/设置恢复）
+   - 自动保存折叠为纯图标（隐藏文字标签 + iOS 开关，保留按钮本体与 aria-pressed
+     状态色；完整开关仍在设置里），约省 27px
+   - 搜索框 min-width 进一步降到 72px（720px 断点晚于 720px 断点，这里后定义以覆盖，
+     同时兜住 701–719px 这段原始布局仍会轻微溢出的过渡带）
+   三者合计约省 90px，窗口控件在 600px 最小宽度下不再被裁。 */
+@media (max-width: 720px) {
+  #tg-reset-layout,
+  #tg-reset-layout + .toolbar-divider {
+    display: none;
+  }
+  #toolbar-autosave .btn-label,
+  #toolbar-autosave .toggle-switch {
+    display: none;
+  }
+  #toolbar-autosave {
+    padding: 0 6px;
+  }
+  .toolbar-search {
+    flex: 0 1 120px;
+    min-width: 72px;
   }
 }
 

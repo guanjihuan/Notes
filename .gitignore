@@ -35,3 +35,8 @@ tests/manual/
 # 历史一次性脚本，未被 package.json / lint / check 引用 —— 不进版本库
 # 即可，但留在磁盘方便日后查同一类问题的修复路径。
 scripts/_archive/
+
+.audit_profile/
+.audit_profile2/
+.audit_profile3/
+.audit_profile4/

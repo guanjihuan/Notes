@@ -29,6 +29,19 @@ import { AiDiffPanel } from './ai-diff-panel.js';
 import { AI_STATUS, AI_ERROR, aiErrorMessage } from './ai-status.js';
 
 /**
+ * 取 pendingDiff 的「不可变提交快照」：originalBaseContent 优先，缺时回退
+ * baseContent。apply / skip 漂移判定统一用此函数 —— 避免每个调用点重复
+ * `originalBaseContent || baseContent` 表达式，也方便后续把 baseContent
+ * 拆为「可变重算基线」/「不可变提交快照」两个独立字段时只改一处。
+ * @param {{originalBaseContent?: string, baseContent?: string} | null | undefined} pd
+ * @returns {string}
+ */
+function getImmutableBase(pd) {
+  if (!pd) return '';
+  return pd.originalBaseContent || pd.baseContent || '';
+}
+
+/**
  * 给一段行级 lines 构造只读 context rows（用于 AI 普通回复展示）。
  * 行号必须与 shared/markdown-diff.js 的 splitLines 严格一致 —— 否则 viewer
  * 行号与 diff 行号错位，撤销 / 光标定位跑偏。
@@ -274,9 +287,18 @@ export function createAiController({
       // 走 onNotify → app.js 的 updateStatusAi → statusbar 上的 #status-ai chip。
       // 详见 [feedback-ai-tips-into-status-bar]。
       onNotify: notify,
+      // P2-23：未配置时点击「⚙ 设置」内联链直接打开设置对话框。
+      // 与 togglePanel 中 !isConfigured() → onOpenSettings 同源。
+      onOpenSettings: () => {
+        if (typeof onOpenSettings === 'function') {
+          try { onOpenSettings(); } catch { /* ignore */ }
+        }
+      },
     });
     // 一开始禁用（直到用户打开文件）
     chatPanel.syncFileState(!!state.currentFile);
+    // P2-23：bootstrap 时同步 AI 配置态（影响 placeholder 三态文案 + 内联设置链）
+    chatPanel.setConfigured(isConfigured());
 
     diffPanel = new AiDiffPanel({
       element: diffElement,
@@ -367,9 +389,12 @@ export function createAiController({
     const isRaw = result.responseFormat === 'raw';
     if (isRaw) {
       // AI 没改文档，只是回复一段文字
+      // originalBaseContent 必须填：apply 漂移判断靠它（与下方非 readOnly 分支对齐），
+      // 缺它会回退到 baseContent，被 recompute 覆写后漂移保护失效。
       setPendingDiff({
         id: result.id,
         baseContent: contentSnapshot,
+        originalBaseContent: contentSnapshot,
         nextContent: aiContent,
         isReadOnly: true,
         rows: linesToContextRows(aiContent),
@@ -391,10 +416,13 @@ export function createAiController({
 
     if (!diffResult.regions || diffResult.regions.length === 0) {
       // AI 返回内容与原文一致（已经过 schema 比较过，但 baseContent 可能在
-      // 期间被外部改过，所以再次校验）
+      // 期间被外部改过，所以再次校验）。
+      // 与非 readOnly 分支保持对称：都设 originalBaseContent = contentSnapshot，
+      // 让下游读到 originalBaseContent || baseContent 时语义一致。
       setPendingDiff({
         id: result.id,
         baseContent: contentSnapshot,
+        originalBaseContent: contentSnapshot,
         nextContent: aiContent,
         isReadOnly: true,
         rows: linesToContextRows(aiContent),
@@ -408,6 +436,7 @@ export function createAiController({
     setPendingDiff({
       id: result.id,
       baseContent: contentSnapshot,
+      originalBaseContent: contentSnapshot,
       nextContent: aiContent,
       isReadOnly: false,
       rows: diffResult.rows,
@@ -545,7 +574,9 @@ export function createAiController({
     // 「编辑器的当前实际内容」—— 后续任何重算 / onFileChanged 比对都依赖它。
     // 旧顺序里如果 aiDiffCompute 抛错，编辑器是新内容、pendingDiff.baseContent
     // 还是旧内容，用户看到「已应用的修改没体现在剩余 diff 里」的诡异行为。
-    pendingDiff = { ...pendingDiff, baseContent: result.content };
+    // 同时把 originalBaseContent 也同步推进到 result.content —— 否则后续
+    // 「应用全部」会与残留的 submit-time 快照对比误判漂移，强制 readOnly。
+    pendingDiff = { ...pendingDiff, baseContent: result.content, originalBaseContent: result.content };
     // preview 模式修复：apply 后立即通知外部刷新 viewer。split 模式下
     // scheduleLivePreview 会覆盖（防双触发不致命 —— loadContentLive 幂等）。
     if (typeof onAfterApply === 'function') {
@@ -623,7 +654,10 @@ export function createAiController({
     // 或者撤销自己的编辑后重提。最坏情况保留全删路（用户主动重提后 baseContent
     // 重新对齐，apply 不再丢失任何东西）。
     const currentForApply = safeGetContent();
-    if (currentForApply !== null && currentForApply !== pendingDiff.baseContent) {
+    // 漂移判定必须用「提交时的不可变快照」originalBaseContent，而非 pendingDiff.baseContent
+    // —— 后者会被 recomputeDiffFromBase 在每次用户输入后覆写为当前内容，导致本保护永远不触发、
+    // 「应用全部」静默覆盖用户等待期间的手动修改（数据丢失）。
+    if (currentForApply !== null && currentForApply !== getImmutableBase(pendingDiff)) {
       if (typeof toast === 'function') {
         toast('你在等待 AI 时已修改过文档，「应用全部」会覆盖未在 diff 内的修改，已切换为逐条确认', 'warning', 4000);
       }
@@ -695,9 +729,11 @@ export function createAiController({
     }
     let nextRows = filteredRows;
     let nextRegions = filtered;
-    let nextBase = pendingDiff.baseContent;
+    let nextBase = getImmutableBase(pendingDiff);
     const skippedRegion = (pendingDiff.regions || []).find((r) => r.id === regionId);
-    if (current !== pendingDiff.baseContent && pendingDiff.nextContent) {
+    // 漂移判定同 handleApplyAll：用提交时的不可变快照 originalBaseContent，
+    // 避免 recompute 把 baseContent 覆写为当前内容后，漏掉"用户等待期间已编辑"的重算。
+    if (current !== getImmutableBase(pendingDiff) && pendingDiff.nextContent) {
       try {
         const recomputed = api.aiDiffCompute(current, pendingDiff.nextContent, pickDiffOptions(current, pendingDiff.nextContent));
         if (recomputed && Array.isArray(recomputed.rows) && Array.isArray(recomputed.regions)) {
@@ -742,7 +778,11 @@ export function createAiController({
 
     pendingDiff = {
       ...pendingDiff,
+      // originalBaseContent 跟随 nextBase 推进：下一次 skip / apply 的漂移
+      // 判定窗口不再包含本步跳过造成的编辑差异，否则「跳 1 → 再跳 1」
+      // 都会被假漂移触发重算。
       baseContent: nextBase,
+      originalBaseContent: nextBase,
       rows: nextRows,
       regions: nextRegions,
     };
@@ -911,5 +951,12 @@ export function createAiController({
     hasPendingDiff: () => !!pendingDiff,
     onFileChanged,
     onContentChanged,
+    // P2-23：settings 改了（Base URL / API Key / Model）后调用，
+    // 把最新配置态推给 chatPanel 让 placeholder 立即切换「未配置」↔「描述修改」。
+    refreshConfigured: () => {
+      if (chatPanel && typeof chatPanel.setConfigured === 'function') {
+        chatPanel.setConfigured(isConfigured());
+      }
+    },
   };
 }

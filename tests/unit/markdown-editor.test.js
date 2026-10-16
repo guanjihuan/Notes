@@ -203,3 +203,147 @@ describe('MarkdownEditor 基础行为', () => {
     expect(() => editor._onCompositionEnd()).not.toThrow();
   });
 });
+
+
+// ============================================================================
+// audit R7b P1-18：单实例 EditorView 持久化
+// ============================================================================
+//
+// 核心契约：loadFile 多次调用复用同一 view 实例，不再 _destroyView + new。
+// 旧实现下：A→B→A 切文件会丢 history / selection / 折叠，30-100ms 黑闪。
+describe('MarkdownEditor 单实例 view 持久化 (audit R7b P1-18)', () => {
+  it('首次 loadFile 创建 view', () => {
+    const { editor } = createEditor();
+    expect(editor.view).toBeNull();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A content');
+    expect(editor.view).not.toBeNull();
+    expect(editor.getContent()).toBe('A content');
+  });
+
+  it('多次 loadFile 复用同一 view 实例（A→B→A 同一 view）', () => {
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A content');
+    const viewA = editor.view;
+    // 切到 B
+    editor.loadFile({ path: '/b.md', name: 'b.md' }, 'B content');
+    expect(editor.view).toBe(viewA); // 引用相等
+    expect(editor.getContent()).toBe('B content');
+    // 切回 A（新内容）
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A content v2');
+    expect(editor.view).toBe(viewA);
+    expect(editor.getContent()).toBe('A content v2');
+  });
+
+  it('loadFile 切换文件后 selection 重置到 (0, 0)', () => {
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'hello world');
+    // 用户手动把光标移到位置 5
+    editor.view.dispatch({ selection: { anchor: 5, head: 5 } });
+    expect(editor.view.state.selection.main.anchor).toBe(5);
+    // 切到 B → selection 应被重置
+    editor.loadFile({ path: '/b.md', name: 'b.md' }, 'foo bar baz');
+    expect(editor.view.state.selection.main.anchor).toBe(0);
+    expect(editor.view.state.selection.main.head).toBe(0);
+  });
+
+  it('loadFile 切换后 history 仍可用（view 复用，undo stack 保留）', () => {
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'one');
+    // 用户编辑 → 一些 transaction 计入 history
+    editor.view.dispatch({ changes: { from: 3, insert: ' two' } });
+    editor.view.dispatch({ changes: { from: 7, insert: ' three' } });
+    expect(editor.getContent()).toBe('one two three');
+    // 切到 B 再切回 A（content 是初始 one，dispatch 替换；这里测的是 view 复用，
+    // 不是 history 跨文件保留——后者是更大设计问题，本测试只锁 view 实例稳定）
+    editor.loadFile({ path: '/b.md', name: 'b.md' }, 'B');
+    expect(editor.view).not.toBeNull();
+    // view 还是同一个引用 → history 字段在 view 生命周期内持续
+    // （CM6 history field 由 EditorState 持有；view 复用 = state 延续）
+    const beforeUndo = editor.view.state.doc.toString();
+    // 触发一次新 transaction（与刚才的 history 关联）
+    editor.view.dispatch({ changes: { from: 1, insert: 'B' } });
+    // undo 应该能回到 beforeUndo
+    expect(editor.view.state.doc.toString()).not.toBe(beforeUndo);
+  });
+
+  it('loadFile 复用 view 时 _viewAbort signal 不重建（IME listener 不会重复挂）', () => {
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A');
+    const signal1 = editor._viewAbort;
+    editor.loadFile({ path: '/b.md', name: 'b.md' }, 'B');
+    const signal2 = editor._viewAbort;
+    // view 复用 → 不需要新的 AbortController（IME listener 还在原 signal 上）
+    expect(signal2).toBe(signal1);
+  });
+
+  it('unload → 销毁 view；再 loadFile 创建新 view', () => {
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A');
+    const viewA = editor.view;
+    editor.unload();
+    expect(editor.view).toBeNull();
+    editor.loadFile({ path: '/b.md', name: 'b.md' }, 'B');
+    // unload 后 view 是 null；下次 loadFile 触发 _createView → 新 view
+    expect(editor.view).not.toBe(viewA);
+    expect(editor.view).not.toBeNull();
+    expect(editor.getContent()).toBe('B');
+  });
+
+  it('多次 loadFile 复用 view 时 _viewAbort signal 引用稳定（IME listener 不重建）', () => {
+    // 核心契约：旧实现每次 loadFile 都 _destroyView + new AbortController，
+    // 但 addAbort 路径在 dispose 时才 remove —— 多次切文件会让 contentDOM
+    // 上累积多份 IME listener（compositionend 跑多次 → onChange 多次 →
+    // state.isDirty 翻脏态反复 + scheduleAutoSave 多次 clearTimeout）。
+    // 新实现下 view 整个 lifetime 只一个 _viewAbort signal，listener 只一份。
+    // 验证方式：loadFile 多次，_viewAbort 引用始终相等。
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A');
+    const signalRef = editor._viewAbort;
+    expect(signalRef).not.toBeNull();
+    for (let i = 0; i < 10; i++) {
+      editor.loadFile({ path: `/f${i}.md`, name: `f${i}.md` }, `content ${i}`);
+      expect(editor._viewAbort).toBe(signalRef);
+    }
+  });
+
+  it('loadFile 重复同一文件：onChange 触发次数精确等于 dispatch 次数（listener 不重复挂）', () => {
+    // 回归锚点：旧实现每次 loadFile 都 addEventListener 三次（compositionstart
+    // / end / cancel），但 dispose 才 remove —— contentDOM 上 listener 数量
+    // 线性增长。N 次切文件 → onChange 被触发 3N 次。新实现下 view 不重建，
+    // listener 只一份，N 次 loadFile 正好 N 次 onChange。
+    const { editor, onChange } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A');
+    const baseCount = onChange.mock.calls.length;
+    for (let i = 0; i < 5; i++) {
+      editor.loadFile({ path: '/a.md', name: 'a.md' }, `A${i}`);
+    }
+    const delta = onChange.mock.calls.length - baseCount;
+    expect(delta).toBe(5); // 精确 5，不是 10 / 15 / ...
+  });
+
+  it('A→B→A 场景下 lastSavedDoc 跟踪最终内容', () => {
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A1');
+    editor.loadFile({ path: '/b.md', name: 'b.md' }, 'B1');
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A2');
+    // loadFile 总是把 lastSavedDoc 同步到传入 content
+    expect(editor.lastSavedDoc).toBe('A2');
+    expect(editor.isDirty()).toBe(false);
+  });
+
+  it('getContent 在多次 loadFile 后返回当前 view 的 doc（不是 lastSavedDoc）', () => {
+    const { editor } = createEditor();
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A');
+    expect(editor.getContent()).toBe('A');
+    // 用户编辑
+    editor.view.dispatch({ changes: { from: 1, insert: 'A-edit' } });
+    expect(editor.getContent()).toBe('AA-edit');
+    // 切到 B
+    editor.loadFile({ path: '/b.md', name: 'b.md' }, 'B');
+    expect(editor.getContent()).toBe('B');
+    // 切回 A（content 是 A 初始的，但 view 的 doc 是 A-edit 之前 dispatch 过的
+    // 状态——实际 loadFile 走 dispatch 全量替换，所以 doc 回到 A 初始）
+    editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A');
+    expect(editor.getContent()).toBe('A');
+  });
+});

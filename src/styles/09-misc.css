@@ -48,8 +48,10 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  -webkit-backdrop-filter: blur(20px);
-  backdrop-filter: blur(20px);
+  /* audit fix (P3)：与 chrome 类保持 backdrop-filter 策略一致 —— 与 .toast
+     同源（07-statusbar.css .toast 注释），实色背景上看不出毛玻璃，反而
+     每次滚动主区都强制 GPU 重算菜单覆盖区域的模糊。菜单小但触发频繁，
+     切目录 / 右键都会重新出现，累积 GPU 成本不容忽视。 */
   animation: context-menu-in 120ms var(--ease-out);
   user-select: none;
   /* 阻止菜单自身的文本被选中 */
@@ -151,6 +153,119 @@ body[data-focus-mode="true"] .ai-chat-dock {
   transition: opacity var(--transition-fast, 120ms ease-out);
 }
 
+/* ============================================================
+   图片 lightbox（点击正文图片放大）
+   全局浮层，挂在 document.body（不进 <img>，避免破坏 live diff）
+   ============================================================ */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-7);
+}
+.image-lightbox[hidden] { display: none !important; }
+
+.image-lightbox-backdrop {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, #000 72%, transparent);
+}
+[data-theme="light"] .image-lightbox-backdrop {
+  background: color-mix(in srgb, #000 52%, transparent);
+}
+
+.image-lightbox-stage {
+  position: relative;
+  max-width: 92vw;
+  max-height: 88vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: image-lightbox-in 180ms var(--ease-out);
+}
+.image-lightbox-img {
+  max-width: 92vw;
+  max-height: 88vh;
+  width: auto;
+  height: auto;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  background: var(--bg-card);
+}
+.image-lightbox-close {
+  position: absolute;
+  top: -12px;
+  right: -12px;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  color: var(--fg-primary);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-md);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.image-lightbox-close:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.image-lightbox-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@keyframes image-lightbox-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* ============================================================
+   工具栏快捷键 chip（hover 主按钮时浮现，只读 data-shortcut，
+   不改动按钮 DOM。pointer-events:none → 纯视觉提示，不挡 hover）
+   ============================================================ */
+.shortcut-hint {
+  position: fixed;
+  z-index: 1100;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-md);
+  color: var(--fg-secondary);
+  pointer-events: none;
+  animation: shortcut-hint-in 140ms var(--ease-out);
+}
+.shortcut-hint[hidden] { display: none !important; }
+.shortcut-hint kbd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs-readable);
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--bg-app);
+  color: var(--fg-primary);
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 1px 0 var(--border-subtle);
+}
+.shortcut-hint-plus {
+  color: var(--fg-tertiary);
+  font-size: 0.8em;
+  padding: 0 1px;
+}
+@keyframes shortcut-hint-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 /*
    BUG-3 fix (audit)：focus mode 下 .ai-chat-dock 即便被 opacity:0 隐藏，
    仍然占据 body grid row 3 的自然高度（~88px），把 app-shell 高度挤掉。
@@ -240,7 +355,10 @@ body[data-focus-mode="true"][data-editor-mode="split"] .splitter {
   border-radius: 3px;
   background: var(--bg-card);
   font-family: var(--font-mono);
-  font-size: 10px;
+  /* 10 → 11（--fs-xs）：focus exit hint 在右下角停留 ~600ms 后淡出，
+     10px 在低 DPI 屏易糊；提到 11px 与 .toolbar / .empty-state kbd 同档，
+     鼠标停在窗口里那一瞥就能看见。 */
+  font-size: var(--fs-xs);
   margin: 0 1px;
 }
 body[data-focus-mode="true"]:hover .focus-exit-hint {

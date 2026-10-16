@@ -29,6 +29,13 @@ const {
 // 与 main/file-ops.js#friendlyWriteError 走同一份文案。避免用户看到
 // 「EACCES: permission denied, open '/Users/.../config.json'」英文 errno + 路径。
 const { friendlyFsError } = require('../shared/friendly-fs-error.js');
+// audit fix (R3 P0-1)：aiApiKey 走 safeStorage 加密层。saveConfig 在写盘前
+// 调 encrypt，loadConfig 在读到包络后调 decrypt —— 上层（ai.js / renderer /
+// settingsStore）拿到的 appConfig.aiApiKey 始终是明文。详细迁移 / 降级策略
+// 见 main/secret-store.js 顶部注释。
+const secretStore = require('./secret-store.js');
+// P2-1：tmp 路径生成走加密安全随机（与 main/file-ops.js 共享同一工厂）
+const { generateTmpPath } = require('./generate-tmp-path.js');
 
 // 测试注入点：默认走真实 electron.app，单测可以换成 mock app。
 // 下划线前缀表示「仅测试用」—— 生产代码不应调用。
@@ -75,6 +82,19 @@ function loadConfig() {
   try {
     const parsed = JSON.parse(raw);
     appConfig = coerceLoadedSettings(parsed);
+    // R3 P0-1：读盘后立刻把 aiApiKey 包络解回明文。saveConfig 会在写盘前
+    // 重新加密；这里只负责「内存里 appConfig.aiApiKey 始终是明文」——
+    // 上层（ai.js / settingsStore / renderer）零感知。懒迁移：旧版明文
+    // 没前缀，decrypt 原样返回，下一次 saveConfig 自动重新加密。
+    if (appConfig.aiApiKey) {
+      const decrypted = secretStore.decrypt(appConfig.aiApiKey);
+      // 仅当解密得到非空明文时才覆盖：若密钥库不可用 / 包络损坏导致 decrypt 返回 ''，
+      // 保留磁盘上的原始 enc:v1:... 包络，避免后续 saveConfig（如改主题）因内存值为 ''
+      // 而把仍有效的加密 Key 覆盖成空串、永久丢失。
+      if (decrypted) {
+        appConfig.aiApiKey = decrypted;
+      }
+    }
   } catch (e) {
     // 关键修复：之前 `} catch { ... }` 把 JSON 解析错误也吞了 —— 一旦 config.json
     // 半截 / 格式错（断电、强杀进程、磁盘故障），用户的 aiApiKey / 自定义 dataDir
@@ -173,7 +193,24 @@ function cleanupStaleTmpFiles() {
  *  - 写入失败：appConfig 回滚到 pre-merge 快照，调用方拿到 { ok:false, error }
  */
 let saveQueue = Promise.resolve();
+// audit fix (P1-2)：isQuitting 闸。before-quit 触发时置 true，新 saveConfig
+// 立即返一个已 resolve 的 Promise { ok:false, error:'APP_QUITTING' }（与 queue 路径
+// 返回类型一致，避免调用方对「同步值 vs Promise」分叉处理）——
+// 否则 renderer 错误风暴期间 IPC `await saveConfig(...)` 会挂在链尾，
+// before-quit 等不到 save 完成 → quit 阻塞。in-flight 之前的 save 照常
+// 完成（已 fsync 的文件 rename 完才返回 ok:true；强制 abort 会丢正在写的
+// tmp）。主进程退出时「最新一个 save 完成」即可接受。
+let _quitting = false;
+function _isQuitting() {
+  return _quitting;
+}
+function _setIsQuitting(v) {
+  _quitting = !!v;
+}
 function saveConfig(next) {
+  // 闸开 → 立即返同步值（不挂 await）。注意：不入 queue，避免 in-flight 任务
+  // resolve 后又被这个新任务接走（保持 queue 长度 = 在跑 + 排队中闸前任务数）。
+  if (_quitting) return Promise.resolve({ ok: false, error: 'APP_QUITTING' });
   // audit fix (H1)：merged 不能在 enqueue 时计算，否则两个并发调用
   // 都基于同一份 appConfig 合并，第二个任务写盘时会覆盖第一个任务的改动
   // （典型场景：用户同时点 alwaysOnTop + 切 dataDir —— alwaysOnTop 被静默丢）。
@@ -194,7 +231,9 @@ function saveConfig(next) {
     // 在 await 后进入 fs.open）会算出相同 tmpPath，后到的 rename 因源文件已被消费
     // 而失败（ENOENT），上层捕获后返回 {ok:false}。random 后缀 ~36^6 ≈ 21 亿组合，
     // 同毫秒冲突概率可忽略。main/file-ops.js#atomicWriteFile 也做了对称修复。
-    const tmpPath = `${cfgPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+    // P2-1：tmp 路径走加密安全随机。复用 main/generate-tmp-path.js 工厂
+    // （同 main/file-ops.js 的 atomicWriteFile 路径生成逻辑）。
+    const tmpPath = generateTmpPath(cfgPath);
     let fh = null;
     try {
       await fs.mkdir(path.dirname(cfgPath), { recursive: true });
@@ -204,8 +243,21 @@ function saveConfig(next) {
       // 原子性，但 fsync 缺失让断电后实际文件可能不是新文件）。AI key / 自定义 dataDir
       // 这类关键配置丢失 = 用户感知不到为什么 settings 全没了。先 fsync 再 rename 才能
       // 保证断电后磁盘上要么是旧 config.json（rename 前断电），要么是完整新文件。
-      fh = await fs.open(tmpPath, 'w');
-      await fh.writeFile(JSON.stringify(merged, null, 2), 'utf-8');
+      // R5 P1-13：tmp 模式 0o600 (rw owner only)。多用户 Linux/macOS 上其他用户
+      // 能读父目录 → 也能读默认 0o644 的 tmp，里面就是包络后的 AI Key / 整份
+      // 配置（最坏情况 decrypt 失败前的瞬态）。Windows 不强制 mode（用 ACL），
+      // 但设了不冲突。详见 main/file-ops.js 同号修复。
+      fh = await fs.open(tmpPath, 'w', 0o600);
+      // R3 P0-1：写盘前把 aiApiKey 转成包络。**用 toWrite 浅拷贝**，不污染
+      // merged —— merged 还要 return 给 IPC 调用方（renderer settingsStore），
+      // UI 看到的是明文（masked display）而不是 enc:v1:...。appConfig 也保持
+      // 明文，loadConfig 那边解密一次后整轮生命周期对称。
+      // secretStore.encrypt 对空串 / 已是包络 / safeStorage 不可用都有兜底。
+      const toWrite = { ...merged };
+      if (toWrite.aiApiKey) {
+        toWrite.aiApiKey = secretStore.encrypt(toWrite.aiApiKey);
+      }
+      await fh.writeFile(JSON.stringify(toWrite, null, 2), 'utf-8');
       await fh.sync();
       await fh.close();
       fh = null;
@@ -397,8 +449,11 @@ function _invalidateResolveCache() {
 
 function getConfig() {
   if (!configLoaded) {
-    // 防御：调用方忘了 load() —— 隐式初始化一次
-    loadConfig();
+    // 防御：调用方忘了 init() —— 隐式初始化一次（与 init() 对齐：既 loadConfig
+    // 也设定 DEFAULT_DATA_DIR，否则 resolveDataDirOrFallback 因 DEFAULT_DATA_DIR 为
+    // null 返回 dir:null，fs-watcher 拿 null 去 watch 会抛错进入重连死循环）。
+    appConfig = loadConfig();
+    if (!DEFAULT_DATA_DIR) DEFAULT_DATA_DIR = getDefaultDataDir();
   }
   return appConfig;
 }
@@ -535,6 +590,8 @@ function _reset() {
   // 跨 case 串扰（renderer 端 / 用户态不会触发，但单测 _reset 后再 save
   // 必须从干净 queue 开始）。
   saveQueue = Promise.resolve();
+  // P1-2：闸也要重置，避免一个 case 置 true 后污染下一个 case。
+  _quitting = false;
 }
 
 /**
@@ -560,4 +617,6 @@ module.exports = {
   seedDefaultDataDir,
   _reset,
   _setApp,
+  _isQuitting,
+  _setIsQuitting,
 };

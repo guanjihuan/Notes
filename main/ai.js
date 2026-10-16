@@ -60,6 +60,12 @@ const ANTHROPIC_API_VERSION = '2023-06-01';
 // 不再靠注释提醒同步。
 const { AI_ERROR } = require('../shared/ai-errors.js');
 const nodeCrypto = require('node:crypto');
+// R3 P0-1：aiApiKey 走 safeStorage 加密后，磁盘上是 enc:v1: 包络；config
+// 加载到 appConfig 时已经 decrypt 一次（见 main/config-store.js loadConfig），
+// 但这里是直接接 getConfig() 的兜底路径，防御性再 decrypt 一次（passthrough
+// 明文，包络也安全），避免未来调用方改动时漏掉解密。
+const secretStore = require('./secret-store.js');
+const { makeCleanupEpoch } = require('./cleanup-epoch.js');
 const ERR_NOT_CONFIGURED = AI_ERROR.NOT_CONFIGURED;
 const ERR_TIMEOUT = AI_ERROR.ERR_TIMEOUT;
 const ERR_PROVIDER = AI_ERROR.ERR_PROVIDER;
@@ -201,7 +207,23 @@ function extractRawReply(parsed) {
  * @param {string} path
  * @returns {string}
  */
+// P2-6 (audit)：joinUrl / pickOpenAITokenConfig 每次 AI 请求都重复跑
+// regex + new URL 解析；同 baseURL / 同 model 在一次会话里反复命中，
+// LRU 缓存结果。maxSize 64 覆盖「用户试过的 URL + model」组合，无界增长免疫。
+const { createLruCache } = require('./lru-cache.js');
+const _joinUrlCache = createLruCache({ maxSize: 64 });
+const _tokenConfigCache = createLruCache({ maxSize: 64 });
+
 function joinUrl(base, path) {
+  const cacheKey = `${base}|${path}`;
+  const hit = _joinUrlCache.get(cacheKey);
+  if (hit !== undefined) return hit;
+  const joined = _joinUrlUncached(base, path);
+  _joinUrlCache.set(cacheKey, joined);
+  return joined;
+}
+
+function _joinUrlUncached(base, path) {
   // P3-3 fix (audit)：拆分 query / fragment 后再拼。
   // 否则 `https://gw.com?token=abc` 会被拼成 `https://gw.com?token=abc/v1/messages`
   // （query 后被拼了 path，URL 非法）。query / fragment 也可能在错误回显时
@@ -367,6 +389,11 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
   const pending = new Map();
   /** requestId → 它的超时定时器。cancel 时一起清，避免 setTimeout 回调空转。 */
   const timers = new Map();
+  // audit fix (P1-5)：cancelAll 顺序竞争 epoch 闸。cancelAll 三步非原子
+  // （abort → clear → clear），与新 runEdit 同步阶段加 entry 存在竞态窗口。
+  // cleanupEpoch.invalidate() 让所有「更早 snapshot」的 in-flight runEdit
+  // 自行 bail（isCurrent → false），避免「同 requestId 重试找不到 controller」。
+  const cleanupEpoch = makeCleanupEpoch();
   /** audit fix (C4)：请求生命周期登记集合（runEdit 入口 → finally），用于
    *  真正拦截同 requestId 的重复进入 —— 之前的 pending 集合是 postJson 内部填的，
    *  runEdit 同步阶段检查永远是空，已被注释自承为 dead code。 */
@@ -386,6 +413,10 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
   }
 
   function cancelAll() {
+    // audit fix (P1-5)：入口先 invalidate，挡掉「cancelAll 期间新 runEdit
+    // 同步阶段已加入 entry」竞态。新 runEdit 入口会 snapshot 当前 epoch，
+    // await 后 isCurrent → false 时 bail，不污染主流程返回。
+    cleanupEpoch.invalidate();
     for (const controller of pending.values()) controller.abort();
     pending.clear();
     // C1 (audit)：与 cancel() 一样同步清理 timeout，避免 setTimeout 回调空转
@@ -471,6 +502,15 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
    * @returns {{ capTokens: number, tokenField: 'max_tokens' | 'max_completion_tokens', includeTemperature: boolean }}
    */
   function pickOpenAITokenConfig(model) {
+    const key = String(model || '');
+    const hit = _tokenConfigCache.get(key);
+    if (hit !== undefined) return hit;
+    const cfg = _pickOpenAITokenConfigUncached(key);
+    _tokenConfigCache.set(key, cfg);
+    return cfg;
+  }
+
+  function _pickOpenAITokenConfigUncached(model) {
     const m = String(model || '').toLowerCase();
     // gpt-5 / o-series → 必须用 max_completion_tokens；上限通常 ≥ 128k；不传 temperature
     if (/^(gpt-5|o1|o3|o4)/.test(m)) {
@@ -605,8 +645,10 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
       // 会回显 URL 或 header），统一走 sanitizeDetail 防止泄露到 toast / 日志
       return { ok: false, error: ERR_PROVIDER, message: `网络错误：${sanitizeDetail(msg)}` };
     }
-    cleanup();
-
+    // 不再此处 cleanup：fetch 已 resolve 但 body 仍在流式读取，取消窗口内
+    // （响应头到达 → body 读完前）cancel 需要 pending 中的 controller 才能 abort。
+    // 清理统一收口到下方 try/finally（覆盖所有 early-return / 错误路径）。
+    try {
     // audit fix (Round 13 / Sec-H3)：3xx 重定向在 manual 模式下表现为 status=0
     // 且 type='opaqueredirect'。明示用户配置错了 Base URL，不要走"读 body 取错误信息"
     // 分支（那里会卡死读 body 或者报错信息误导成"格式错误"）。
@@ -714,6 +756,9 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
       return { ok: false, error: ERR_FORMAT, message: 'AI 返回的不是合法 JSON' };
     }
     return { ok: true, json };
+    } finally {
+      cleanup();
+    }
   }
 
   /**
@@ -752,7 +797,8 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
   async function runOpenAIEdit({ prompt, content, filename, requestId, timeoutMs }) {
     const config = (typeof getConfig === 'function' ? getConfig() : {}) || {};
     const baseURL = String(config.aiBaseUrl || '').trim();
-    const apiKey = String(config.aiApiKey || '').trim();
+    // R3 P0-1：解密 aiApiKey 包络。secretStore.decrypt 对明文 / 空 / 损坏都有兜底。
+    const apiKey = secretStore.decrypt(config.aiApiKey).trim();
     const model = String(config.aiModel || '').trim();
     const systemPrompt = String(config.aiSystemPrompt || '').trim() || CURRENT_FILE_EDIT_SYSTEM_PROMPT;
 
@@ -830,7 +876,8 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
   async function runAnthropicEdit({ prompt, content, filename, requestId, timeoutMs }) {
     const config = (typeof getConfig === 'function' ? getConfig() : {}) || {};
     const baseURL = String(config.aiBaseUrl || '').trim();
-    const apiKey = String(config.aiApiKey || '').trim();
+    // R3 P0-1：解密 aiApiKey 包络。secretStore.decrypt 对明文 / 空 / 损坏都有兜底。
+    const apiKey = secretStore.decrypt(config.aiApiKey).trim();
     const model = String(config.aiModel || '').trim();
     const systemPrompt = String(config.aiSystemPrompt || '').trim() || CURRENT_FILE_EDIT_SYSTEM_PROMPT;
 
@@ -974,23 +1021,46 @@ function createAiProxy({ getConfig, fetchImpl, log } = {}) {
       cancel(requestId);
     }
     inFlightRequestIds.add(requestId);
+    // audit fix (P1-5)：拍下 cancelAll epoch 快照。本 runEdit 期间若发生
+    // cancelAll（用户点取消、will-quit 触发），await 之后 isCurrent → false
+    // → 返 ERR_CANCELLED 不应用任何副作用。snapshot 必须在 inFlightRequestIds
+    // 之后但 await 之前 —— 在 inFlightRequestIds.add 之后确保「新请求已
+    // 登记」语义在 cancelAll 之前；invalidate 会同时清 Set 的 entry，但本请求
+    // 已登记的「我自己负责清除」语义不变（finally 仍会 delete，但 Set 已空，
+    // delete 一次 noop）。
+    const myEpoch = cleanupEpoch.snapshot();
 
     // 注：token 上限不再用入参 maxTokens（已被 pick*TokenConfig 按模型路由取代）
     const baseArgs = { prompt, content, filename, requestId, timeoutMs };
     try {
+      let result;
       if (provider === 'anthropic') {
-        return await runAnthropicEdit(baseArgs);
+        result = await runAnthropicEdit(baseArgs);
+      } else if (provider === 'openai') {
+        result = await runOpenAIEdit(baseArgs);
+      } else {
+        // audit fix (2.5)：未知 provider 不再静默按 OpenAI 走 —— 配置错了会让用户困惑。
+        // schema enum 已防，但 IPC 直调 / 老 settings 文件可能漏过来，这里明确报错。
+        return {
+          ok: false,
+          error: ERR_NOT_CONFIGURED,
+          message: `未知 AI 服务提供方：${provider}（请在设置里选 OpenAI 兼容或 Anthropic 兼容）`,
+        };
       }
-      if (provider === 'openai') {
-        return await runOpenAIEdit(baseArgs);
+      // audit fix (P1-5)：await 之后，cancelAll 已 invalidate epoch → 本次
+      // 任务期间发生过 cancel，请求结果不再应用（即使 provider 返了 200，
+      // 也可能是 cancelAll 触发 abort 之前最后一段响应；语义上「用户已取消」
+      // 优先于「网络层成功」）。同时这一步拦截「cancelAll 三步非原子期间
+      // 新请求被误 abort 之后」场景 —— 新 runEdit 拿不到 response，但 abort
+      // 信号让它提前抛 AbortError；这里统一以 ERR_CANCELLED 兜底。
+      if (!cleanupEpoch.isCurrent(myEpoch)) {
+        return {
+          ok: false,
+          error: ERR_CANCELLED,
+          message: '请求已被取消',
+        };
       }
-      // audit fix (2.5)：未知 provider 不再静默按 OpenAI 走 —— 配置错了会让用户困惑。
-      // schema enum 已防，但 IPC 直调 / 老 settings 文件可能漏过来，这里明确报错。
-      return {
-        ok: false,
-        error: ERR_NOT_CONFIGURED,
-        message: `未知 AI 服务提供方：${provider}（请在设置里选 OpenAI 兼容或 Anthropic 兼容）`,
-      };
+      return result;
     } finally {
       // audit fix (C4)：无论成功 / 失败 / 抛错都清登记，下次同 requestId
       // 再来能正常进入；防 Set 缓慢增长。

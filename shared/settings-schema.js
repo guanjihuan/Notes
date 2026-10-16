@@ -51,7 +51,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   editorMode: 'split',     // 'preview' | 'edit' | 'split' — 默认双栏
   readerFontSize: 17,      // 阅读字号 (px)，范围 12..24
   readerLineHeight: 1.85,  // 阅读行距，范围 1.4..2.2
-  fileListSort: 'name',    // 'name' | 'mtime-desc'
+  fileListSort: 'name',    // 'name' | 'name-desc' | 'mtime-desc' | 'mtime-asc'
   autoSaveDebounceMs: AUTO_SAVE_DEFAULT_DEBOUNCE_MS, // 防抖延迟（ms）；0 = 关闭；默认 500ms
   splitRatio: 0.5,         // 双栏模式左侧占比 0.2..0.8
   sidebarWidth: null,       // 侧栏拖拽后的宽度（px）；null = 使用 CSS 默认 --w-sidebar
@@ -118,6 +118,9 @@ const SETTINGS_SCHEMA = Object.freeze({
     type: 'number',
     min: 1.4,
     max: 2.2,
+    // 与 readerFontSize / autoSaveDebounceMs / splitRatio 一致启用 clamp，
+    // 手改越界值落盘时夹到范围内而非静默回落默认。
+    clamp: true,
     // fix(audit 2026-08)：round:1 会把 1.85 静默四舍五入到 1.9。UI 选项列出
     // 的是 [1.5, 1.7, 1.85, 2.0] 两位小数，round:2 才能保留用户的选择。
     round: 2,
@@ -125,7 +128,7 @@ const SETTINGS_SCHEMA = Object.freeze({
   },
   fileListSort: {
     type: 'enum',
-    enum: ['name', 'mtime-desc'],
+    enum: ['name', 'name-desc', 'mtime-desc', 'mtime-asc'],
     description: '侧栏文件列表排序',
   },
   autoSaveDebounceMs: {
@@ -215,7 +218,9 @@ const SETTINGS_UI_OPTIONS = Object.freeze({
   ]),
   fileListSort: Object.freeze([
     { value: 'name', label: '按名称', hint: 'A → Z，localeCompare(zh-CN)' },
+    { value: 'name-desc', label: '按名称', hint: 'Z → A，localeCompare(zh-CN) 反向' },
     { value: 'mtime-desc', label: '按修改时间', hint: '最近修改排在最前' },
+    { value: 'mtime-asc', label: '按修改时间', hint: '最早修改排在最前' },
   ]),
   // 自动保存不再需要枚举选项：debounce 延迟是连续数值（0..60000 ms），
 // 由 toolbar 按钮直接 toggle 0 ↔ 500，UI 也不再有「选几秒」的下拉。
@@ -515,7 +520,7 @@ function sanitizeSync(key, raw) {
       // 注意：trim 后可能变空字符串，与 max > 0 但被 trim 成空的 case 区分；
       // 这里把 trim 后空串仍走原 length 检查（空串会让 url-https 校验短路，
       // 但保留 nullable-path 上面已经拦截过的场景）。
-      const trimmed = (rule.type === 'string' || rule.type === 'nullable-string' || rule.type === 'path') ? raw.trim() : raw;
+      const trimmed = (rule.type === 'string' || rule.type === 'nullable-string' || rule.type === 'nullable-path') ? raw.trim() : raw;
       if (typeof rule.max === 'number' && trimmed.length > rule.max) return undefined;
       // fix(audit 2026-08)：同步路径也要校验 format。旧版只 validateKey（async 路径）
       // 校验 format，coerceLoadedSettings 直接放行 → 手改 settings.json 把 aiBaseUrl
@@ -537,20 +542,22 @@ function sanitizeSync(key, raw) {
     }
     case 'nullable-string': {
       if (typeof raw !== 'string') return undefined;
-      if (typeof rule.max === 'number' && raw.length > rule.max) return undefined;
+      // 与 string 分支一致先 trim，避免未来字段（带 max / url-https format）静默放行前后空白。
+      const trimmed = raw.trim();
+      if (typeof rule.max === 'number' && trimmed.length > rule.max) return undefined;
       // fix(audit 2026-08)：nullable-string 与 string 一样需要 format 校验，
       // 否则未来 schema 加 nullable-string + format 字段会静默失效。
-      if (raw.length > 0 && rule.format === 'url-https') {
-        if (!/^https?:\/\//i.test(raw)) return undefined;
+      if (trimmed.length > 0 && rule.format === 'url-https') {
+        if (!/^https?:\/\//i.test(trimmed)) return undefined;
         let parsed;
         try {
-          parsed = new URL(raw);
+          parsed = new URL(trimmed);
         } catch {
           return undefined;
         }
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
       }
-      return raw;
+      return trimmed;
     }
     case 'boolean':
       return typeof raw === 'boolean' ? raw : undefined;
@@ -589,7 +596,16 @@ function sanitizeSync(key, raw) {
       const n = Number(raw);
       if (!Number.isFinite(n)) return undefined;
       let v = n;
+      // 与异步 validateKey 分支对称支持 clamp / round —— 否则同字段 update() clamp
+      // 但 load() 丢成默认，UI 行为漂移（audit 标注过的对称 bug）。
+      if (rule.clamp && (v < rule.min || v > rule.max)) {
+        v = Math.min(Math.max(v, rule.min), rule.max);
+      }
       if (rule.integer) v = Math.round(v);
+      if (typeof rule.round === 'number') {
+        const k = 10 ** rule.round;
+        v = Math.round(v * k) / k;
+      }
       if (v < rule.min || v > rule.max) return undefined;
       return v;
     }

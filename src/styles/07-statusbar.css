@@ -24,6 +24,13 @@
   letter-spacing: var(--tracking-wide);
   /* audit fix (P2)：与 toolbar 同步去掉 backdrop-filter —— 实色背景上看不出
      毛玻璃效果，但每帧重算模糊成本真实存在（1200×24 px × 60 fps = 大量 GPU）。 */
+  /* 切主题时与 body 同步淡入淡出：与 .toolbar 同源问题（见 04-toolbar.css
+     .toolbar { transition: background var(--transition-slow) } 注释），
+     不声明会让 --bg-toolbar 跳色而 body 还在过渡，形成 ~320ms 色块错位。
+     border-color 同理：1px 顶分隔线在切主题时硬切会跟主区淡变错位。 */
+  transition:
+    background var(--transition-slow),
+    border-color var(--transition-slow);
 }
 
 /* 三段式状态栏：左段（弱化路径）/ 中段（核心字数）/ 右段（chip 簇） */
@@ -108,9 +115,10 @@
   flex: 0 0 auto;
   width: 1px;
   height: 10px;
-  /* 圆角胶囊状的点状分隔符，比纯色线条更精致 */
+  /* 1px 宽 + 10px 高的纯竖线：border-radius 1px 在这种尺寸下既看不出"胶囊"
+      也"做隐形"，留着反而像漏改。改 0 让分隔线回归"实线"语义。 */
   background: var(--border-default);
-  border-radius: 1px;
+  border-radius: 0;
 }
 
 .status-meta {
@@ -271,6 +279,16 @@
   flex: 0 0 auto;
 }
 
+/* 章节切换时平滑淡入（随滚动触发，由 app.js 重触发动画）。
+   reduced-motion 下被 10-a11y.css 的 .01ms 规则收掉，不残留动画。 */
+.status-heading.is-updating {
+  animation: status-heading-fade 240ms var(--ease-out);
+}
+@keyframes status-heading-fade {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 .status-chip-muted {
   background: transparent;
   color: var(--fg-tertiary);
@@ -425,8 +443,11 @@
   animation: toast-in 280ms var(--ease-out);
   max-width: 480px;
   white-space: pre-wrap;
-  -webkit-backdrop-filter: blur(20px);
-  backdrop-filter: blur(20px);
+  /* audit fix (P3)：与 chrome 类保持 backdrop-filter 策略一致 —— toolbar /
+     statusbar 已因「实色上看不出毛玻璃、但 GPU 每帧重算成本真实」摘掉。
+     toast 用 var(--bg-elevated) 实色背景，去掉 blur 后视觉几乎无差
+     （短时浮现 + 不透明底色遮住一切），却避免每帧重算这块接近 viewport
+     1/3 宽的模糊覆盖区。 */
   /* 可选 icon：用 grid 而不是 inline-flex 是为了 icon 缺失时布局也稳定 */
   display: inline-grid;
   grid-template-columns: auto 1fr;

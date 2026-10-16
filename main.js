@@ -33,12 +33,13 @@ try {
         if (err && (err.code === 'EPIPE' || err.code === 'ENOTCONN' || err.code === 'EBADF')) {
           return; // 静默忽略：没有终端可写是正常的
         }
-        // 其他错误写到 tmp 文件，避免被 Electron 弹成主进程错误框
+        // 其他错误写到 tmp 文件，避免被 Electron 弹成主进程错误框。
+        // P2-12：fire-and-forget 异步写，不走 appendFileSync 阻塞 main。
         try {
-          require('fs').appendFileSync(
+          require('fs').promises.appendFile(
             require('path').join(require('os').tmpdir(), 'notes-main-stderr.log'),
             `[${new Date().toISOString()}] ${err.stack || err}\n`
-          );
+          ).catch(() => { /* 兜底逻辑本身不应再抛 */ });
         } catch { /* 兜底逻辑本身不应再抛 */ }
       });
     }
@@ -60,7 +61,6 @@ try {
   const _origWarn = console.warn;
   const _origError = console.error;
   const _path = require('path');
-  const _fsSync = require('fs');
   const _resolveLogDir = () => {
     try {
       const { app: _app } = require('electron');
@@ -85,12 +85,16 @@ try {
   };
   const _logDir = _resolveLogDir();
   const _logFile = _path.join(_logDir, 'notes-main.log');
+  // P2-10 / P2-12 (audit)：旧版每行 mkdirSync + appendFileSync 同步阻塞 main
+  // 事件循环；改 main/main-log-writer.js 异步缓冲（250ms 一把写，unref 定时器，
+  // 失败静默丢弃 —— 与旧「catch 忽略」语义一致）。
+  const _writer = require('./main/main-log-writer.js').createMainLogWriter({
+    logDir: _logDir,
+    logFile: _logFile,
+  });
   const _writeLog = (level, args) => {
     try {
-      // 兜底：目录可能不存在（首次启动 / 权限）→ 同步 mkdirSync recursive
-      _fsSync.mkdirSync(_logDir, { recursive: true });
-      _fsSync.appendFileSync(
-        _logFile,
+      _writer.write(
         `[${new Date().toISOString()}] [${level}] ${args.map((a) => (typeof a === 'string' ? a : require('util').inspect(a))).join(' ')}\n`
       );
     } catch { /* 写日志失败不应影响主流程 */ }
@@ -162,6 +166,12 @@ const fsSync = require('fs');
 // 设置 schema（单一事实源）—— 主进程、preload、renderer 三处共享。
 // 新增/修改设置项只需改 shared/settings-schema.js 一处。
 const { validateAndSanitize } = require('./shared/settings-schema.js');
+const { isValidPartialSettings } = require('./main/save-settings-validate.js');
+// R5 P1-10 / P1-11 / P1-14：IPC handler 入口 sender / frame / requestId 守卫。
+// 详见 main/ipc-sender.js 顶部注释。getMainWindow 通过 main.js 内部函数注入。
+const { assertMainSender, assertTopFrame, assertAiRequestId } = require('./main/ipc-sender.js');
+// P1-6：file:rename / folder:rename 成功后 fsync 父目录（POSIX 强同步视图）
+const { fsyncParentDir } = require('./main/fsync-parent-dir.js');
 // 配置持久化层（Stage 4b.1 抽离）
 const configStore = require('./main/config-store');
 // 目录监听层（Stage 4b.2 抽离）
@@ -176,11 +186,15 @@ const {
   isWithinDataDir,
   resolveFileName,
   resolveRenameName,
+  resolveFolderName,
+  resolveRenameFolderName,
   scanDir,
   assertNotSymlink,
   assertNoSymlinkAncestor,
   resolveDirRelative,
   toRelativeDir,
+  renameWithRetry,
+  recursiveCopy,
 } = fileOps;
 // AI 代理（用 Node 18+ 内置 fetch 调 OpenAI 兼容 API）
 const { createAiProxy } = require('./main/ai');
@@ -276,6 +290,33 @@ function _friendlyDeleteError(e) {
 }
 
 /**
+ * 复制失败的中文翻译（file:copy 专用）。
+ * 常见 errno：EACCES/EPERM（权限）、ENOSPC（磁盘满）、EROFS（只读）、
+ * EBUSY（文件被占）、ENOENT（源已被删）、EEXIST（目标已存在）。
+ */
+function _friendlyCopyError(e, name) {
+  const n = name || '文件';
+  switch (e && e.code) {
+    case 'EACCES':
+    case 'EPERM':
+      return `没有写入权限，无法复制 ${n}`;
+    case 'ENOSPC':
+      return '磁盘空间不足，无法复制';
+    case 'EROFS':
+      return '只读文件系统，无法复制';
+    case 'EEXIST':
+    case 'ENOTEMPTY':
+      return `已存在同名项，无法复制到 ${n}`;
+    case 'ENOENT':
+      return '源文件已被删除，无法复制';
+    case 'EBUSY':
+      return '文件被占用，无法复制';
+    default:
+      return `复制 ${n} 失败`;
+  }
+}
+
+/**
  * audit fix (K1-M2)：file:read 的 errno 翻译。读路径常见 errno：
  * EACCES/EPERM（权限）、EIO（磁盘 I/O）、EISDIR（路径是目录）、
  * ENAMETOOLONG（路径过长）。
@@ -332,6 +373,13 @@ app.commandLine.appendSwitch('disable-gpu-cache');
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 
 let mainWindow = null;
+// R5 P1-10：getMainWindow 是闭包（每次访问时读 mainWindow 当前值）—— 注入
+// 到 assertMainSender，让单测可以传 mock，且主窗口销毁事件触发时后续 IPC
+// 自动拒掉（getter 返回已销毁的 BrowserWindow，assertMainSender 看到
+// isDestroyed() true 直接拒绝）。
+function getMainWindow() {
+  return mainWindow;
+}
 let tray = null;
 let isQuitting = false;
 let currentDataDir = null;
@@ -437,12 +485,18 @@ console.log('[main] Project path:', __dirname);
 // 没人 await」「fsWatcher 内部 setTimeout 回调抛」之类的边界场景 —— 没有
 // 这里兜底会被 Node 默认行为吞掉（unhandledRejection 在新 Node 上是会
 // terminate 进程的，uncaughtException 默认打印 + 退出），连日志都不留。
-// 只 log 不 exit（与既有 try/catch 风格一致 —— 主进程挂了 IPC 全断）。
+// R5 P1-9：log 完调 app.exit(1) —— Node 文档明确警告 uncaughtException 后
+// 「process state may be inconsistent」，继续运行 IPC / fs / DB 操作更危险。
+// 代价：用户写一半的笔记可能丢失；但 uncaught 在 Notes 这类纯本地 app 里
+// 极少触发（99% 是 bug），出现时安全 > 完整。
 process.on('uncaughtException', (err, origin) => {
   console.error('[main] uncaughtException:', err && (err.stack || err.message || err), 'origin:', origin);
+  // flush 后再 exit —— console.error 是同步的，但保险起见给一个 tick
+  setImmediate(() => app.exit(1));
 });
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[main] unhandledRejection at:', promise, 'reason:', reason && (reason.stack || reason.message || reason));
+  setImmediate(() => app.exit(1));
 });
 
 // ============================================
@@ -912,6 +966,10 @@ app.on('before-quit', async (e) => {
 });
 
 app.on('will-quit', () => {
+  // audit fix (P1-2)：will-quit 时把 configStore 闸置 true，拒后续新 save。
+  // 时机：after before-quit（dirty 确认完，已经决定退）→ 不会再有新合法 save。
+  // 目的：renderer 错误风暴期间 IPC `await saveConfig(...)` 不挂在链尾阻塞 quit。
+  try { configStore._setIsQuitting(true); } catch (e) { console.warn('[main] _setIsQuitting 失败:', e && e.message); }
   // 退出时取消所有在飞的 AI 请求，避免响应被丢弃（付费用 API 也会浪费额度）。
   // audit fix (main-M11)：把同步清理拆出来，把 revealArmedBySender 兜底清理
   // 也挪到这里（armed TTL 兜底 setTimeout 已经 .unref，正常退出流程不会等它，
@@ -1182,7 +1240,45 @@ function broadcastDataDirResolved() {
   });
 }
 
-ipcMain.handle('file:list', async () => {
+// R5 P1-10：所有 IPC handler 入口的 sender 守卫辅助。每个 handler 顶部一行：
+//   const denied = guardSender(event); if (denied) return denied;
+// 比直接展开 assertMainSender 三行更省眼。顶层 frame 守卫（assertTopFrame，
+// P1-14）单独走 guardTopFrame —— 只 arm-reveal 用得上。
+function guardSender(event) {
+  const r = assertMainSender(event, getMainWindow);
+  return r.ok ? null : { ok: false, error: r.error };
+}
+function guardTopFrame(event) {
+  const r = assertTopFrame(event);
+  return r.ok ? null : { ok: false, error: r.error };
+}
+
+// audit fix (R7a P1-20)：file:list 分页缓存。
+//
+// 旧版 file:list 一次性返回全部 entries + files，10000 文件 ≈ 1.5-2MB
+// IPC payload，结构化克隆 + 渲染端 JSON.parse 都要 30-100ms，首次启动 cold
+// paint 明显卡顿。改成「首次 200 + 分页」+ 模块级 cache：scan 一次切片多次
+// 返回，避免 loadMore 反复触发全量 scanDir。
+//
+// 缓存逻辑抽到 main/file-list-cache.js（便于单测），本文件只调它。
+// file:write / file:create / file:delete / file:rename 成功后调
+// invalidateFileListCache()，下一次 file:list / file:list:more 重扫。
+const fileListCache = require('./main/file-list-cache.js');
+function invalidateFileListCache() { fileListCache.invalidate(); }
+
+/** 拉或建 file:list 缓存。dir 变化或缓存被显式失效时重扫。 */
+async function getOrBuildFileListCache(dir) {
+  return fileListCache.getOrBuild(dir, scanDir);
+}
+
+/** file:list 单页大小。10000 文件 ÷ 200 = 50 页，每页 30-50KB IPC，
+ *  结构化克隆 < 5ms。配合 P1-15 virtual scroll，首次启动 cold paint
+ *  < 100ms。 */
+const FILE_LIST_PAGE_SIZE = 200;
+
+ipcMain.handle('file:list', async (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   const dir = currentDataRoot();
   currentDataDir = dir;
   // audit fix (Main P2 / file:list no validation)：其他 handler（file:scan-dir
@@ -1204,29 +1300,86 @@ ipcMain.handle('file:list', async () => {
       message: ancestorCheck.message,
     };
   }
-  // Folder Browser：根目录也走 scanDir，渲染端用 entryType 分流显示文件夹 / 文件 / binary。
-  // 为了兼容老调用方，仍然把 entries 镜像成 files（仅 entryType==='editable'|'binary' 的项）。
-  const result = await scanDir(dir);
-  if (!result.ok) {
+  // audit fix (R7a P1-20)：走分页缓存，返回第一页 + total/hasMore。
+  const cache = await getOrBuildFileListCache(dir);
+  if (cache.error) {
     return {
       ok: false,
       files: [],
       entries: [],
-      error: result.error,
-      code: result.code,
-      message: result.message,
+      error: cache.error.error,
+      code: cache.error.code,
+      message: cache.error.message,
     };
   }
-  // files = 非文件夹条目（侧栏历史逻辑兼容：state.files 仅含文件）
-  const files = result.entries
-    .filter((e) => !e.isFolder)
-    .map((e) => ({ name: e.name, path: e.path, size: e.size, mtimeMs: e.mtimeMs, entryType: e.entryType }));
+  const offset = 0;
+  const limit = FILE_LIST_PAGE_SIZE;
   return {
     ok: true,
-    files,
-    entries: result.entries,
-    dir: result.dir,
+    files: cache.files.slice(offset, offset + limit),
+    entries: cache.entries.slice(offset, offset + limit),
+    dir,
     relDir: '',
+    total: cache.total,
+    hasMore: cache.total > limit,
+    offset,
+    limit,
+  };
+});
+
+/**
+ * file:list:more —— 分页后续页（audit R7a P1-20）
+ *
+ * 入参 {offset, limit?}，offset 必填（无 0 默认可避免 caller 把空参当 offset=0
+ * 漏 load 第一页），limit 默认 FILE_LIST_PAGE_SIZE，封顶 1000 防止恶意请求拉
+ * 爆。共享 file:list 的缓存；offset >= total 返回 ok + 空数组 + hasMore=false。
+ */
+ipcMain.handle('file:list:more', async (event, payload) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
+  const dir = currentDataRoot();
+  currentDataDir = dir;
+  // audit fix (R7a P1-20)：分页也走 assertNoSymlinkAncestor 防御：
+  // 共享 file:list 的 cache，但 cache 可能在 dir 被外部替换成 symlink 后
+  // 失效（cache.dir 没变但底层 symlink 改了），仍要每次校验。
+  const ancestorCheck = await assertNoSymlinkAncestor(dir, dir);
+  if (!ancestorCheck.ok) {
+    return {
+      ok: false,
+      files: [],
+      entries: [],
+      error: ancestorCheck.error,
+      code: ancestorCheck.code,
+      message: ancestorCheck.message,
+    };
+  }
+  const reqOffset = Number.isFinite(payload && payload.offset) ? payload.offset : -1;
+  const reqLimit = Number.isFinite(payload && payload.limit) ? payload.limit : FILE_LIST_PAGE_SIZE;
+  if (reqOffset < 0) {
+    return { ok: false, error: 'INVALID_OFFSET', code: 'EINVAL' };
+  }
+  const safeOffset = Math.max(0, Math.floor(reqOffset));
+  const safeLimit = Math.max(1, Math.min(Math.floor(reqLimit) || FILE_LIST_PAGE_SIZE, 1000));
+  const cache = await getOrBuildFileListCache(dir);
+  if (cache.error) {
+    return {
+      ok: false,
+      files: [],
+      entries: [],
+      error: cache.error.error,
+      code: cache.error.code,
+      message: cache.error.message,
+    };
+  }
+  const end = Math.min(safeOffset + safeLimit, cache.total);
+  return {
+    ok: true,
+    files: cache.files.slice(safeOffset, end),
+    entries: cache.entries.slice(safeOffset, end),
+    hasMore: end < cache.total,
+    offset: safeOffset,
+    limit: safeLimit,
+    total: cache.total,
   };
 });
 
@@ -1239,7 +1392,9 @@ ipcMain.handle('file:list', async () => {
  * 渲染端用这个在子目录之间导航；fs-watcher 也通过 {relDir} 字段告诉
  * 渲染端「变更发生在哪一层」，渲染端比对当前目录决定是否重扫。
  */
-ipcMain.handle('file:scan-dir', async (_event, relDir) => {
+ipcMain.handle('file:scan-dir', async (event, relDir) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   const dataRoot = currentDataRoot();
   const resolved = resolveDirRelative(typeof relDir === 'string' ? relDir : '', dataRoot);
   if (!resolved.ok) {
@@ -1266,6 +1421,11 @@ ipcMain.handle('file:scan-dir', async (_event, relDir) => {
       relDir: resolved.relDir,
     };
   }
+  // audit fix (R7a P1-20)：Folder Browser 进入子目录 / 切换目录后，
+  // 根目录 file:list 缓存的「dir 不等于 dataRoot」自然 stale（命中逻辑是
+  // _fileListCache.dir === dir，dataRoot 没变就仍命中 —— 根目录的 file:list
+  // 缓存与子目录 file:scan-dir 解耦，不影响）。这里仅记一笔：scan-dir 不会
+  // 改根目录 file:list 缓存，不需要显式 invalidate。
   return { ok: true, dir: result.dir, relDir: resolved.relDir, entries: result.entries };
 });
 
@@ -1281,7 +1441,9 @@ ipcMain.handle('file:scan-dir', async (_event, relDir) => {
  *
  * relDir 必须经过 resolveDirRelative 校验，防止传入绝对路径或 .. 段越权。
  */
-ipcMain.handle('file:watch-dir', async (_event, relDir) => {
+ipcMain.handle('file:watch-dir', async (event, relDir) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   const dataRoot = currentDataRoot();
   const resolved = resolveDirRelative(typeof relDir === 'string' ? relDir : '', dataRoot);
   if (!resolved.ok) {
@@ -1305,7 +1467,9 @@ ipcMain.handle('file:watch-dir', async (_event, relDir) => {
   }
 });
 
-ipcMain.handle('file:read', async (_event, filePath) => {
+ipcMain.handle('file:read', async (event, filePath) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof filePath !== 'string' || !filePath) {
     // audit fix (Round 7 IPC-1)：补齐 message 字段。renderer 走
     // `result.message || result.error || '未知错误'` 兜底，没 message 会退到
@@ -1411,7 +1575,9 @@ ipcMain.handle('file:read', async (_event, filePath) => {
  *
  * 不传 expectedMtimeMs（老调用 / 强写场景）则跳过校验。
  */
-ipcMain.handle('file:write', async (_event, filePath, content, expectedMtimeMs = null) => {
+ipcMain.handle('file:write', async (event, filePath, content, expectedMtimeMs = null) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof filePath !== 'string' || !filePath) {
     // audit fix (Round 7 IPC-3)：补齐 code + message，对齐其它 file:* handler 的
     // 字段集。renderer 一律 `result.code / result.message` 取值，没这两个字段
@@ -1507,6 +1673,10 @@ ipcMain.handle('file:write', async (_event, filePath, content, expectedMtimeMs =
       try { fsWatcher.markExpectedWrite(filePath, st.mtimeMs); }
       catch (e) { console.warn('[main] markExpectedWrite 失败:', e?.message); }
     }
+    // audit fix (R7a P1-20)：file:write 成功后让 file:list cache 失效。
+    // 文件 size / mtimeMs 都变了；走精细 diff 反而比重扫慢（一次 slice 即可），
+    // 直接 drop 缓存更省。
+    invalidateFileListCache();
     return { ok: true, mtimeMs: st.mtimeMs, size: st.size };
   } catch (e) {
     if (e.code === 'ENOENT') {
@@ -1529,7 +1699,9 @@ ipcMain.handle('file:write', async (_event, filePath, content, expectedMtimeMs =
   }
 });
 
-ipcMain.handle('file:create', async (_event, rawName, opts) => {
+ipcMain.handle('file:create', async (event, rawName, opts) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof rawName !== 'string') {
     return { ok: false, error: 'INVALID_NAME', code: 'INVALID_NAME', message: '文件名必须是字符串' };
   }
@@ -1583,6 +1755,9 @@ ipcMain.handle('file:create', async (_event, rawName, opts) => {
       return { ok: false, error: ancestorCheck.error, code: ancestorCheck.code, message: ancestorCheck.message };
     }
   }
+  // 记录目标子目录在创建前是否已存在：仅当我们"这次新建"的空目录才在失败路径清理，
+  // 避免误删用户原本就存在的空子文件夹（见下方 cleanupEmptySubdir）。
+  const targetDirExistedBefore = await fs.access(targetDir).then(() => true).catch(() => false);
   try {
     await fs.mkdir(targetDir, { recursive: true });
   } catch (e) {
@@ -1599,19 +1774,21 @@ ipcMain.handle('file:create', async (_event, rawName, opts) => {
     };
   }
 
-  // audit fix (2026-09-21)：标记是否新建了子目录，用于失败路径下清理空目录。
+  // 标记是否新建了子目录，用于失败路径下清理空目录。
   // 之前 mkdir 成功后任何下游失败（resolveFileName / isWithinDataDir / symlink
   // 防护 / atomicWriteFile）都会留下 targetDir 这个空子目录 —— 数据目录里
-  // 出现不可见的垃圾文件夹，下次扫描会列入文件列表。targetDir === dataRoot
-  // 时不需要清理（root 早就在）。
-  const didMkdirSubdir = targetDir !== dataRoot;
+  // 出现不可见的垃圾文件夹，下次扫描会列入文件列表。
+  // 仅当我们本次新建了子目录才清理：pre-existing 的空子文件夹不在清理范围
+  // （避免原子写失败时把用户原有空目录也误删）。targetDir === dataRoot 时
+  // targetDirExistedBefore 必为 true，同样不会清理。
+  const didMkdirSubdir = !targetDirExistedBefore;
   // best-effort 清理函数：仅当目录为空时移除（已含文件的不动，避免误删）。
   async function cleanupEmptySubdir() {
     if (!didMkdirSubdir) return;
     try {
       const entries = await fs.readdir(targetDir);
       if (entries.length === 0) {
-        await fs.rmdir(targetDir);
+        await fs.rm(targetDir, { recursive: true, force: false });
       }
     } catch (cleanupErr) {
       // 清理本身失败不抛 —— 让原始错误的响应路径主导。
@@ -1679,6 +1856,8 @@ ipcMain.handle('file:create', async (_event, rawName, opts) => {
       try { fsWatcher.markExpectedWrite(r.path, st.mtimeMs); }
       catch (e) { console.warn('[main] markExpectedWrite 失败:', e?.message); }
     }
+    // audit fix (R7a P1-20)：file:create 成功后让 file:list cache 失效（新增条目）。
+    invalidateFileListCache();
     return { ok: true, path: r.path, name: r.name, mtimeMs: st.mtimeMs, size: st.size };
   } catch (e) {
     // 失败路径：先清理可能新建的空子目录，再按错误类型返回响应。
@@ -1699,12 +1878,142 @@ ipcMain.handle('file:create', async (_event, rawName, opts) => {
 });
 
 /**
+ * folder:create —— 在指定目录下新建文件夹。
+ *
+ * 设计要点：
+ *   - 与 file:create 对称：
+ *     symlink 防护（assertNotSymlink + assertNoSymlinkAncestor）→
+ *     resolveFolderName（输入合法性 + 重名避让）→
+ *     mkdir → fsync parent → 返回 {path, name} 强同步视图
+ *   - targetDir 缺省 = dataRoot；可在 opts.dir 指定 POSIX 相对子目录。
+ *     子目录不存在则自动 mkdir recursive（一层）；symlink 父链被 assertNoSymlinkAncestor 拦下。
+ *   - 不递归创建深链 —— 只在 opts.dir 那一层做 mkdir recursive（resolveFolderName 之前的 mkdir），
+ *     与 file:create 同源语义：用户主动「在这里建文件夹」 → 自动创建所在目录合理。
+ *   - 不写文件：mkdir 之后不原子写任何东西。返回字段不含 mtimeMs/size（folder 没有这两项内容展示）。
+ *
+ * 失败路径语义：
+ *   - INVALID_NAME：resolveFolderName 返回 !ok（捕获在 _early）
+ *   - PATH_NOT_ALLOWED / SYMLINK_NOT_ALLOWED：防御栈统一返回
+ *   - mkdir errno：EEXIST（已被 resolveFolderName 避让，正常不会撞）/ ENOENT（祖先链断）/
+ *     EACCES/EPERM（无权限）走统一 _friendly*Error 翻译
+ *   - 任何 mkdir 后的失败路径都做 best-effort 清理（仿 file:create 行为）：
+ *     只清空子目录，不动根 dataRoot
+ */
+ipcMain.handle('folder:create', async (event, rawName, opts) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
+  if (typeof rawName !== 'string') {
+    return { ok: false, error: 'INVALID_NAME', code: 'INVALID_NAME', message: '文件夹名必须是字符串' };
+  }
+  const dataRoot = currentDataRoot();
+  if (!dataRoot) return { ok: false, error: 'DATA_DIR_UNAVAILABLE', code: 'DATA_DIR_UNAVAILABLE', message: '数据目录不可用' };
+
+  // opts 处理：可选 { dir } —— root 下还是某个子目录下
+  let targetDir = dataRoot;
+  if (opts && typeof opts === 'object' && typeof opts.dir === 'string' && opts.dir) {
+    if (!isWithinDataDir(opts.dir, dataRoot)) {
+      return { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '目标目录不在数据目录内' };
+    }
+    targetDir = opts.dir;
+  }
+
+  // 关键防御：祖先链 symlink 检查必须在 mkdir 之前 —— 与 file:create 同源（见 line 1580 注释）。
+  if (targetDir !== dataRoot) {
+    const ancestorCheck = await assertNoSymlinkAncestor(targetDir, dataRoot);
+    if (!ancestorCheck.ok) {
+      return { ok: false, error: ancestorCheck.error, code: ancestorCheck.code, message: ancestorCheck.message };
+    }
+  }
+  let didMkdirSubdir = false;
+  try {
+    // mkdir recursive：targetDir 不存在则自动创建（与 file:create 同源）；
+    // 已存在 → noop（下面 resolveFolderName 内的 pathOccupancy 仍会判定 finalPath 是否冲突）
+    await fs.mkdir(targetDir, { recursive: true });
+    if (targetDir !== dataRoot) didMkdirSubdir = true;
+  } catch (e) {
+    console.error('[main] folder:create mkdir 失败:', _redactPath(targetDir), e.code || e.message);
+    return {
+      ok: false,
+      error: e.code || 'MKDIR_FAILED',
+      code: e.code,
+      message: _friendlyCreateError(e, '所在目录'),
+    };
+  }
+
+  // mkdir 成功后失败路径清理 —— 仅当新建了子目录时清（root 不清）
+  async function cleanupEmptySubdir() {
+    if (!didMkdirSubdir) return;
+    try {
+      const entries = await fs.readdir(targetDir);
+      if (entries.length === 0) {
+        await fs.rm(targetDir, { recursive: true, force: false });
+      }
+    } catch (cleanupErr) {
+      console.warn('[main] folder:create 清理空子目录失败:', _redactPath(targetDir), cleanupErr.code || cleanupErr.message);
+    }
+  }
+
+  try {
+    const r = await resolveFolderName(rawName, targetDir);
+    if (!r.ok) {
+      throw Object.assign(new Error(r.error), { _early: { error: 'INVALID_NAME', code: 'INVALID_NAME', message: r.error } });
+    }
+    if (!isWithinDataDir(r.path, dataRoot)) {
+      throw Object.assign(new Error('路径不在数据目录内'), { _early: { error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '路径不在数据目录内' } });
+    }
+    // target path 的祖先链复查（防御 TOCTOU：resolveFolderName 与 mkdir 之间可能有竞态）
+    const finalAncestorCheck = await assertNoSymlinkAncestor(r.path, dataRoot);
+    if (!finalAncestorCheck.ok) {
+      throw Object.assign(new Error(finalAncestorCheck.message || '祖先链 symlink 防护拒绝'), { _early: finalAncestorCheck });
+    }
+
+    // mkdir(target)：already-exists 走 noop（resolveFolderName 已避让，正常不应撞）；
+    // 同步 fsync 父目录（POSIX 下与 atomicWriteFile 同源语义 —— 「目录项写入磁盘」语义）
+    // mkdir 本身在 fsync 之前；POSIX-only 防御，Win NTFS journal 自带元数据持久化无需 fsync。
+    try {
+      await withTimeout(fs.mkdir(r.path, { recursive: false }), undefined, 'folder:create.mkdir-target');
+    } catch (e) {
+      if (e.code === 'EEXIST') {
+        // 极小概率：resolveFolderName 后某个并发进程恰好放入同名 file/dir → 回到避让再试一次
+        throw Object.assign(new Error('目标路径已被占用'), { _early: { error: 'PATH_CONFLICT', code: 'EEXIST', message: '该名称已被占用' } });
+      }
+      throw e;
+    }
+    if (process.platform !== 'win32') {
+      // 与 atomicWriteFile 同源：POSIX rename/mkdir 后 fsync 父目录项
+      const dirFh = await fs.open(targetDir, 'r');
+      try {
+        await dirFh.sync();
+      } finally {
+        try { await dirFh.close(); } catch { /* ignore */ }
+      }
+    }
+    invalidateFileListCache();
+    return { ok: true, path: r.path, name: r.name };
+  } catch (e) {
+    await cleanupEmptySubdir();
+    if (e && e._early) {
+      return { ok: false, error: e._early.error, code: e._early.code, message: e._early.message };
+    }
+    console.error('[main] folder:create 失败:', _redactPath(targetDir + '/' + rawName), e.code || e.message);
+    return {
+      ok: false,
+      error: e.code || 'CREATE_FOLDER_FAILED',
+      code: e.code,
+      message: _friendlyCreateError(e, rawName),
+    };
+  }
+});
+
+/**
  * file:rename —— 修复两点（audit #4 + audit #12 + audit #7）：
  *   - 返回 mtimeMs / size 让 renderer 立刻同步侧边栏与状态栏
  *   - Windows 上大小写不敏感比对（path.resolve 保留原大小写）
  *   - symlink 防护：拒绝重命名 symlink
  */
-ipcMain.handle('file:rename', async (_event, oldPath, newName) => {
+ipcMain.handle('file:rename', async (event, oldPath, newName) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof oldPath !== 'string' || typeof newName !== 'string') {
     return { ok: false, error: 'INVALID_ARGS', code: 'INVALID_ARGS', message: '参数类型不合法' };
   }
@@ -1743,7 +2052,9 @@ ipcMain.handle('file:rename', async (_event, oldPath, newName) => {
 
   // 解析新文件名（重命名专用：不强制 .md 后缀，用户输入什么就用什么 —— 见 [[project-no-auto-md-on-rename-2026-08]]；
   //   仍做路径分隔符 / Windows 保留字符 / 控制字符 / 重名避让校验）。
-  const r = await resolveRenameName(newName, dir);
+  // 解析新文件名（重命名专用）：用文件自身的父目录而非 dataRoot 作为 join 基准，
+  // 否则嵌套目录里的文件重命名会被静默移到根目录顶层（audit 修复）。
+  const r = await resolveRenameName(newName, path.dirname(oldPath));
   // audit fix (Round 7 IPC-3)：补齐 message 字段，并保证 code 一定存在。
   // 旧版直接 `code: r.code`，但 resolveRenameName 历史上不返回 code 字段
   // （参见 main/file-ops.js#resolveRenameName：返回 `{ ok:false, error }`），
@@ -1773,7 +2084,10 @@ ipcMain.handle('file:rename', async (_event, oldPath, newName) => {
     return { ok: false, error: newAncestorCheck.error, code: newAncestorCheck.code, message: newAncestorCheck.message };
   }
 
-  // 新路径不能等于原路径（Windows 上大小写不敏感比对，audit #12）
+  // 新路径不能等于原路径（Windows 上大小写不敏感比对，audit #12）。
+  // 同名 rename（basename 相同）会被下方的 isSamePath 捕获 —— r.path 是
+  // `path.join(dirname(oldPath), newName)`，basename 相同时必然等于 oldPath，
+  // 走 unchanged:true + stat 早返回，不需要额外的 isSameName 分支。
   const oldResolved = path.resolve(oldPath);
   const newResolved = path.resolve(r.path);
   const isSamePath = process.platform === 'win32'
@@ -1807,6 +2121,12 @@ ipcMain.handle('file:rename', async (_event, oldPath, newName) => {
     // audit fix (Round 17 H2)：rename 走 withTimeout —— SMB / OneDrive 持锁时
     // rename 可能挂死数分钟；超时透传 FS_TIMEOUT 让 renderer 弹友好提示。
     await withTimeout(fs.rename(oldPath, r.path), undefined, 'file:rename.rename');
+    // P1-6：rename 成功后 fsync 父目录（POSIX 强同步视图）。失败只 warn：
+    // 文件已改名成功，崩溃时只是「新名可能不持久」，回滚成本高于收益。
+    const fsyncResult = await fsyncParentDir(r.path);
+    if (!fsyncResult.ok) {
+      console.warn('[main] file:rename fsync 父目录失败（不影响 rename 成功）:', fsyncResult.error);
+    }
     // 重新 stat 拿到新 mtime/size（audit #4：之前漏掉，renderer 状态栏会短暂无日期）
     const st = await withTimeout(fs.stat(r.path), undefined, 'file:rename.stat');
     // audit fix (Round 16 M1)：self-write filter —— rename 触发 fs.watch 两个
@@ -1816,6 +2136,9 @@ ipcMain.handle('file:rename', async (_event, oldPath, newName) => {
       try { fsWatcher.markExpectedWrite(r.path, st.mtimeMs); }
       catch (e) { console.warn('[main] markExpectedWrite 失败:', e?.message); }
     }
+    // audit fix (R7a P1-20)：file:rename 成功后让 file:list cache 失效
+    // （name / path 都变了，缓存里旧条目失效）。
+    invalidateFileListCache();
     return { ok: true, path: r.path, name: r.name, mtimeMs: st.mtimeMs, size: st.size };
   } catch (e) {
     // audit fix (K1-H1)：console 走 _redactPath（之前 e.message 直接打到日志，
@@ -1832,13 +2155,122 @@ ipcMain.handle('file:rename', async (_event, oldPath, newName) => {
 });
 
 /**
+ * folder:rename —— 重命名一个文件夹。镜像 file:rename 的防御栈，但：
+ *   - 旧路径必须存在且**是目录**（不是文件、不是不存在）
+ *   - 新路径在父目录下（folder rename 不跨父目录）
+ *   - 用 resolveRenameFolderName 校验 + 重名避让（无扩展名切割，与 file 版本对齐）
+ *
+ * 返回 { ok:true, path, name } 让 renderer 把 state.currentDir / breadcrumb / fs-watcher 都同步过去。
+ * self-rename（新名 === 旧名）走 short-circuit，返回 unchanged:true。
+ */
+ipcMain.handle('folder:rename', async (event, oldPath, newName) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
+  if (typeof oldPath !== 'string' || typeof newName !== 'string') {
+    return { ok: false, error: 'INVALID_ARGS', code: 'INVALID_ARGS', message: '参数类型不合法' };
+  }
+  const dataRoot = currentDataRoot();
+  if (!isWithinDataDir(oldPath, dataRoot)) {
+    return { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '原路径不在数据目录内' };
+  }
+  // 原路径必须是目录（folder:rename 契约）。不像 file:rename 需要查 isFile 区分，
+  // 这里反过来：要的就是目录、文件则拒。ENOENT 也拒（防止「重命名不存在的文件夹」）。
+  let oldStat;
+  try {
+    oldStat = await fs.stat(oldPath);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      return { ok: false, error: 'FOLDER_NOT_FOUND', code: 'FOLDER_NOT_FOUND', message: '文件夹已被删除' };
+    }
+    return { ok: false, error: e.code || 'STAT_FAILED', code: e.code, message: _friendlyShellError(e, '读取状态失败') };
+  }
+  if (!oldStat.isDirectory()) {
+    return { ok: false, error: 'NOT_A_FOLDER', code: 'NOT_A_FOLDER', message: '该路径不是文件夹' };
+  }
+  // 原路径祖先链 symlink 防护
+  const oldAncestorCheck = await assertNoSymlinkAncestor(oldPath, dataRoot);
+  if (!oldAncestorCheck.ok) {
+    return { ok: false, error: oldAncestorCheck.error, code: oldAncestorCheck.code, message: oldAncestorCheck.message };
+  }
+  // symlink 拒绝（数据目录里不应出现 symlink 目录，但万一同步盘 / 误操作塞进来）
+  const linkCheck = await assertNotSymlink(oldPath);
+  if (!linkCheck.ok) {
+    return { ok: false, error: linkCheck.error, code: linkCheck.code, message: linkCheck.message };
+  }
+
+  // 解析新名（重命名专用，无扩展名切割；带字符校验 + 重名避让）
+  const parentDir = path.dirname(oldPath);
+  const r = await resolveRenameFolderName(newName, parentDir);
+  if (!r.ok) {
+    return { ok: false, error: 'INVALID_NAME', code: 'INVALID_NAME', message: r.error };
+  }
+  // 新路径必须在父目录下（folder rename 不跨父目录 —— 即使 newName 没 /，resolveRenameFolderName 也只在 parentDir 内 join）
+  if (!isWithinDataDir(r.path, parentDir)) {
+    return { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '新路径不在原文件夹内' };
+  }
+  const targetLinkCheck = await assertNotSymlink(r.path);
+  if (!targetLinkCheck.ok) {
+    return { ok: false, error: targetLinkCheck.error, code: targetLinkCheck.code, message: targetLinkCheck.message };
+  }
+  const newAncestorCheck = await assertNoSymlinkAncestor(r.path, dataRoot);
+  if (!newAncestorCheck.ok) {
+    return { ok: false, error: newAncestorCheck.error, code: newAncestorCheck.code, message: newAncestorCheck.message };
+  }
+
+  // 同名 short-circuit（Windows 大小写不敏感比对）
+  const oldResolved = path.resolve(oldPath);
+  const newResolved = path.resolve(r.path);
+  const isSamePath = process.platform === 'win32'
+    ? oldResolved.toLowerCase() === newResolved.toLowerCase()
+    : oldResolved === newResolved;
+  if (isSamePath) {
+    return { ok: true, path: r.path, name: r.name, unchanged: true };
+  }
+
+  try {
+    await withTimeout(fs.rename(oldPath, r.path), undefined, 'folder:rename.rename');
+    // P1-6：rename 成功后 fsync 父目录（POSIX 强同步视图）。失败只 warn：
+    // 文件夹已改名成功，崩溃时只是「新名可能不持久」，回滚成本高于收益。
+    const fsyncResult = await fsyncParentDir(r.path);
+    if (!fsyncResult.ok) {
+      console.warn('[main] folder:rename fsync 父目录失败（不影响 rename 成功）:', fsyncResult.error);
+    }
+    // audit fix (Round 16 M1)：self-write filter —— rename 触发 fs.watch 事件（旧路径消失 + 新路径出现）。
+    // rename 不修改 mtime（POSIX rename(2) 保留 inode mtime），但 window 上的 fs.watch
+    // 仍会 emit；先标 self-write 让 fsWatcher 在 500ms 内不推向 renderer。
+    if (fsWatcher && typeof fsWatcher.markExpectedWrite === 'function') {
+      // folder 没有 mtime，用 0 占位标记路径即可 —— markExpectedWrite 已支持这种 fallback
+      try { fsWatcher.markExpectedWrite(r.path, 0); }
+      catch (e) { console.warn('[main] markExpectedWrite(folder) 失败:', e?.message); }
+    }
+    // 同时把旧路径也标上，避免 fs-watcher 推「旧路径已不在」被误读为外部删除
+    if (fsWatcher && typeof fsWatcher.markExpectedWrite === 'function') {
+      try { fsWatcher.markExpectedWrite(oldPath, 0); }
+      catch (e) { console.warn('[main] markExpectedWrite(folder-old) 失败:', e?.message); }
+    }
+    invalidateFileListCache();
+    return { ok: true, path: r.path, name: r.name };
+  } catch (e) {
+    console.error('[main] folder:rename 失败:', _redactPath(oldPath), '→', _redactPath(r.path), e.code || e.message);
+    return {
+      ok: false,
+      error: e.code || 'RENAME_FAILED',
+      code: e.code,
+      message: _friendlyRenameError(e, r.name),
+    };
+  }
+});
+
+/**
  * file:delete —— 修复一点（audit #7）：
  *   - symlink 防护：拒绝删除 symlink（避免 trashItem 跟随到外部真实文件）
  *   - Stage 8：支持删除文件夹（Folder Browser）。空判断逻辑：
  *     `assertNotSymlink` 返回 isFile:false 可能是「目录」或「不存在」；
  *     用 stat 二次判定，存在但不是文件 → 当作目录走 trashItem。
  */
-ipcMain.handle('file:delete', async (_event, filePath) => {
+ipcMain.handle('file:delete', async (event, filePath) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof filePath !== 'string' || !filePath) {
     return { ok: false, error: 'INVALID_PATH', code: 'INVALID_PATH', message: '路径必须是字符串' };
   }
@@ -1875,11 +2307,15 @@ ipcMain.handle('file:delete', async (_event, filePath) => {
     // 走系统回收站 —— 目录也行；失败兜底 fs.rmdir 删空目录
     try {
       await shell.trashItem(filePath);
+      // audit fix (R7a P1-20)：file:delete 目录成功后让 file:list cache 失效。
+      invalidateFileListCache();
       return { ok: true, path: filePath, recycled: true, isFolder: true };
     } catch (e) {
-      console.warn('[main] trashItem(目录) 失败，降级到 rmdir:', e.message);
+      console.warn('[main] trashItem(目录) 失败，降级到 rm:', e.message);
       try {
-        await fs.rmdir(filePath);
+        await fs.rm(filePath, { recursive: true, force: false });
+        // audit fix (R7a P1-20)：同上（rmdir 降级路径）。
+        invalidateFileListCache();
         return { ok: true, path: filePath, recycled: false, isFolder: true };
       } catch (e2) {
         // 不拼 e2.message（英文 errno + 路径）—— 其它 file:* handler 都用纯中文 message
@@ -1903,6 +2339,8 @@ try {
   // Electron 内部可能挂死（直到 trash 处理超时才会 reject）。30s 强制让
   // renderer 拿到结果。
   await withTimeout(shell.trashItem(filePath), undefined, 'file:delete.trash');
+  // audit fix (R7a P1-20)：file:delete 文件成功后让 file:list cache 失效。
+  invalidateFileListCache();
   return { ok: true, path: filePath, recycled: true };
 } catch (e) {
   // audit fix (K1-L2)：之前 message 拼 e.message（英文 errno + 路径）回到 renderer
@@ -1918,6 +2356,180 @@ try {
 }
 });
 
+/**
+ * file:move —— 把文件 / 文件夹移动到目标文件夹（跨目录 rename，同盘原子）。
+ * 拖拽到文件夹 = move；右键「剪切 → 粘贴」也走这里。
+ *
+ * 防御栈与 file:rename 同源：
+ *   - guardSender + 参数类型校验
+ *   - isWithinDataDir（src 与 dest 都在数据目录内）
+ *   - assertNotSymlink + assertNoSymlinkAncestor（src 与 dest 两侧）
+ *   - 目标必须是真实存在的目录；源必须存在
+ *   - 文件夹不能移入自身或其子孙（prevent 循环）
+ *   - 目标名走 resolveRenameName / resolveRenameFolderName 做合法性 + 重名避让
+ *   - rename 成功 → fsync 父目录 + markExpectedWrite + invalidateFileListCache
+ */
+ipcMain.handle('file:move', async (event, srcPath, destDir) => {
+  const prepared = await _prepareRelocate(event, srcPath, destDir);
+  if (prepared.error) return prepared.error;
+  const { srcPath: src, destPath, destName, srcIsDir } = prepared.value;
+  try {
+    await withTimeout(renameWithRetry(src, destPath), undefined, 'file:move.rename');
+    // 重命名后 stat 拿 mtime/size（status bar 需要）；文件夹无 mtime 概念用 0 占位
+    const st = srcIsDir ? null : await withTimeout(fs.stat(destPath), undefined, 'file:move.stat');
+    const fsyncResult = await fsyncParentDir(destPath);
+    if (!fsyncResult.ok) {
+      console.warn('[main] file:move fsync 父目录失败（不影响移动成功）:', fsyncResult.error);
+    }
+    if (fsWatcher && typeof fsWatcher.markExpectedWrite === 'function') {
+      try { fsWatcher.markExpectedWrite(destPath, srcIsDir ? 0 : st.mtimeMs); }
+      catch (e) { console.warn('[main] markExpectedWrite(file) 失败:', e?.message); }
+    }
+    invalidateFileListCache();
+    // 移动目标所在目录的 POSIX 相对路径（相对 dataRoot），供 renderer 同步
+    // state.currentFileRelDir：移动当前打开的文件后，onFilesChanged 才不会把
+    // 旧目录的"文件已移除"事件误判为"打开的文件被删除"（见 src/file-ops.js _applyMoveToOpenFile）。
+    // 走 toRelativeDir helper（main/file-ops.js 导出）而非内联 normalize —— 主进程多处
+    // （fs-watcher、file:list）共用同一份 POSIX 相对路径语义，不在此处再实现一遍。
+    const movedRelDir = toRelativeDir(path.dirname(destPath), currentDataRoot());
+    return srcIsDir
+      ? { ok: true, path: destPath, name: destName, entryType: 'folder', relDir: movedRelDir }
+      : { ok: true, path: destPath, name: destName, entryType: 'file', mtimeMs: st.mtimeMs, size: st.size, relDir: movedRelDir };
+  } catch (e) {
+    console.error('[main] file:move 失败:', _redactPath(src), '→', _redactPath(destPath), e.code || e.message);
+    return {
+      ok: false,
+      error: e.code || 'MOVE_FAILED',
+      code: e.code,
+      message: _friendlyRenameError(e, destName),
+    };
+  }
+});
+
+/**
+ * file:copy —— 把文件 / 文件夹复制到目标文件夹。
+ * 拖拽（按住 Ctrl/Cmd）到文件夹 = copy；右键「复制 → 粘贴」也走这里。
+ *
+ * 防御栈与 file:move 同源（见 _prepareRelocate）。
+ * 文件 → fs.copyFile；文件夹 → recursiveCopy（跳过 symlink、逐文件复制）。
+ * 复制失败 → 清理半成品目标，避免留下半截目录。
+ */
+ipcMain.handle('file:copy', async (event, srcPath, destDir) => {
+  const prepared = await _prepareRelocate(event, srcPath, destDir);
+  if (prepared.error) return prepared.error;
+  const { srcPath: src, destPath, destName, srcIsDir } = prepared.value;
+  try {
+    if (srcIsDir) {
+      await withTimeout(recursiveCopy(src, destPath), undefined, 'file:copy.recursive');
+    } else {
+      // recursiveCopy 内部已 mkdir 目标目录；单文件复制需先确保父目录存在
+      // （destDir 已确认存在，destPath 是 destDir 下的新名字，父目录即 destDir）
+      await withTimeout(fs.copyFile(src, destPath), undefined, 'file:copy.copyFile');
+    }
+    const st = srcIsDir ? null : await withTimeout(fs.stat(destPath), undefined, 'file:copy.stat');
+    const fsyncResult = await fsyncParentDir(destPath);
+    if (!fsyncResult.ok) {
+      console.warn('[main] file:copy fsync 父目录失败（不影响复制成功）:', fsyncResult.error);
+    }
+    if (fsWatcher && typeof fsWatcher.markExpectedWrite === 'function') {
+      try { fsWatcher.markExpectedWrite(destPath, srcIsDir ? 0 : st.mtimeMs); }
+      catch (e) { console.warn('[main] markExpectedWrite(file) 失败:', e?.message); }
+    }
+    invalidateFileListCache();
+    return srcIsDir
+      ? { ok: true, path: destPath, name: destName, entryType: 'folder' }
+      : { ok: true, path: destPath, name: destName, entryType: 'file', mtimeMs: st.mtimeMs, size: st.size };
+  } catch (e) {
+    // 复制失败清理半成品目标，避免留下半截目录 / 文件
+    try { await fs.rm(destPath, { recursive: true, force: true }); } catch { /* ignore */ }
+    console.error('[main] file:copy 失败:', _redactPath(src), '→', _redactPath(destPath), e.code || e.message);
+    return {
+      ok: false,
+      error: e.code || 'COPY_FAILED',
+      code: e.code,
+      message: _friendlyCopyError(e, destName),
+    };
+  }
+});
+
+/**
+ * 移动 / 复制共用的前置校验（file:move / file:copy 均走这里）。
+ * 返回 { error: <envelope> }（失败时）或 { value: {...} }（通过时）。
+ * envelope 形状统一 { ok:false, error, code?, message }，与 file:rename 等对齐。
+ */
+async function _prepareRelocate(event, srcPath, destDir) {
+  const denied = guardSender(event);
+  if (denied) return { error: denied };
+  if (typeof srcPath !== 'string' || !srcPath || typeof destDir !== 'string' || !destDir) {
+    return { error: { ok: false, error: 'INVALID_ARGS', code: 'INVALID_ARGS', message: '参数类型不合法' } };
+  }
+  const dataRoot = currentDataRoot();
+  if (!dataRoot) {
+    return { error: { ok: false, error: 'DATA_DIR_UNAVAILABLE', code: 'DATA_DIR_UNAVAILABLE', message: '数据目录不可用' } };
+  }
+  if (!isWithinDataDir(srcPath, dataRoot)) {
+    return { error: { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '源路径不在数据目录内' } };
+  }
+  if (!isWithinDataDir(destDir, dataRoot)) {
+    return { error: { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '目标目录不在数据目录内' } };
+  }
+  // symlink 防护（audit #7）：src / dest 两侧都不允许含 symlink
+  const linkCheck = await assertNotSymlink(srcPath);
+  if (!linkCheck.ok) {
+    return { error: { ok: false, error: linkCheck.error, code: linkCheck.code, message: linkCheck.message } };
+  }
+  const srcAncestorCheck = await assertNoSymlinkAncestor(srcPath, dataRoot);
+  if (!srcAncestorCheck.ok) {
+    return { error: { ok: false, error: srcAncestorCheck.error, code: srcAncestorCheck.code, message: srcAncestorCheck.message } };
+  }
+  const destAncestorCheck = await assertNoSymlinkAncestor(destDir, dataRoot);
+  if (!destAncestorCheck.ok) {
+    return { error: { ok: false, error: destAncestorCheck.error, code: destAncestorCheck.code, message: destAncestorCheck.message } };
+  }
+  // 目标必须是真实存在的目录
+  let destStat;
+  try {
+    destStat = await fs.stat(destDir);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      return { error: { ok: false, error: 'FOLDER_NOT_FOUND', code: 'ENOENT', message: '目标文件夹已不存在' } };
+    }
+    return { error: { ok: false, error: e.code || 'STAT_FAILED', code: e.code, message: _friendlyShellError(e, '读取目标状态失败') } };
+  }
+  if (!destStat.isDirectory()) {
+    return { error: { ok: false, error: 'NOT_A_DIRECTORY', code: 'NOT_A_DIRECTORY', message: '目标路径不是文件夹' } };
+  }
+  // 源必须存在 + 确定类型
+  let srcStat;
+  try {
+    srcStat = await fs.stat(srcPath);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      return { error: { ok: false, error: 'FILE_NOT_FOUND', code: 'ENOENT', message: '源文件已被删除' } };
+    }
+    return { error: { ok: false, error: e.code || 'STAT_FAILED', code: e.code, message: _friendlyShellError(e, '读取源状态失败') } };
+  }
+  const srcIsDir = srcStat.isDirectory();
+  // 文件夹不能移入自身或其子孙（防止循环 / 路径穿越）
+  if (srcIsDir && (destDir === srcPath || destDir.startsWith(srcPath + path.sep))) {
+    return { error: { ok: false, error: 'TARGET_INSIDE_SOURCE', code: 'TARGET_INSIDE_SOURCE', message: '不能把文件夹移入自身或其子文件夹' } };
+  }
+  // 解析目标名 + 重名避让（文件 / 文件夹走各自 resolver）
+  const srcBase = path.basename(srcPath);
+  const r = srcIsDir
+    ? await resolveRenameFolderName(srcBase, destDir)
+    : await resolveRenameName(srcBase, destDir);
+  if (!r.ok) {
+    return { error: { ok: false, error: 'INVALID_NAME', code: 'INVALID_NAME', message: r.error } };
+  }
+  // 目标路径祖先链复查（防御 TOCTOU）
+  const finalAncestorCheck = await assertNoSymlinkAncestor(r.path, dataRoot);
+  if (!finalAncestorCheck.ok) {
+    return { error: { ok: false, error: finalAncestorCheck.error, code: finalAncestorCheck.code, message: finalAncestorCheck.message } };
+  }
+  return { value: { srcPath, destPath: r.path, destName: r.name, srcIsDir, dataRoot } };
+}
+
 // ============================================
 //  IPC: 应用信息
 // ============================================
@@ -1926,7 +2538,9 @@ ipcMain.handle('app:get-data-dir', () => currentDataRoot());
 ipcMain.handle('app:get-default-data-dir', () => configStore.getDefaultDataDir());
 ipcMain.handle('app:get-version', () => app.getVersion());
 
-ipcMain.handle('app:open-data-dir', async () => {
+ipcMain.handle('app:open-data-dir', async (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   let dir;
   try {
     dir = path.resolve(currentDataRoot());
@@ -1977,7 +2591,9 @@ ipcMain.handle('app:open-data-dir', async () => {
 // 也是无谓的权限暴露）。这里强制 target 必须是当前数据目录（settings-dialog.js
 // 也只拿 _configDir 来调用）。路径比对走 path.resolve + 大小写规整化
 // （Windows 不区分大小写、POSIX 区分），避免通过 '..' / 大小写绕过。
-ipcMain.handle('app:open-path', async (_event, target) => {
+ipcMain.handle('app:open-path', async (event, target) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof target !== 'string' || !target) {
     // audit fix (Round 8 IPC-5)：补齐 message 字段，与 file:read / file:write /
     // shell:open-dir 等 handler 对齐。renderer 走 `result.message || result.error
@@ -2016,7 +2632,9 @@ ipcMain.handle('app:open-path', async (_event, target) => {
   }
 });
 
-ipcMain.handle('app:choose-data-dir', async () => {
+ipcMain.handle('app:choose-data-dir', async (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   // audit fix (H5)：补 isDestroyed() —— !mainWindow 只能挡 null/undefined，
   // 异步窗口销毁的窗口期（mainWindow 引用还在但 isDestroyed===true）会进
   // showOpenDialog 抛错。X 紧接菜单点「选择数据目录」的场景能复现。
@@ -2042,7 +2660,9 @@ ipcMain.handle('app:choose-data-dir', async () => {
  * custom 路径」的语义。auto-fallback 已尽量减少用户误触发，这里只对应用户主动点
  * 「回到默认」按钮的明确指令。
  */
-ipcMain.handle('app:reset-data-dir', async () => {
+ipcMain.handle('app:reset-data-dir', async (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (!mainWindow || mainWindow.isDestroyed()) {
     return { ok: false, error: 'NO_WINDOW' };
   }
@@ -2082,7 +2702,9 @@ ipcMain.handle('app:reset-data-dir', async () => {
 // ============================================
 //  IPC: shell.openExternal（链接点击跳转默认浏览器）
 // ============================================
-ipcMain.handle('shell:open-external', async (_event, url) => {
+ipcMain.handle('shell:open-external', async (event, url) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   // audit fix (Round 7 IPC-10)：改成 `{ ok, code, message }` envelope，与全文件
   // 其它 IPC handler 对齐。renderer 端 `if (!ok)` 无法区分「URL 不合法」/「shell
   // 调用失败」/「系统级错误」，统一走 envelope 让 toast 文案可针对原因。
@@ -2160,7 +2782,9 @@ ipcMain.handle('shell:open-external', async (_event, url) => {
  * 传文件会被拒绝（"不是一个目录"）。这里单独走 shell.showItemInFolder，
  * 是 Electron 提供的"显示文件"标准入口。
  */
-ipcMain.handle('shell:show-item-in-folder', async (_event, fullPath) => {
+ipcMain.handle('shell:show-item-in-folder', async (event, fullPath) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof fullPath !== 'string' || !fullPath) {
     // audit fix (Round 8 IPC-6)：补齐 message 字段，与 shell:open-dir / file:read
     // 等 handler 对齐。renderer friendlyFsError 兜底走 result.message，没 message
@@ -2189,7 +2813,7 @@ ipcMain.handle('shell:show-item-in-folder', async (_event, fullPath) => {
     // 修复：realpath 拿到「symlink 真实指向」，再次 isWithinDataDir 校验。
     // 真实路径不在数据目录 → 拒（错误码 SYMLINK_OUTSIDE，与 file:write
     // 路径的 SYMLINK_NOT_ALLOWED 对齐但语义更准确）。
-    const real = await fs.promises.realpath(fullPath);
+    const real = await fs.realpath(fullPath);
     if (!isWithinDataDir(real, currentDataRoot())) {
       return {
         ok: false,
@@ -2223,7 +2847,9 @@ ipcMain.handle('shell:show-item-in-folder', async (_event, fullPath) => {
  * 安全：与 `shell:show-item-in-folder` 对称 —— 强制 isWithinDataDir 边界检查，
  * 不让 renderer 通过这条 IPC 打开任意系统目录。
  */
-ipcMain.handle('shell:open-dir', async (_event, dirPath) => {
+ipcMain.handle('shell:open-dir', async (event, dirPath) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (typeof dirPath !== 'string' || !dirPath) {
     // audit fix (Round 7 IPC-4)：补齐 code + message 字段，与其它 shell:* handler
     // 对齐。renderer 走 friendlyFsError(code, message) 没 message 兜底到英文。
@@ -2240,6 +2866,13 @@ ipcMain.handle('shell:open-dir', async (_event, dirPath) => {
     // renderer 走 friendlyFsError(code, message) 没 code 字段会落到 error 字符串，
     // 文案与其它通道不一致。
     return { ok: false, error: 'PATH_NOT_ALLOWED', code: 'PATH_NOT_ALLOWED', message: '路径不在数据目录内' };
+  }
+  // MEDIUM #7 修复：仅查末段 lstat 不够 —— 若路径中某祖先是软链指向数据目录外，
+  // path.resolve 不跟随，isWithinDataDir 与末段 lstat 都通过，shell.openPath 仍会
+  // 跟随祖先软链打开外部目录（与 file:scan-dir 的祖先链防护对齐）。
+  const ancestorCheck = await assertNoSymlinkAncestor(resolved, currentDataRoot());
+  if (!ancestorCheck.ok) {
+    return { ok: false, error: ancestorCheck.error, code: ancestorCheck.code, message: ancestorCheck.message };
   }
   try {
     // audit fix：用 lstat 拒绝 symlink 目录（与 file:scan-dir 对齐）。
@@ -2279,7 +2912,9 @@ ipcMain.handle('shell:open-dir', async (_event, dirPath) => {
 //  IPC: 窗口控制
 // ============================================
 
-ipcMain.handle('window:set-always-on-top', (_event, enabled) => {
+ipcMain.handle('window:set-always-on-top', (event, enabled) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (!mainWindow || mainWindow.isDestroyed()) return false;
   if (typeof enabled !== 'boolean') {
     console.warn('[main] setAlwaysOnTop 收到非布尔值:', enabled);
@@ -2294,7 +2929,9 @@ ipcMain.handle('window:set-always-on-top', (_event, enabled) => {
   }
 });
 
-ipcMain.handle('window:minimize', () => {
+ipcMain.handle('window:minimize', (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (!mainWindow || mainWindow.isDestroyed()) return false;
   // audit fix (K1-L4)：try/catch 兜底 —— minimize() 在窗口被销毁过程中可能抛
   // "Object has been destroyed"，与 setAlwaysOnTop 的 L4 修复对齐。
@@ -2307,7 +2944,9 @@ ipcMain.handle('window:minimize', () => {
   }
 });
 
-ipcMain.handle('window:toggle-maximize', () => {
+ipcMain.handle('window:toggle-maximize', (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (!mainWindow || mainWindow.isDestroyed()) return false;
   try {
     if (mainWindow.isMaximized()) {
@@ -2322,7 +2961,9 @@ ipcMain.handle('window:toggle-maximize', () => {
   }
 });
 
-ipcMain.handle('window:close', () => {
+ipcMain.handle('window:close', (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (!mainWindow || mainWindow.isDestroyed()) return false;
   try {
     mainWindow.close();
@@ -2345,7 +2986,9 @@ function broadcastMaximizeState() {
  * 渲染端发来修改请求：调 OpenAI 兼容 API，返回 { id, content, responseFormat }。
  * 错误统一返回 { ok:false, error, message } 供 renderer 弹 toast。
  */
-ipcMain.handle('ai:edit', async (_event, payload) => {
+ipcMain.handle('ai:edit', async (event, payload) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
   if (!payload || typeof payload !== 'object') {
     return { ok: false, error: 'INVALID_PAYLOAD', message: '请求体无效' };
   }
@@ -2357,17 +3000,30 @@ ipcMain.handle('ai:edit', async (_event, payload) => {
  * 渲染端发来取消请求：找到对应 requestId 的 AbortController 并触发 abort。
  * 找不到（请求已完成 / 超时）静默忽略。
  */
-ipcMain.on('ai:cancel', (_event, requestId) => {
-  if (typeof requestId === 'string' && requestId) {
-    aiProxy.cancel(requestId);
+ipcMain.on('ai:cancel', (event, requestId) => {
+  // R5 P1-10 / P1-11：sender 守卫 + requestId 格式校验。攻击场景：
+  //   1) 恶意 webContents 调 ai:cancel 取消别人正在跑的 AI 请求
+  //   2) 注入畸形 requestId 探测 aiProxy 内部 Map 结构
+  // 两者都拒。
+  const denied = guardSender(event);
+  if (denied) return;
+  const idCheck = assertAiRequestId(requestId);
+  if (!idCheck.ok) {
+    console.warn('[main] ai:cancel 拒绝：requestId 格式不合法');
+    return;
   }
+  aiProxy.cancel(idCheck.requestId);
 });
 
 // ============================================
 //  IPC: 应用设置（持久化）
 // ============================================
 
-ipcMain.handle('app:get-settings', () => {
+ipcMain.handle('app:get-settings', (event) => {
+  // R5 P1-10：app:get-settings 返回整份配置（已脱敏 aiApiKey），仍需 sender
+  // 守卫 —— 防止恶意 webContents 拉配置嗅探 dataDir / theme 等元信息。
+  const denied = guardSender(event);
+  if (denied) return denied;
   const cfg = configStore.getConfig() || {};
   const { aiApiKey, ...rest } = cfg;
   // P1-1 fix (audit)：过滤 aiApiKey 真值，只露布尔标记。renderer 任何位置
@@ -2397,6 +3053,10 @@ const REVEAL_ARMED_TTL_MS = 5_000;
 const revealArmedBySender = new Map();
 
 ipcMain.handle('app:arm-reveal-ai-key', (event) => {
+  // R5 P1-14：顶层 frame 守卫。app:reveal-ai-key 流程是「先 arm，5s 内
+  // reveal」—— 防子 frame（未来 webview 嵌入）通过调 arm 推进 reveal 状态机。
+  const denied = guardSender(event) || guardTopFrame(event);
+  if (denied) return denied;
   const senderId = event.sender && event.sender.id;
   if (typeof senderId !== 'number') {
     return { ok: false, error: 'INVALID_SENDER' };
@@ -2415,6 +3075,11 @@ ipcMain.handle('app:arm-reveal-ai-key', (event) => {
 });
 
 ipcMain.handle('app:reveal-ai-key', (event) => {
+  // R5 P1-10：纵深防御。app:reveal-ai-key 已有 revealArmedBySender Map
+  // 按 sender.id 二次确认，但加 assertMainSender 让恶意 webContents 根本
+  // 进不到 sender-id 提取逻辑（更早 fail）。
+  const denied = guardSender(event);
+  if (denied) return denied;
   const senderId = event.sender && event.sender.id;
   const until = (typeof senderId === 'number') ? revealArmedBySender.get(senderId) : undefined;
   // 任意一条命中即拒绝：没 arm / arm 已过期 / sender 不匹配
@@ -2469,7 +3134,24 @@ ipcMain.handle('app:get-config-path', () => {
  * 这里用「不接参数」的专用 handler 同时满足两个既有约束：完整路径不过 IPC
  * （隐私），renderer 也无法传任意路径（安全）。形状与 app:open-data-dir 对齐。
  */
-ipcMain.handle('app:open-config-dir', async () => {
+// P2-7（audit）：app:open-config-dir 审计日志 + 高频调用 warn。
+// 单次打开配置目录无害，但脚本化高频调用能弹一串文件管理器窗口骚扰用户；
+// 只检测不拦截（拦截会误伤合法连点），超阈值 console.warn 进 notes-main.log。
+const _openConfigDirRate = require('./main/audit-rate.js').createAuditRateTracker({
+  windowMs: 60_000,
+  threshold: 10,
+});
+ipcMain.handle('app:open-config-dir', async (event) => {
+  const denied = guardSender(event);
+  if (denied) return denied;
+  // 审计行：sender id + ISO 时间戳。不写路径（与 _redactPath 的隐私约束同源）。
+  console.log('[audit] app:open-config-dir', 'ts=', new Date().toISOString(),
+    'senderId=', event && event.sender && event.sender.id);
+  const _rate = _openConfigDirRate.hit('app:open-config-dir');
+  if (_rate.exceeded) {
+    console.warn('[main] app:open-config-dir 高频调用:', _rate.count, '次/分钟, senderId=',
+      event && event.sender && event.sender.id);
+  }
   let dir;
   try {
     dir = path.dirname(configStore.getConfigPath());
@@ -2503,7 +3185,12 @@ ipcMain.handle('app:open-config-dir', async () => {
  * 渲染端直接把这串东西塞进 toast 很难看。
  */
 ipcMain.handle('app:save-settings', async (event, partial) => {
-  if (!partial || typeof partial !== 'object') return { ok: true, settings: configStore.getConfig() };
+  // audit fix (P1-1)：null / undefined / primitive / Array / Function 一律拒。
+  // 旧版 `!partial || typeof partial !== 'object'` 把非法 payload 当「无更新」
+  // 静默放过，renderer 缓存与磁盘脱钩（settingsStore.update 拿不到 error 也不
+  // 会重试，直到下次合法保存）。改为显式拒返，settingsStore.update 能看到
+  // 错误并提示用户。
+  if (!isValidPartialSettings(partial)) return { ok: false, error: 'INVALID_PAYLOAD' };
 
   // 目录存在性校验（schema 里用 opts.resolveDir 注入，因为要异步 fs.lstat + access）
   // audit fix (Security-L4)：旧版用 fs.stat 会跟随 symlink —— 用户 / 同步盘 /

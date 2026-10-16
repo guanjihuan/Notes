@@ -12,6 +12,9 @@
 //   - Ctrl/Cmd + Shift+A     切换 AI 修改面板（编辑器内让给 CM6）
 //   - Ctrl/Cmd + W           关闭当前打开的文件（无文件时 no-op；模态打开时吞掉）
 //   - Esc（搜索框内）        清空搜索
+//   - Ctrl/Cmd + X           剪切侧栏选中的文件 / 文件夹到剪贴板（编辑器内让给 CM6）
+//   - Ctrl/Cmd + C           复制侧栏选中的文件 / 文件夹到剪贴板（编辑器内让给 CM6）
+//   - Ctrl/Cmd + V           把剪贴板里的条目粘贴到当前浏览目录（编辑器内让给 CM6）
 //
 // 注意：CM6 内部的 keymap 会优先拦截 Mod-s / Mod-f（在编辑器聚焦时），
 // 但事件仍会继续冒泡到 document —— 所以这里必须主动避让，否则
@@ -36,6 +39,20 @@ function isInsideEditor(e) {
 }
 
 /**
+ * 事件焦点是否在侧栏 / 文件列表内。
+ * 只有焦点落在侧栏（含 .file-list 里的 .file-item）时，Ctrl+X/C/V 才作用于
+ * 选中的文件条目；否则（编辑器内 / 阅读视图 / 搜索框）让浏览器原生
+ * 复制 / 粘贴文本，不被快捷键劫持。
+ * @param {Event} e
+ * @returns {boolean}
+ */
+function isSidebarFocused(e) {
+  const target = e.target;
+  if (!target || typeof target.closest !== 'function') return false;
+  return !!(target.closest('.sidebar') || target.closest('.file-list'));
+}
+
+/**
  * @param {object} handlers
  * @param {() => void} handlers.onFocusSearch
  * @param {() => void} handlers.onClearSearch
@@ -48,6 +65,9 @@ function isInsideEditor(e) {
  * @param {() => void} [handlers.onToggleAi] - Ctrl/Cmd+Shift+A（AI 修改面板）
  * @param {() => void} [handlers.onReload]   - Ctrl/Cmd+R（README 之前提到但未注册——audit 补全）
  * @param {() => void} [handlers.onCloseFile] - Ctrl/Cmd+W（关闭当前打开的文件；无文件时 no-op）
+ * @param {() => void} [handlers.onCut]       - Ctrl/Cmd+X（剪切侧栏选中条目到剪贴板）
+ * @param {() => void} [handlers.onCopy]      - Ctrl/Cmd+C（复制侧栏选中条目到剪贴板）
+ * @param {() => void} [handlers.onPaste]     - Ctrl/Cmd+V（把剪贴板条目粘贴到当前目录）
  */
 export function mountKeyboardShortcuts({
   onFocusSearch,
@@ -61,6 +81,9 @@ export function mountKeyboardShortcuts({
   onToggleAi,
   onReload,
   onCloseFile,
+  onCut,
+  onCopy,
+  onPaste,
 }) {
   // audit fix (Phase O-M2)：提取命名 handler 让 dispose 能 removeEventListener。
   // 之前匿名函数 addEventListener 后无法解绑，测试 beforeEach 反复 mount
@@ -95,12 +118,17 @@ export function mountKeyboardShortcuts({
 
     const inEditor = isInsideEditor(e);
 
-    // 模态打开时禁用所有 Ctrl/Cmd 类快捷键，避免抢焦点或顶替对话框。
+    // 模态打开时禁用大部分 Ctrl/Cmd 类快捷键，避免抢焦点或顶替对话框。
     // 注意：编辑器内的 Ctrl+S/Ctrl+F 已经在 inEditor 分支里 return 了，
     // 所以这里再补一个 modalOpen 不会影响 CM6 内部的快捷键。
     if (modalOpen && !inEditor) {
-      // 但 Ctrl+S 仍允许 —— 在模态内按 Ctrl+S 不该有副作用
-      // 真正会被拦下的：Ctrl+, / Ctrl+F / Ctrl+Shift+T / Ctrl+E / Ctrl+N / Ctrl+Shift+F / Ctrl+Shift+A
+      // 模态内大部分文件类快捷键吞掉，但 Ctrl+S 是例外 —— 下面 SUPPRESS_KEYS 不收 's'，
+      // 事件会落到文件末尾的 Ctrl+S 分支（line ~158）继续调 onSave 保存底层文档，
+      // 与编辑器内 Ctrl+S 行为一致（设置对话框自身也在内部监听 Ctrl+S 做「模态内快捷保存」，
+      // 并用 stopPropagation 阻止冒泡，这里无需拦截；开着普通 confirm/prompt 时
+      // Ctrl+S 仍可落盘，避免用户改完内容想保存却毫无反应）。
+      // 真正会被拦下的：Ctrl+, / Ctrl+F / Ctrl+Shift+T / Ctrl+E / Ctrl+N / Ctrl+Shift+F /
+      // Ctrl+Shift+A。
       // 用 toLowerCase() 同时覆盖 Ctrl 与 Cmd，按 Shift 时 key 已是 'F'/'T' 等大写
       // —— 所以 'f' 一行就同时兜住 Ctrl+F 和 Ctrl+Shift+F，不用再写一份 shiftKey 子句。
       const k = e.key.toLowerCase();
@@ -202,6 +230,24 @@ export function mountKeyboardShortcuts({
       e.preventDefault();
       if (onReload) onReload();
       return;
+    }
+
+    // Ctrl/Cmd + X / C / V → 剪切 / 复制 / 粘贴侧栏选中的文件条目。
+    // 仅在焦点位于侧栏（.sidebar / .file-list）时生效：
+    //   - 编辑器内 → 让给 CM6 的原生文本复制 / 剪切 / 粘贴
+    //   - 阅读视图 / 搜索框 → 让给浏览器原生文本复制
+    // 与上方其它 Ctrl+letter 分支一样，IME 合成期已在 handler 顶部被 isComposing 守卫拦截。
+    if (!e.shiftKey && !e.altKey) {
+      const k = e.key.toLowerCase();
+      if (k === 'x' || k === 'c' || k === 'v') {
+        if (inEditor) return;
+        if (!isSidebarFocused(e)) return;
+        e.preventDefault();
+        if (k === 'x' && onCut) onCut();
+        else if (k === 'c' && onCopy) onCopy();
+        else if (k === 'v' && onPaste) onPaste();
+        return;
+      }
     }
 
     // Ctrl/Cmd + W → 关闭当前打开的文件。

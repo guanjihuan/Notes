@@ -9,6 +9,7 @@
 import { EditorState, Prec, Compartment } from '@codemirror/state';
 import { EditorView, keymap } from '@codemirror/view';
 import { basicSetup } from 'codemirror';
+import { history } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { getTextStats } from './stats.js';
 import { pickEditorTheme } from './editor-theme.js';
@@ -103,7 +104,16 @@ export class MarkdownEditor {
   }
 
   /**
-   * 加载文件内容到编辑器。多次调用会销毁旧 view。
+   * 加载文件内容到编辑器。多次调用复用同一 view（不再 _destroyView + new）。
+   *
+   * audit fix (R7b P1-18)：单实例 `EditorView` 持久化。
+   *   - 旧实现每次 loadFile 都 _destroyView() + new EditorView() → history /
+   *     selection / 折叠全丢 + 30-100ms 黑闪 + 重新挂 N 个 IME listener
+   *     （极端时序 compositionend 跑多次 → state.isDirty 翻脏态反复）。
+   *   - 新实现：view 已存在 → dispatch 替换 doc + selection reset 到开头
+   *     （用户「打开文件」是导航动作，光标落文首是符合直觉的默认）；
+   *     view 不存在 → 走 _createView 一次性建好（首次 loadFile 触发）。
+   *
    * @param {{path:string,name:string}} file
    * @param {string} content
    */
@@ -114,27 +124,56 @@ export class MarkdownEditor {
     if (!this.element || typeof this.element.appendChild !== 'function') {
       throw new Error('MarkdownEditor: element required (must be a DOM node)');
     }
-    this._destroyView();
-
-    // Round 13 fix (H8)：clearListeners 用新 AbortController 包住本轮 view 的
-    // listener 与 IME handler。下次 loadFile() / dispose() 时清掉旧 listener。
-    // 旧实现每次 loadFile 都给 contentDOM addEventListener，但只 dispose 时
-    // 才走 addAbort 的 remove —— 多次开文件会让 DOM 上累积多份 IME handler，
-    // 极端时序（compositionend 在 view 已 destroy 之后才 fire）会跑多次
-    // onChangeCallback，让 app 翻脏态 + 调度多余的 auto-save。
-    this._viewAbort = new AbortController();
-    // 把 contentDOM 上的 listener 挂到这个 signal，loadFile 重入 / dispose
-    // 都一次性 abort。CM6 自己的 listener 用 contentDOM 默认挂（不在 signal
-    // 上），由 _destroyView / view.destroy 拆解。
-    const contentSignal = this._viewAbort.signal;
 
     this.lastSavedDoc = content || '';
+    const insert = content || '';
+
+    if (this.view) {
+      // view 已存在 → 复用。dispatch 替换 doc，selection 故意重置到 (0,0)
+      // （用户主动打开文件 = 导航，光标落文首是合理默认；与 setExternalContent
+      // 的「保留光标位置」差异是设计意图：setExternalContent 是外部覆盖，
+      // 不该打断用户当前阅读位置；loadFile 是用户主动切文件，重置是合理的）。
+      this.view.dispatch({
+        changes: { from: 0, to: this.view.state.doc.length, insert },
+        selection: { anchor: 0, head: 0 },
+      });
+      return;
+    }
+
+    // 首次：建 view（之后不再重建，直到 dispose / unload）
+    this._createView(insert);
+  }
+
+  /**
+   * 首次创建 EditorView + IME listener。view 整个 lifetime 只调一次。
+   * loadFile 在 view 已存在时不会重入这里。
+   *
+   * @param {string} initialContent - 初始 doc 内容
+   */
+  _createView(initialContent) {
+    // Round 13 fix (H8)：clearListeners 用新 AbortController 包住本轮 view 的
+    // listener 与 IME handler。下次 dispose() 时清掉旧 listener。view 在
+    // MarkdownEditor 生命周期内只建一次，所以这个 signal 也只创一次。
+    this._viewAbort = new AbortController();
+    // 把 contentDOM 上的 listener 挂到这个 signal，dispose 时整体 abort。
+    // CM6 自己的 listener 用 contentDOM 默认挂（不在 signal 上），由 view.destroy
+    // 拆解。
+    const contentSignal = this._viewAbort.signal;
 
     const state = EditorState.create({
-      doc: this.lastSavedDoc,
+      doc: initialContent,
       extensions: [
         EditorView.lineWrapping,
         basicSetup,
+        // audit P0-3（C-1）：basicSetup 默认带 history() 但 history 大小无显式
+        // 上限（默认 minDepth=100，updateBranch 实际有 +20 buffer，所以 120）。
+        // 打开 5MB 文件 + 长时间编辑 → history 数组几十~几百 MB，OOM 风险。
+        // 覆盖配置：minDepth=500 限制 history 长度（老 step 被丢弃，updateBranch
+        // 内部 +20 buffer，所以 520 上限），newGroupDelay=200ms 把短时间内的连续
+        // keystroke 合并成 1 步（避免每个键 1 步、3 千字输入塞 3 千条 history）。
+        // 注：CM6 API 用 minDepth（虽然语义上是 max），不是 audit 文档误写的
+        // maxDepth；参数名以 @codemirror/commands 的 HistoryConfig 为准。
+        Prec.high(history({ minDepth: 500, newGroupDelay: 200 })),
         markdown(),
         this.themeCompartment.of(pickEditorTheme(this.currentTheme)),
         this.editableCompartment.of(EditorView.editable.of(true)),

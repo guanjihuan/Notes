@@ -21,7 +21,17 @@ const fsSync = require('fs');
 // 把登记 key 和 dirWatcher 上报的 absPath 都归一化到同一形态。
 const path = require('path');
 
-const DIR_POLL_INTERVAL_MS = 2000;
+// audit fix (R7a P1-19)：自适应轮询间隔。活动期间（最近 POLL_ACTIVE_WINDOW_MS
+// 内有 fs.watch 事件 / 探测到列表变化）用 500ms 高频轮询，静止期 5s 一次。
+// 旧版固定 2s 在 SMB / OneDrive 上常因 scanDir 自身 > 2s + 重入保护 drop 5-15 轮
+// 兜底信号（fs.watch 不可靠环境的唯一变化源），侧栏 stale 数分钟。自适应后：
+//   - 文件刚改完时高频扫，能在 1s 内反映
+//   - 静止后回到 5s 节流，省 SMB 流量 / IO
+//   - 关键：「不 drop」—— in-flight 时挂 pending flag，完成后立即补一次，
+//     上一轮被跳过的探测不会丢失（旧版在 pollInFlight 守卫下直接吞掉）
+const POLL_INTERVAL_ACTIVE_MS = 500;
+const POLL_INTERVAL_QUIET_MS = 5000;
+const POLL_ACTIVE_WINDOW_MS = 2000;
 const EMIT_DEBOUNCE_MS = 300;
 // audit fix (Round 7 FS-F8)：debounce maxWait —— 持续事件流（git checkout /
 // 大目录解压 / AI 批量写）让 300ms 防抖窗口永远不能 trailing flush，
@@ -94,6 +104,22 @@ function createFsWatcher(deps) {
   // lastFilesSnapshot → 后完成的可能是先发起的（旧快照覆盖新基线）。
   // pollInFlight 守卫：上一轮未返回时直接跳过本次。
   let pollInFlight = false;
+  // audit fix (R7a P1-19)：「不 drop」pending。in-flight 期间又触发的 tick
+  // 不再被吞，挂 pendingPoll = true；in-flight 完成后立即补一次（delay=0），
+  // 紧跟的那次 tick 间隔回到 adaptive 值。被跳过的探测不再丢。
+  let pendingPoll = false;
+  // audit fix (R7a P1-19 bugfix)：「暂停期间不 re-schedule」。pauseDirPolling
+  // 通过 stopDirPoll 清掉 dirPollTimer + 把 pendingPoll 重置为 false，但
+  // 已 in-flight 的 runPollTick 仍在 await scanDir；scanDir 返回后 finally
+  // 走「无 pending → scheduleNextPoll(getPollInterval())」，等于暂停期间
+  // 重新挂了一个 5s 后才退到的轮询定时器，窗口隐藏时白白浪费 SMB / OneDrive
+  // 流量。pollPaused 标志让 finally 跳过 scheduleNextPoll，真正停止轮询；
+  // resumeDirPolling 清标志 + startDirPoll() 立即重启。
+  let pollPaused = false;
+  // audit fix (R7a P1-19)：自适应轮询的「活动窗口」基线。fs.watch 事件 /
+  // emitFilesChanged 实际探测到变化时刷新；poll tick 取间隔时比 POLL_ACTIVE_WINDOW_MS，
+  // 在窗口内 → ACTIVE 500ms，否则 QUIET 5000ms。
+  let lastChangeAt = 0;
   // audit fix (Round 16 M1)：self-write filter。file:write / file:create 成功后
   // 通过 markExpectedWrite(absPath, mtimeMs) 登记；dirWatcher callback 看到这个
   // key 命中 + 未过期 → 跳过 scheduleEmit，避免「renderer 把自己的写盘当外部
@@ -225,6 +251,26 @@ function createFsWatcher(deps) {
   function clearErrorLatch() {
     lastErrorKey = '';
     lastErrorAt = 0;
+  }
+
+  /**
+   * audit fix (R7a P1-19)：标记「刚刚有活动」。被 fs.watch callback / scheduleEmit
+   * / 探测到列表变化时调用。poll tick 读 lastChangeAt 决定下次间隔是 ACTIVE
+   * (500ms) 还是 QUIET (5000ms)。
+   */
+  function markActivity() {
+    lastChangeAt = Date.now();
+  }
+
+  /**
+   * 自适应 poll 间隔：距 lastChangeAt 在 ACTIVE_WINDOW 内 → 500ms，否则 5s。
+   * 仅「是否在活动窗口」的二元判定 —— 不做指数退避，简单的「5s 节流」就够
+   * 应付 SMB 流量压力（5s 一次 readdir 1w 文件 ≈ 200KB 网络 IO，可忽略）。
+   */
+  function getPollInterval() {
+    return (Date.now() - lastChangeAt) < POLL_ACTIVE_WINDOW_MS
+      ? POLL_INTERVAL_ACTIVE_MS
+      : POLL_INTERVAL_QUIET_MS;
   }
 
   /**
@@ -391,6 +437,10 @@ function createFsWatcher(deps) {
       // 不向 renderer 推送，避免「刚加载就 emitFilesChanged 又被 renderer 当
       // fs:changed 事件 → 触发 scanDir 重复请求」循环。
       if (snapshot !== lastFilesSnapshot) {
+        // audit fix (R7a P1-19)：真正探测到列表变化时也算「活动」，把 poll
+        // 切到 ACTIVE 500ms 高频，确保连续改动（git checkout / AI 批量写）
+        // 期间每 500ms 兜底一次，即便 fs.watch 漏报。
+        markActivity();
         lastFilesSnapshot = snapshot;
         if (!skipInitialEmit) {
           // 成功路径同样补 relDir 字段（FS-F11）；移除绝对 dir 字段（M12）。
@@ -402,6 +452,10 @@ function createFsWatcher(deps) {
 
   function scheduleEmit() {
     const now = Date.now();
+    // audit fix (R7a P1-19)：fs.watch 事件流持续期间把 poll 切到 ACTIVE 500ms
+    // 高频。markActivity 写 lastChangeAt，下一次 poll tick 拿到的就是 active
+    // 间隔；事件流停 2s 后回 QUIET 5s。无需显式定时器，纯「窗口判定」。
+    markActivity();
     // audit fix (Round 7 FS-F8)：maxWait —— 持续事件流（git checkout /
     // 大目录解压 / AI 批量写）让 300ms 防抖窗口永远 trailing flush 不出。
     // burstStartedAt 记录首事件时间，到 maxWait 时强制立即 emit。
@@ -417,7 +471,13 @@ function createFsWatcher(deps) {
     const t = setTimeout(() => {
       emitDebounceTimer = null;
       burstStartedAt = 0;
-      emitFilesChanged(undefined, dirAtSchedule);
+      // 防御性兜底：emitFilesChanged 是 async，其 scanDir 之后的 entriesSnapshot /
+      // safeSend 路径（try 之外）若抛错会变成未捕获拒绝，触发全局
+      // unhandledRejection → app.exit(1) 杀进程。这里 .catch 吞掉，避免一次
+      // 畸形 scan 结果拖垮整个应用。
+      emitFilesChanged(undefined, dirAtSchedule).catch((e) => {
+        console.warn('[fs-watcher] emitFilesChanged 失败：', e && e.message);
+      });
     }, delay);
     // audit fix (main-M8)：unref —— 否则 fs-watcher 还在挂定时器时 Electron
     // 主进程不会自然退出（before-quit 取消 close path 后这 300ms 会再卡一下）。
@@ -456,33 +516,83 @@ function createFsWatcher(deps) {
     reattachTimer = t;
   }
 
-  function startDirPoll() {
-    if (dirPollTimer || !watchedDir) return;
+  /**
+   * audit fix (R7a P1-19)：重构 setInterval → setTimeout 链。每次 tick 后
+   * 重新决策下次间隔（active / quiet 二元），用 setTimeout 而不是 setInterval
+   * 才能让间隔真正自适应。
+   *
+   * 「不 drop」语义：in-flight 期间触发的 tick 不再被 pollInFlight 守卫吞掉，
+   * 挂 pendingPoll = true；in-flight 完成后 nextTick 立即补一次（delay=0），
+   * 之后再回到 adaptive 间隔。被跳过的探测不会丢。
+   *
+   * @param {number} [delay] - 距上次结束的延迟（ms），默认 = getPollInterval()
+   */
+  function scheduleNextPoll(delay) {
+    if (!watchedDir) return;
+    if (dirPollTimer) {
+      clearTimeout(dirPollTimer);
+      dirPollTimer = null;
+    }
+    const wait = Number.isFinite(delay) ? delay : getPollInterval();
     // audit fix (Round 7 FS-F14)：unref —— 这个 timer 是长期存活的，叠加
     // will-quit 不清 fsWatcher 会在退出路径上拖住主进程。
-    dirPollTimer = setInterval(() => {
-      // audit fix (Round 7 FS-F7)：重入保护。慢盘（OneDrive / SMB）上
-      // scanDir 可能 > 2s，setInterval 触发新一轮与上一轮 await 并发，
-      // 争写 lastFilesSnapshot → 后完成的可能是先发起的（旧覆盖新）。
-      if (pollInFlight) return;
-      pollInFlight = true;
-      updateSnapshot(watchedDir)
-        .catch((e) => {
-          // audit fix (Round 7 FS-F16)：floating promise 兜底。
-          console.warn('[fs-watcher] 轮询 updateSnapshot 抛出:', e && e.message);
-        })
-        .finally(() => {
-          pollInFlight = false;
-        });
-    }, DIR_POLL_INTERVAL_MS);
-    if (typeof dirPollTimer.unref === 'function') dirPollTimer.unref();
+    const t = setTimeout(() => {
+      dirPollTimer = null;
+      runPollTick();
+    }, wait);
+    if (typeof t.unref === 'function') t.unref();
+    dirPollTimer = t;
+  }
+
+  async function runPollTick() {
+    if (!watchedDir) return;
+    // audit fix (R7a P1-19)：「不 drop」pending。in-flight 时挂 pending，
+    // 完成后立即补一次（delay=0），再回 adaptive 间隔。
+    if (pollInFlight) {
+      pendingPoll = true;
+      scheduleNextPoll(getPollInterval());
+      return;
+    }
+    pollInFlight = true;
+    try {
+      await updateSnapshot(watchedDir);
+    } catch (e) {
+      // audit fix (Round 7 FS-F16)：floating promise 兜底。
+      console.warn('[fs-watcher] 轮询 updateSnapshot 抛出:', e && e.message);
+    } finally {
+      pollInFlight = false;
+    }
+    // 探测完成后再决定下次：
+    //   - pending 标记被 set 过 → 立即（delay=0）补一次
+    //   - 否则按 adaptive 间隔
+    // audit fix (R7a P1-19 bugfix)：暂停期间 → 不挂新 timer。pauseDirPolling
+    // 已经清掉了 dirPollTimer + pendingPoll，但已 in-flight 的 scanDir 在
+    // await 上挂了几秒，恢复时如果不查 pollPaused 就走 scheduleNextPoll，
+    // 等于窗口隐藏期间还有 5s 一次的后台 readdir，违背「暂停省 SMB 流量」
+    // 的设计意图（main.js#707-710 的 minimize/hide handler 假设轮询真的停了）。
+    if (pollPaused) return;
+    if (pendingPoll) {
+      pendingPoll = false;
+      scheduleNextPoll(0);
+    } else {
+      scheduleNextPoll(getPollInterval());
+    }
+  }
+
+  function startDirPoll() {
+    if (dirPollTimer || !watchedDir) return;
+    // 启动时算 active：第一次 tick 立即跑（delay=0），给用户即时反馈
+    markActivity();
+    scheduleNextPoll(0);
   }
 
   function stopDirPoll() {
     if (dirPollTimer) {
-      clearInterval(dirPollTimer);
+      clearTimeout(dirPollTimer);
       dirPollTimer = null;
     }
+    pollInFlight = false;
+    pendingPoll = false;
   }
 
   /**
@@ -587,11 +697,16 @@ function createFsWatcher(deps) {
    */
   function pauseDirPolling() {
     stopDirPoll();
+    // audit fix (R7a P1-19 bugfix)：挂「不 re-schedule」闸，让已 in-flight 的
+    // runPollTick finally 跳过 scheduleNextPoll；否则 5s 一次的轮询还在悄悄跑，
+    // 违反 pause 的省 SMB 流量语义。
+    pollPaused = true;
   }
 
   /** 恢复轮询，并立刻补扫一次，追上隐藏期间 fs.watch 可能漏掉的改动 */
   function resumeDirPolling() {
     if (!watchedDir) return;
+    pollPaused = false;
     startDirPoll();
     updateSnapshot(watchedDir);
   }
@@ -652,6 +767,24 @@ function createFsWatcher(deps) {
     _test_updateSnapshot: updateSnapshot,
     /** 测试 / 调试用：当前是否在监听某个目录 */
     get watchedDir() { return watchedDir; },
+    // audit fix (R7a P1-19) 测试钩子：暴露 getPollInterval / markActivity /
+    // scheduleNextPoll / runPollTick 给单测，验证自适应间隔 + 「不 drop」pending
+    // 语义。生产路径不暴露 —— 上层不应该直接调轮询内部。
+    _test_getPollInterval: getPollInterval,
+    _test_markActivity: markActivity,
+    _test_scheduleNextPoll: scheduleNextPoll,
+    _test_runPollTick: runPollTick,
+    // audit fix (R7a P1-19) 测试钩子：直接设 watchedDir 跳过 fs.watch 订阅，
+    // 让单测可以纯驱动 runPollTick 验证 pending 链，不污染临时目录。
+    _test_setWatchedDir: (dir) => { watchedDir = dir; },
+    // audit fix (R7a P1-19 bugfix) 测试钩子：暴露 pause/resume，让单测验证
+    // 暂停期间 in-flight runPollTick finally 不会 re-schedule（否则窗口
+    // 隐藏时还在偷偷 readdir）。
+    _test_pauseDirPolling: pauseDirPolling,
+    _test_resumeDirPolling: resumeDirPolling,
+    // audit fix (R7a P1-19 bugfix) 测试钩子：当前是否挂有 poll timer。pause
+    // bugfix 测试用它确认 in-flight runPollTick finally 不会偷偷挂新 timer。
+    _test_hasPollTimer: () => dirPollTimer !== null,
   };
 }
 

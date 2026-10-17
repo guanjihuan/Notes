@@ -26,31 +26,42 @@
  *     —— `(?![/\\]{2})[/\\]|[^a-z/\\]` 覆盖 `#` 锚点 + 单 `/` 或 `\` 开头；
  *       `(?![/\\]{2})` 显式拒绝「协议相对 URL」（`//evil.com/x.png` /
  *       `\\evil.com\x.png`），避免静默导航到外站
- *     —— `[a-z+.-]+(?:[\\/][^a-z]*|$)` 覆盖字母开头的相对路径
+ *     —— `[a-z.+#-]+(?:[\\/][^/\\]*)*` 覆盖字母开头的相对路径：首段允许
+ *       `.`/`#`/`+`/`-`（如 `page.md#chapter`），后续段允许 `:` 与 `#`
+ *       （如 `dir/sub:dir/file.png`、`sprite.svg#icon-home`、`foo/bar#baz`
+ *       —— 跨文件锚点跳转的 `文件#章节` 形态由 app.js resolveLocalFile 消费）。
  *
- * 危险协议 (javascript:/vbscript:/data:text\/html) 走「字母+冒号」分支——因
- * scheme 不在前列、不以 `#` 开头、不含 `/`，全部不匹配。
+ * 危险协议 (javascript:/vbscript:/data:text\/html)：顶层 `(?!)` 显式拒已知
+ * 危险 scheme；其余未授权 scheme（`blob:x` / `chrome:x` / `ms-msdt:x` 等
+ * 「scheme:无点 token」形态）因分支 A 要求「冒号 + 带点扩展名」不再命中 ——
+ * 维持白名单的默认拒绝。
  *
  * Windows 路径分隔符 `\`：用户在 Windows 上常写 `![](img\foo.png)`，
  * 浏览器对 URL 会自动把 `\` 规范化成 `/`（Chrome/Firefox 都如此），
  * 校验放行 `\` 与 `/` 都不会引入新风险 —— 真实加载由 resolveRelativeImages 控。
  */
 // 末尾 $ 锚整串；scheme / data:image / 纯锚点分支用 [^\s]* 兜底后续字符。
-// 顶层 `(?!)` 拒未在白名单的 scheme：相对路径分支 A (`[a-z+.-]+:[a-z\d.\-_]+(?![/\\])`)
-// 会让 `about:blank` / `javascript:foo` / `vbscript:foo` / `data:text/html` 同形态通过
-// —— 这里在外层把已知危险 / 未授权 scheme 统一拒掉，保留分支 A 的 Mac 文件名修复。
+// 顶层 `(?!)` 拒已知危险 scheme（about: / javascript: / vbscript: /
+// data:text\/html）—— 它们与相对路径分支同形态，必须在外层先斩。
 // 相对路径分支：
-//   A. `[a-z+.-]+:[a-z\d.\-_]+(?![/\\])` —— Mac/Linux 文件名带单冒号（如
-//      `image:001.jpg`、`screenshot:1.png`），但 `:` 后不许是 `/` 或 `\`
-//      （否则会误吃 `data:text/html`、`javascript:foo/bar` 之类）。
-//   B. `[a-z+.-]+(?:[\\/][^/\\#]*)*` —— 多段路径，支持 `img/a.png` / `../up.md` /
-//      `/abs/x.png` / Windows 反斜杠 / 路径段内含 `:`（如 `dir/sub:dir/file.png`）
-//      / 段内 #fragment（如 `sprite.svg#icon-home`、`page.md#chapter`）。
+//   A. `[a-z+.-]+:[a-z\d.\-_]*\.[a-z\d]+(?![/\\])` —— Mac/Linux 文件名带单冒号
+//      （如 `image:001.jpg`、`screenshot:1.png`）。要求冒号后是「带点扩展名」
+//      形态：`blob:x` / `chrome:x` / `ms-msdt:x` 这类「scheme:无点 token」不再
+//      命中（旧版 `[a-z\d.\-_]+` 不要求扩展名点，等于把默认拒绝白名单放宽成
+//      只拦 4 个 scheme 的黑名单）。`:` 后仍不许紧跟 `/` 或 `\`（否则会误吃
+//      `data:text/html`、`javascript:foo/bar` 之类；这些也被顶层 `(?!)` 拦）。
+//   B. `[a-z.+#-]+(?:[\\/][^/\\]*)*` —— 多段 / 单段路径，支持 `img/a.png` /
+//      `../up.md` / `/abs/x.png`（经前一分支）/ Windows 反斜杠 / 路径段内含
+//      `:`（如 `dir/sub:dir/file.png`）/ 段内与末段 `#fragment`（如
+//      `sprite.svg#icon-home`、`page.md#chapter`、`foo/bar#baz`——旧版段字符类
+//      `[^/\\#]` 排除 `#`，把跨文件锚点跳转整类误拒，本分支修复）。首段类
+//      `[a-z.+#-]` 不含 `:` 与分隔符，拼不出「scheme:」形态，与 A 的扩展名
+//      要求共同维持默认拒绝。
 // `data:image/...` 在顶层 `(?!)` 里只拒 `data:text/html`（白名单分支仍允许
 // `data:image/png` 等栅格格式）；非 IMG URI 由 isDangerousUriNonImg 兜底
 // javascript:/vbscript:/file:/data(?!:image\/)，IMG 由 installHooks 的额外检查兜底。
 const ALLOWED_URI_REGEXP =
-  /^(?!about:|javascript:|vbscript:|data\s*:\s*text\s*\/\s*html)(?:(?:https?|mailto|tel|callto|file):[^\s]*|data:image\/(?:png|jpe?g|gif|webp|bmp|ico|tiff);base64,[^\s]*|#[^\s]*|(?:(?![/\\]{2})[/\\]|[^a-z/\\])[^\s]*|[a-z+.-]+:[a-z\d.\-_]+(?![/\\])|[a-z+.-]+(?:[\\/][^/\\#]*)*)$/i;
+  /^(?!about:|javascript:|vbscript:|data\s*:\s*text\s*\/\s*html)(?:(?:https?|mailto|tel|callto|file):[^\s]*|data:image\/(?:png|jpe?g|gif|webp|bmp|ico|tiff);base64,[^\s]*|#[^\s]*|(?:(?![/\\]{2})[/\\]|[^a-z/\\])[^\s]*|[a-z+.-]+:[a-z\d.\-_]*\.[a-z\d]+(?![/\\])|[a-z.+#-]+(?:[\\/][^/\\]*)*)$/i;
 
 // data:image 单 URL 字节上限（防 OOM）。10 MB 对正常 AI 输出 + 用户内嵌图
 // 已经远超合理上限 —— Notes 单文件 5 MB 限制会先卡住写入，所以 10 MB 留余量。
@@ -204,14 +215,13 @@ function installHooks(DOMPurifyInstance) {
         data.keepAttr = false;
         return;
       }
-      // 显式拒未在白名单的 scheme：ALLOWED_URI_REGEXP 的分支 A
-      // (`[a-z+.-]+:[a-z\d.\-_]+(?![/\\])`) 允许 Mac/Linux 文件名带单 `:`
-      // （如 `image:001.jpg`），但形态上同 `javascript:foo` / `vbscript:foo` /
-      // `about:blank` —— 后者也会通过 ALLOWED。isDangerousUriNonImg 只跑非 IMG
-      // 路径且只覆盖危险 scheme，不含 `about:`，IMG 必须自己再拦一道。
-      // data:text/html 在分支 A 里 `:text` 后续遇 `/` 被 `(?![/\\])` 否定、不通过；
-      // 这里保留是为了防御性深度扫描（与 audit Sec-D 风格一致），同时挡住形如
-      // `data:text/html;<script>` 等 `;` 后紧接 script payload 的边界情况。
+      // 防御纵深：ALLOWED 的分支 A 现要求「冒号 + 带点扩展名」（放行 Mac
+      // 文件名如 `image:001.jpg`），`javascript:foo` / `about:blank` 这类无点
+      // token 已在正则层被拒、顶层 `(?!)` 也拦了已知危险 scheme；但
+      // `data:a.b` 等「危险前缀 + 带点尾巴」仍会形态命中分支 A ——
+      // isDangerousUriNonImg 只跑非 IMG 路径且不含 `about:`，IMG 保留这道
+      // scheme 前缀检查兜底（同时挡 `data:text/html;<script>` 之类 `;` 拼接
+      // payload 的边界情况，与 audit Sec-D 风格一致）。
       if (/^\s*(?:javascript|vbscript|data\s*:\s*text\s*\/\s*html|about\s*:)/i.test(data.attrValue)) {
         data.keepAttr = false;
         return;

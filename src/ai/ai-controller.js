@@ -31,14 +31,18 @@ import { AI_STATUS, AI_ERROR, aiErrorMessage } from './ai-status.js';
 /**
  * 取 pendingDiff 的「不可变提交快照」：originalBaseContent 优先，缺时回退
  * baseContent。apply / skip 漂移判定统一用此函数 —— 避免每个调用点重复
- * `originalBaseContent || baseContent` 表达式，也方便后续把 baseContent
+ * `originalBaseContent ?? baseContent` 表达式，也方便后续把 baseContent
  * 拆为「可变重算基线」/「不可变提交快照」两个独立字段时只改一处。
+ * 必须用 `??` 而非 `||`：构造处 originalBaseContent 允许是合法空串（空笔记
+ * 的提交快照 contentSnapshot === ''），`||` 会把空快照当「缺字段」回退到
+ * baseContent —— baseContent 正是会被 recompute 覆写的可变基线，空笔记上
+ * 发起 AI 修改期间的外部改动漂移检测就此失效，Apply All 静默覆盖外部修改。
  * @param {{originalBaseContent?: string, baseContent?: string} | null | undefined} pd
  * @returns {string}
  */
 function getImmutableBase(pd) {
   if (!pd) return '';
-  return pd.originalBaseContent || pd.baseContent || '';
+  return pd.originalBaseContent ?? pd.baseContent ?? '';
 }
 
 /**

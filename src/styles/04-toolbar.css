@@ -504,108 +504,18 @@ body[data-theme="light"] #btn-theme .theme-icon-sun {
 }
 
 /* ============================================================
-   Toolbar Search（设计优化 2026-09：从侧栏 header 迁来）
+   Toolbar Search —— 已迁回侧栏（设计回调 2026-10）
    ------------------------------------------------------------
-   把搜索文件框从侧栏上移到底部顶栏首位，让侧栏垂直空间专注于文件列表
-   （侧栏的新建按钮已挪到右键菜单，首屏只留排序条）。
-   - flex:0 1 240px：理想宽度 240px，可缩不可涨 —— 窗口变窄时它先缩，
-     不挤右侧按钮组；不抢占侧栏上方视觉重量
-   - min-width:160px：极限窄窗口下保留可用宽度（低于此值键盘用户看不清）
-   - max-width:320px：超宽窗口里也不无止境扩张，避免视觉失衡
-   - 顶栏背景 + 输入框对比：bg-card 让搜索框"沉下去"，与工具栏按钮区分层级
-
-   CSS 顺序说明：base 规则必须放在 media query 之前，否则等特异性下后者
-   会被覆盖。
+   搜索文件框从工具栏首位移回左侧栏顶部，紧贴它过滤的 .file-list
+   （见 [[feedback-prefer-near-affected-area]]）。样式跟随 HTML 一起
+   搬到 05-sidebar.css 的 .sidebar-search；id="search-input" 不变，
+   shortcuts.js / file-list.js 接线零改动。
+   工具栏腾出的空间：撤销 / 重做按钮组并入操作组（#btn-undo / #btn-redo），
+   极窄窗口的腾挪策略见文件底部 720px 断点。
    ============================================================ */
-.toolbar-search {
-  position: relative;
-  display: flex;
-  align-items: center;
-  /* belt-and-suspenders：toolbar-right 已设 no-drag，但显式再标一次，
-     防止未来重构时把 .toolbar-search 误放进 .drag-region */
-  -webkit-app-region: no-drag;
-  flex: 0 1 240px;
-  min-width: 160px;
-  max-width: 320px;
-  height: 30px;
-  /* 与后面按钮组之间留点呼吸 —— 视觉上把搜索框归到"独立区"，不和按钮混在一起 */
-  margin-right: 2px;
-}
-
-.toolbar-search .search-icon {
-  position: absolute;
-  left: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--fg-secondary);
-  pointer-events: none;
-  transition: color var(--transition-fast);
-}
-
-.toolbar-search .search-input {
-  width: 100%;
-  height: 30px;
-  /* 右侧多 4px 内边距：input[type="search"] 在 Webkit / Chromium 会渲染
-     内置的「×」清除按钮，避开它和占位文字重叠 */
-  padding: 0 30px 0 32px;
-  background: var(--bg-card);
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  font-size: var(--fs-sm);
-  color: var(--fg-primary);
-  transition:
-    border-color var(--transition-fast),
-    background var(--transition-fast),
-    box-shadow var(--transition-fast);
-  /* 搜索框是输入区，需要能选中文本。工具栏其余区域 user-select:none（避免拖拽时
-     高亮一片），这里覆盖掉只对输入区解禁 —— 比整个 toolbar 开 selection 干净 */
-  -webkit-user-select: text;
-  user-select: text;
-}
-
-.toolbar-search .search-input::placeholder {
-  color: var(--fg-tertiary);
-}
-
-.toolbar-search .search-input:hover {
-  border-color: var(--border-default);
-}
-
-.toolbar-search .search-input:focus {
-  /* 鼠标点击不画外圈：键盘 focus-visible 由全局规则接管（见 :focus-visible 基线） */
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: var(--shadow-glow);
-  background: var(--bg-elevated);
-}
-@supports (focus-visible) {
-  .toolbar-search .search-input:focus:not(:focus-visible) {
-    box-shadow: none;
-  }
-  .toolbar-search .search-input:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
-}
-
-/* 输入框 focus 时把左侧放大镜也跟着亮起来 —— 视觉一致性。
-   用 :focus-within 而不是兄弟选择器（.search-input:focus + .search-icon），
-   因为 DOM 里 icon 在 input 前面，兄弟选择器匹配不到 */
-.toolbar-search:focus-within .search-icon {
-  color: var(--accent);
-}
-
-/*
-  聚焦模式隐藏整个 toolbar 时，搜索框随之隐藏 —— 此时连侧栏都没有，
-  搜索框无处可用。这与 09-misc.css 的 `body[data-focus-mode="true"] .toolbar { ... }`
-  配套，无需单独写规则。
-
-  窄窗口（< 820px）下，工具栏按钮文字隐藏但搜索框保留（核心功能）。
-*/
 
 /* 窄窗口（< 820px）：toolbar 文字标签隐藏，只保留图标。
-   与 sidebar 720px 阈值错开，留出中间过渡区，避免一次性把全部 toolbar 砍塌。
-   CSS 顺序：media query 必须在 base .toolbar-search 之后，等特异性下后者覆盖前者 */
+   与 sidebar 720px 阈值错开，留出中间过渡区，避免一次性把全部 toolbar 砍塌。 */
 @media (max-width: 820px) {
   .btn-icon-text .btn-label {
     display: none;
@@ -614,36 +524,16 @@ body[data-theme="light"] #btn-theme .theme-icon-sun {
     /* 没文字时收紧 padding，让按钮保持图标按钮的紧凑感 */
     padding: 0 6px;
   }
-  /* 820px 时所有文字按钮已退化为图标按钮，省下约 100px；
-     搜索框也按比例收紧到 160~200px，给 title 留更多空间 */
-  .toolbar-search {
-    flex: 0 1 200px;
-    min-width: 140px;
-  }
 }
 
-/* 极窄窗口（< 720px）：与侧栏窄屏阈值对齐。搜索框最小化到只保留图标宽度，
-   用户仍能用 Ctrl+F 聚焦输入（即使视觉上更紧凑，键盘可达性不丢）。
-   ::placeholder 无法设 content（浏览器不支持），自然截断即可 —— 输入框太窄时
-   占位文字会被输入框边缘裁掉，但输入体验（点 / Ctrl+F / Esc 清空）都还在 */
-@media (max-width: 720px) {
-  .toolbar-search {
-    flex: 0 1 140px;
-    min-width: 96px;
-  }
-}
-
-/* 极窄窗口（≤ 720px，含 600px 最小窗口）：工具栏右簇（搜索 + 外观 + 视图 +
-   重置布局 + 自动保存 + 保存/关闭/设置 + 窗口控件）在 600px 视口下会溢出约 90px，
-   把最右侧的窗口控件（最小化/最大化/关闭）挤出视口 —— frameless 窗口下这是唯一
-   的关闭入口，被裁掉等于「关不掉窗口」。这里只收起最低优先级的控件腾出空间，
-   保证窗口控件始终可达：
+/* 极窄窗口（≤ 720px，含 600px 最小窗口）：工具栏右簇（外观 + 视图 +
+   重置布局 + 自动保存 + 撤销/重做/保存/关闭/设置 + 窗口控件）在 600px
+   视口下空间紧张，frameless 窗口的关闭入口（最小化/最大化/关闭）一旦被
+   挤出视口等于「关不掉窗口」。这里只收起最低优先级的控件腾出空间：
    - 隐藏「重置布局」按钮组 + 它后面的分隔线（低频操作，仍可经右键菜单/设置恢复）
    - 自动保存折叠为纯图标（隐藏文字标签 + iOS 开关，保留按钮本体与 aria-pressed
      状态色；完整开关仍在设置里），约省 27px
-   - 搜索框 min-width 进一步降到 72px（720px 断点晚于 720px 断点，这里后定义以覆盖，
-     同时兜住 701–719px 这段原始布局仍会轻微溢出的过渡带）
-   三者合计约省 90px，窗口控件在 600px 最小宽度下不再被裁。 */
+   撤销 / 重做本就是 icon-only 紧凑按钮组（~60px），不折叠。 */
 @media (max-width: 720px) {
   #tg-reset-layout,
   #tg-reset-layout + .toolbar-divider {
@@ -655,10 +545,6 @@ body[data-theme="light"] #btn-theme .theme-icon-sun {
   }
   #toolbar-autosave {
     padding: 0 6px;
-  }
-  .toolbar-search {
-    flex: 0 1 120px;
-    min-width: 72px;
   }
 }
 

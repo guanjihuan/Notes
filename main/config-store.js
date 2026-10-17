@@ -62,8 +62,18 @@ let appConfig = {};
 let DEFAULT_DATA_DIR = null;
 let configLoaded = false;
 
+// loadConfig 解密失败（密钥库不可用 / 包络损坏）时，磁盘上的 enc:v1: 包络挪到
+// 这里保存：内存 appConfig.aiApiKey 维持「始终是明文」契约（置空），saveConfig
+// 本轮没动 Key 字段时从这里原样写回磁盘，避免把仍有效的加密 Key 覆盖成 '' 而
+// 丢失。不进 appConfig —— 原实现把包络留在 appConfig.aiApiKey，会经 reveal
+// 把密文外漏给 renderer、_hasAiKey / AI 调用把密文当明文（契约违反）。
+let pendingAiKeyEnvelope = null;
+
 function loadConfig() {
   const cfgPath = getConfigPath();
+  // 每次读盘重新推导包络暂存（解密成功 → 保持 null / 解密失败 → 置入）；
+  // ENOENT / JSON 损坏 / 解析异常路径也顺带清掉上一轮残留。
+  pendingAiKeyEnvelope = null;
   let raw;
   try {
     raw = fsSync.readFileSync(cfgPath, 'utf-8');
@@ -87,12 +97,18 @@ function loadConfig() {
     // 上层（ai.js / settingsStore / renderer）零感知。懒迁移：旧版明文
     // 没前缀，decrypt 原样返回，下一次 saveConfig 自动重新加密。
     if (appConfig.aiApiKey) {
-      const decrypted = secretStore.decrypt(appConfig.aiApiKey);
-      // 仅当解密得到非空明文时才覆盖：若密钥库不可用 / 包络损坏导致 decrypt 返回 ''，
-      // 保留磁盘上的原始 enc:v1:... 包络，避免后续 saveConfig（如改主题）因内存值为 ''
-      // 而把仍有效的加密 Key 覆盖成空串、永久丢失。
+      const rawKey = String(appConfig.aiApiKey);
+      const decrypted = secretStore.decrypt(rawKey);
+      // 仅当解密得到非空明文时才覆盖：若密钥库不可用 / 包络损坏导致 decrypt
+      // 返回 ''，把包络挪进 pendingAiKeyEnvelope（见模块顶部注释）、内存置空 ——
+      // 既保住「内存 aiApiKey 始终明文」契约（reveal / _hasAiKey / ai.js 不会
+      // 拿到密文），又让后续 saveConfig（如改主题）能把包络原样写回、不丢 Key。
       if (decrypted) {
         appConfig.aiApiKey = decrypted;
+        pendingAiKeyEnvelope = null;
+      } else {
+        appConfig.aiApiKey = '';
+        pendingAiKeyEnvelope = rawKey.startsWith(secretStore.ENVELOPE_PREFIX) ? rawKey : null;
       }
     }
   } catch (e) {
@@ -256,6 +272,11 @@ function saveConfig(next) {
       const toWrite = { ...merged };
       if (toWrite.aiApiKey) {
         toWrite.aiApiKey = secretStore.encrypt(toWrite.aiApiKey);
+      } else if (pendingAiKeyEnvelope && !('aiApiKey' in next)) {
+        // 内存 aiApiKey 因解密失败被置空、本轮保存没动 Key 字段 →
+        // 包络从 pendingAiKeyEnvelope 原样写回磁盘，避免无关保存把仍有效
+        // 的加密 Key 覆盖成空串。
+        toWrite.aiApiKey = pendingAiKeyEnvelope;
       }
       await fh.writeFile(JSON.stringify(toWrite, null, 2), 'utf-8');
       await fh.sync();
@@ -284,6 +305,8 @@ function saveConfig(next) {
       }
       // 写盘成功 → 同步到 in-memory cache
       appConfig = merged;
+      // 本轮显式改写了 Key（重填新值 / 主动清空）→ 旧包络作废。
+      if ('aiApiKey' in next) pendingAiKeyEnvelope = null;
       return { ok: true, value: merged };
     } catch (e) {
       if (fh) { try { await fh.close(); } catch { /* ignore */ } }
@@ -579,6 +602,7 @@ function _reset() {
   appConfig = {};
   DEFAULT_DATA_DIR = null;
   configLoaded = false;
+  pendingAiKeyEnvelope = null;
   // auto-fallback 2026-08：测试间清理缓存，避免上一个 case 残留 customDir
   // 命中率污染下一个 case 的首次 stat。
   _resolveCache = null;
@@ -619,4 +643,5 @@ module.exports = {
   _setApp,
   _isQuitting,
   _setIsQuitting,
+  hasPendingAiKeyEnvelope: () => !!pendingAiKeyEnvelope,
 };

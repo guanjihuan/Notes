@@ -2510,9 +2510,19 @@ async function _prepareRelocate(event, srcPath, destDir) {
     return { error: { ok: false, error: e.code || 'STAT_FAILED', code: e.code, message: _friendlyShellError(e, '读取源状态失败') } };
   }
   const srcIsDir = srcStat.isDirectory();
-  // 文件夹不能移入自身或其子孙（防止循环 / 路径穿越）
-  if (srcIsDir && (destDir === srcPath || destDir.startsWith(srcPath + path.sep))) {
-    return { error: { ok: false, error: 'TARGET_INSIDE_SOURCE', code: 'TARGET_INSIDE_SOURCE', message: '不能把文件夹移入自身或其子文件夹' } };
+  // 文件夹不能移入自身或其子孙（防止循环 / 路径穿越）。
+  // audit #12 惯例（见 file:rename 的 isSamePath）：先 resolve、win32 再折叠
+  // 大小写 —— path 字符串可能以混合拼写到达（'d:/notes/A' vs 'D:\notes\A'，
+  // 同一 inode：陈旧 clipboard 跨 data-dir 重选 / 手改 config.json），原始串
+  // 比对会绕过本守卫，之后 recursiveCopy 把副本套进自身目录无限嵌套直到
+  // ENAMETOOLONG（move 场景则是 rename 到自身产生静默改名）。
+  if (srcIsDir) {
+    const fold = (s) => (process.platform === 'win32' ? s.toLowerCase() : s);
+    const srcFolded = fold(path.resolve(srcPath));
+    const destFolded = fold(path.resolve(destDir));
+    if (destFolded === srcFolded || destFolded.startsWith(srcFolded + path.sep)) {
+      return { error: { ok: false, error: 'TARGET_INSIDE_SOURCE', code: 'TARGET_INSIDE_SOURCE', message: '不能把文件夹移入自身或其子文件夹' } };
+    }
   }
   // 解析目标名 + 重名避让（文件 / 文件夹走各自 resolver）
   const srcBase = path.basename(srcPath);
@@ -3029,7 +3039,11 @@ ipcMain.handle('app:get-settings', (event) => {
   // P1-1 fix (audit)：过滤 aiApiKey 真值，只露布尔标记。renderer 任何位置
   // 通过 window.api.getSettings() 都拿不到完整 Key —— 必须显式调
   // app:reveal-ai-key 才能拿真值（settings 对话框回显用）。
-  return { ...rest, aiApiKey: '', _hasAiKey: !!aiApiKey };
+  // hasPendingAiKeyEnvelope：loadConfig 解密失败（密钥库不可用 / 包络损坏）时
+  // 包络被挪出 appConfig（内存 aiApiKey 恒为明文的契约 → ''），但磁盘上 Key
+  // 真实存在 —— _hasAiKey 继续报 true，设置对话框走 arm/reveal 流程，reveal
+  // 显式失败 → _aiKeyRevealFailed 提示 + diff 守卫（空白输入不覆盖磁盘 Key）。
+  return { ...rest, aiApiKey: '', _hasAiKey: !!aiApiKey || configStore.hasPendingAiKeyEnvelope() };
 });
 
 /**
@@ -3096,6 +3110,14 @@ ipcMain.handle('app:reveal-ai-key', (event) => {
   // L4 fix (audit)：单行结构、sender + length，去掉任何 key 相关指纹；
   // 配 arm 日志一起能看出 arm→reveal 时序关系。
   const keyStr = String(cfg.aiApiKey || '');
+  if (!keyStr && configStore.hasPendingAiKeyEnvelope()) {
+    // 磁盘有包络但解密失败（密钥库不可用 / 包络损坏）：显式报失败。
+    // 不能回 ok:true + 空串 —— 虽然 renderer Round-11 守卫也会标记失败，
+    // 但这里显式拒绝保住「成功 reveal」日志的语义（length=0 的记录会误导
+    // 事后审计「有人偷到了空 Key」）。
+    console.warn('[reveal-ai-key] rejected: envelope present but undecryptable (keychain unavailable?)');
+    return { ok: false, error: 'KEY_UNAVAILABLE' };
+  }
   console.log('[reveal-ai-key] revealed by sender', senderId, 'length=', keyStr.length);
   return { ok: true, aiApiKey: keyStr };
 });

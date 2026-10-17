@@ -17,6 +17,7 @@ const MENU_ID = 'app-context-menu';
  * @property {string} label     - 显示文本
  * @property {string} value    - 点击时回调收到的值
  * @property {boolean} [disabled]
+ * @property {boolean} [danger]   - 破坏性操作（删除等）：红色文字 + 红色 hover 底
  * @property {boolean} [separator] - 若为 true 则渲染为分隔条（忽略其它字段）
  */
 
@@ -100,6 +101,9 @@ export class ContextMenu {
       btn.className = 'context-menu-item';
       btn.setAttribute('role', 'menuitem');
       btn.textContent = item.label;
+      if (item.danger) {
+        btn.classList.add('is-danger');
+      }
       if (item.disabled) {
         btn.disabled = true;
       }

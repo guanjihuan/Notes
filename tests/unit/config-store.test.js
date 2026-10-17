@@ -735,3 +735,63 @@ describe('coerceLoadedSettings（schema 兜底）', () => {
     expect(coerceLoadedSettings('garbage')).toEqual({ ...DEFAULT_CONFIG });
   });
 });
+
+// aiApiKey 包络降级路径（loadConfig 解密失败 → pendingAiKeyEnvelope）。
+// 单测环境没有 Electron safeStorage → secretStore.decrypt 对 enc:v1: 包络
+// 恒返回 ''（「不可用」契约），天然进入降级分支，无需额外 mock。
+describe('aiApiKey 包络降级（decrypt 失败）', () => {
+  const ENVELOPE = 'enc:v1:Zm9vYmFy';
+
+  it('解密失败：内存 aiApiKey 置空（明文契约）+ hasPendingAiKeyEnvelope 为 true', () => {
+    writeFileSync(join(mockUserDataDir, 'config.json'), JSON.stringify({ aiApiKey: ENVELOPE, theme: 'dark' }), 'utf-8');
+    configStore.init();
+    expect(configStore.getConfig().aiApiKey).toBe('');
+    expect(configStore.hasPendingAiKeyEnvelope()).toBe(true);
+  });
+
+  it('saveConfig 未触碰 aiApiKey：包络原样写回磁盘，不被空串覆盖', async () => {
+    writeFileSync(join(mockUserDataDir, 'config.json'), JSON.stringify({ aiApiKey: ENVELOPE, theme: 'dark' }), 'utf-8');
+    configStore.init();
+    const res = await configStore.saveConfig({ theme: 'light' });
+    expect(res.ok).toBe(true);
+    const raw = JSON.parse(readFileSync(join(mockUserDataDir, 'config.json'), 'utf-8'));
+    expect(raw.aiApiKey).toBe(ENVELOPE);
+    expect(raw.theme).toBe('light');
+    // 内存侧仍守「aiApiKey 是明文或 ''」契约：不把包络塞回去
+    expect(configStore.getConfig().aiApiKey).toBe('');
+  });
+
+  it('saveConfig 显式重填 Key：写新值、清掉旧包络', async () => {
+    writeFileSync(join(mockUserDataDir, 'config.json'), JSON.stringify({ aiApiKey: ENVELOPE }), 'utf-8');
+    configStore.init();
+    const res = await configStore.saveConfig({ aiApiKey: 'sk-new' });
+    expect(res.ok).toBe(true);
+    expect(configStore.hasPendingAiKeyEnvelope()).toBe(false);
+    // 测试环境 safeStorage 不可用 → encrypt 降级为明文透传
+    const raw = JSON.parse(readFileSync(join(mockUserDataDir, 'config.json'), 'utf-8'));
+    expect(raw.aiApiKey).toBe('sk-new');
+    expect(configStore.getConfig().aiApiKey).toBe('sk-new');
+  });
+
+  it('saveConfig 显式清空 Key：写空串，包络不复活', async () => {
+    writeFileSync(join(mockUserDataDir, 'config.json'), JSON.stringify({ aiApiKey: ENVELOPE }), 'utf-8');
+    configStore.init();
+    const res = await configStore.saveConfig({ aiApiKey: '' });
+    expect(res.ok).toBe(true);
+    expect(configStore.hasPendingAiKeyEnvelope()).toBe(false);
+    const raw = JSON.parse(readFileSync(join(mockUserDataDir, 'config.json'), 'utf-8'));
+    expect(raw.aiApiKey).toBe('');
+  });
+
+  it('明文 passthrough（无前缀）正常解密：不留包络', () => {
+    writeFileSync(join(mockUserDataDir, 'config.json'), JSON.stringify({ aiApiKey: 'sk-plain' }), 'utf-8');
+    configStore.init();
+    expect(configStore.getConfig().aiApiKey).toBe('sk-plain');
+    expect(configStore.hasPendingAiKeyEnvelope()).toBe(false);
+  });
+
+  it('首次启动（无 config.json）不残留包络状态', () => {
+    configStore.init();
+    expect(configStore.hasPendingAiKeyEnvelope()).toBe(false);
+  });
+});

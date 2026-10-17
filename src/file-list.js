@@ -112,6 +112,8 @@ export class FileList {
     this.files = [];
     this.filteredFiles = [];
     this.activePath = null;
+    // 剪切源高亮路径（.is-clipboard-cut），渲染期由 _fillItem 应用；见 setClipboardCut。
+    this.clipboardCutPath = null;
     this.searchTerm = '';
     this.sortMode = normalizeSortMode(sortMode);
     /** path → file，供事件委托时反查（避免每个 <li> 挂一个闭包） */
@@ -192,7 +194,11 @@ export class FileList {
           e.dataTransfer.setData('application/x-notes-path',
             JSON.stringify({ path: entry.path, entryType: entry.entryType, name: entry.name }));
         } catch { /* 某些浏览器 setData 受限，但 drag 仍可继续 */ }
-        e.dataTransfer.effectAllowed = (e.ctrlKey || e.metaKey) ? 'copy' : 'move';
+        // 'all'：dragstart 若按当下 Ctrl 态锁死 copy/move，Chromium 会把后续
+        // dragover 的 dropEffect 夹进 effectAllowed —— 拖行途中再按 Ctrl 时
+        // 'copy' ⊄ 'move'，drop 被静默吞掉（Chromium 实测）。copy/move 意图
+        // 的实时判定交给下面 dragover / drop 各自的 ctrlKey 分支。
+        e.dataTransfer.effectAllowed = 'all';
         li.classList.add('is-dragging');
       }, { signal: this.signal });
 
@@ -343,9 +349,30 @@ export class FileList {
     const selfDesc = src.entryType === 'folder'
       && (target.path === src.path + '/' || target.path === src.path + '\\'
         || target.path.startsWith(src.path + '/') || target.path.startsWith(src.path + '\\'));
-    const alreadyInside = target.path === src.path
-      || target.path.startsWith(src.path + '/') || target.path.startsWith(src.path + '\\');
+    // 「源已在目标内部」= 把条目放进它自己所在目录（原地移动会被重名避让
+    // 变成 name (2) 静默改名）。判定方向是 **src 在 target 之下**——此前写反
+    // 成 target 在 src 之下，那个形态 folder 源已被 selfDesc 覆盖、file 源则
+    // 整条永不命中，等于没有这个守卫。
+    const alreadyInside = src.path.startsWith(target.path + '/')
+      || src.path.startsWith(target.path + '\\');
     return !!(selfDesc || alreadyInside);
+  }
+
+  /**
+   * 标记 / 清除「剪切源」高亮（.is-clipboard-cut）。path 传 null = 清除。
+   * 高亮态存在组件里（clipboardCutPath）、由 _fillItem 在每次渲染时应用 ——
+   * 调用方直接 classList.add 的命令式写法会被任何一次重渲染 / windowed 池
+   * 复用的 wantClass 重赋值抹掉（滚动一下就丢）。
+   * @param {string|null} path
+   */
+  setClipboardCut(path) {
+    this.clipboardCutPath = path || null;
+    if (!this.element) return;
+    // 立即同步当前已挂载项（不等下一次重渲染）
+    for (const li of this.element.querySelectorAll('.file-item')) {
+      li.classList.toggle('is-clipboard-cut',
+        this.clipboardCutPath != null && pathsEqual(li.dataset.path, this.clipboardCutPath));
+    }
   }
 
   /**
@@ -712,6 +739,9 @@ export class FileList {
     const isActive = pathsEqual(file.path, this.activePath);
     li.classList.toggle('is-active', isActive);
     li.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    // 剪切高亮随渲染类走（wantClass 重赋值会抹掉命令式 class；见 setClipboardCut）
+    li.classList.toggle('is-clipboard-cut',
+      this.clipboardCutPath != null && pathsEqual(file.path, this.clipboardCutPath));
 
     // 子节点：icon / name / meta。首次建后保留引用，scroll 时只改 textContent。
     let name = li._cachedName;

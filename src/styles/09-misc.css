@@ -93,6 +93,22 @@
   opacity: 0.55;
 }
 
+/* 破坏性操作项（删除）：静置态用降彩度的 --danger-text 保持 WCAG AA，
+   hover 时才上 tint 底 + 纯 --danger，与 .settings-callout-danger 的
+   「文字降彩度、靠背景传递警示」同一设计语言（见 08-modal.css 注释）。 */
+.context-menu-item.is-danger:not(:disabled) {
+  color: var(--danger-text);
+}
+
+.context-menu-item.is-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.context-menu-item.is-danger:active:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
 .context-menu-separator {
   height: 1px;
   background: var(--border-subtle);

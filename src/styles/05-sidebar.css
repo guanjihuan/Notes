@@ -80,8 +80,86 @@
    .sidebar-new-btn--inline 及其窄侧栏 container query 规则随之移除。base 类
    .sidebar-new-btn 仍被侧栏底部 AI 按钮（#btn-ai）复用) */
 
-/* (search-wrap / search-icon / search-input 已移到 04-toolbar.css —— 2026-09
-   设计优化：搜索框从侧栏上移到工具栏，样式跟随 HTML 一起走) */
+/* ============================================================
+   Sidebar Search（设计回调 2026-10：从工具栏移回侧栏首行）
+   ------------------------------------------------------------
+   搜索框紧贴它过滤的 .file-list（中间只隔一行排序工具条），
+   「作用于侧栏」的语义由位置直接表达，不再需要注释解释。
+   - 左右 padding 10px 与下方 .sidebar-sort 对齐，两行共享同一列边线
+   - bg-card 让输入框在 --bg-sidebar 底上"沉下去"一档，与文件列表层级区分
+   - 行本身不画 border-bottom：分隔线由 .sidebar-sort 的底边统一承担，
+     避免首屏出现两条平行细线
+   - 窄侧栏（用户拖窄 / 窄窗口）：input 单行自然截断占位文字，
+     Ctrl+F 聚焦 / Esc 清空的键盘可达性不受宽度影响
+   ============================================================ */
+.sidebar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 8px 10px;
+}
+
+.sidebar-search .search-icon {
+  position: absolute;
+  left: 20px; /* 10px 行 padding + 10px 框内偏移 —— icon 绝对定位在行级容器，需把 padding 计入 */
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--fg-secondary);
+  pointer-events: none;
+  transition: color var(--transition-fast);
+}
+
+.sidebar-search .search-input {
+  width: 100%;
+  height: 30px;
+  /* 右侧多留内边距：input[type="search"] 在 Webkit / Chromium 会渲染
+     内置的「×」清除按钮，避开它和占位文字重叠 */
+  padding: 0 30px 0 32px;
+  background: var(--bg-card);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--fg-primary);
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast),
+    box-shadow var(--transition-fast);
+  /* 保险丝：即便祖先容器禁了 selection，输入区始终可选中/剪切粘贴 */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.sidebar-search .search-input::placeholder {
+  color: var(--fg-tertiary);
+}
+
+.sidebar-search .search-input:hover {
+  border-color: var(--border-default);
+}
+
+.sidebar-search .search-input:focus {
+  /* 鼠标点击不画外圈：键盘 focus-visible 由全局规则接管（见 :focus-visible 基线） */
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-glow);
+  background: var(--bg-elevated);
+}
+@supports (focus-visible) {
+  .sidebar-search .search-input:focus:not(:focus-visible) {
+    box-shadow: none;
+  }
+  .sidebar-search .search-input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+/* 输入框 focus 时把左侧放大镜也跟着亮起来 —— 视觉一致性。
+   用 :focus-within 而不是兄弟选择器（.search-input:focus + .search-icon），
+   因为 DOM 里 icon 在 input 前面，兄弟选择器匹配不到 */
+.sidebar-search:focus-within .search-icon {
+  color: var(--accent);
+}
 
 /* ============================================================
    Sidebar 排序工具条
@@ -854,6 +932,19 @@ body[data-editor-mode="edit"]  .editor-pane,
 body[data-editor-mode="split"] .editor-pane {
   display: flex;
   flex-direction: column;
+}
+
+/* 编辑列紧凑空态提示（见 index.html #editor-pane 注释）：
+   - 只在 edit 模式显示：split 模式下右侧 viewer 已有完整 .empty-state
+     （icon + CTA），左右各来一份同义提示是重复
+   - data-file-open 由 markdown-editor.loadFile() 置 true / unload() 删掉；
+     用 :not([data-file-open]) 而不是 [data-file-open="false"]，
+     这样「首启从未开过文件」（属性压根不存在）也能命中 */
+#editor-pane > .empty-state {
+  display: none;
+}
+body[data-editor-mode="edit"]:not([data-file-open]) #editor-pane > .empty-state {
+  display: flex;
 }
 
 /* 让编辑器与预览区域保持一致的宽度处理：共用 --w-reader-max。

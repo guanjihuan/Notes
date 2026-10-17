@@ -223,6 +223,10 @@ const els = {
   // 关闭当前文件（仅清空视图，磁盘文件不动）：放工具栏「操作组」紧邻保存按钮，
   // 语义上「保存」与「关闭」是相邻操作。沿用 .btn-icon，disabled 态走现有规则。
   btnCloseFile: document.getElementById('btn-close-file'),
+  // 撤销 / 重做（2026-10）：CodeMirror history 的按钮入口，成组紧贴保存按钮。
+  // disabled 规则见 syncUndoRedoButtons；HTML 默认 disabled，首帧不闪可点态。
+  btnUndo: document.getElementById('btn-undo'),
+  btnRedo: document.getElementById('btn-redo'),
   btnModePreview: document.getElementById('btn-mode-preview'),
   btnModeEdit: document.getElementById('btn-mode-edit'),
   btnModeSplit: document.getElementById('btn-mode-split'),
@@ -366,6 +370,10 @@ function syncSaveButton() {
   // syncSaveButton 串到同一出口，openFile / clearCurrentFile 不必各自记得再调一次。
   // 这条调用非常便宜（几个 DOM 属性），不影响 hot path。
   syncCloseFileButton();
+  // 撤销 / 重做按钮（2026-10）与 syncCloseFileButton 同款搭车：
+  // openFile / clearCurrentFile / save / onChange 都会经由 syncSaveButton 到这里，
+  // 不必各自记得再调一次。模式切换路径不经过 syncSaveButton，由 applyEditorMode 负责。
+  syncUndoRedoButtons();
 }
 
 /**
@@ -390,6 +398,34 @@ function syncCloseFileButton() {
     els.btnCloseFile.title = '关闭当前文件（无打开文件）';
     els.btnCloseFile.setAttribute('aria-label', '关闭当前文件（无打开文件）');
   }
+}
+
+/**
+ * 同步「撤销 / 重做」按钮的 disabled 态（2026-10 新增）。
+ *
+ * 规则（2026-10 与用户确认）：
+ *   - 无打开文件 / 预览模式 → 两个都置灰（编辑器不可编辑，撤销不可见不可用）
+ *   - 编辑 / 双栏 → 跟随 CodeMirror history 深度：无可撤销步 ↶ 置灰，
+ *     无可重做步 ↷ 置灰
+ *
+ * 视觉模式读 body[data-editorMode]（editorToolbar._setDOM 写入）：非 md 文件
+ * 已被强制回落到 'edit'，与编辑器实际可编辑性一致，这里不必再推导
+ * state.currentFileIsMarkdown。
+ *
+ * 调用方：syncSaveButton 末尾（搭 openFile / clearCurrentFile / onChange / save
+ * 的统一出口）+ applyEditorMode 末尾（模式切换不触发 syncSaveButton）。
+ * 成本只有几个 DOM 属性 + 两次 history 深度读取，热路径安全。
+ */
+function syncUndoRedoButtons() {
+  if (!els.btnUndo || !els.btnRedo) return;
+  const mode = document.body.dataset.editorMode || 'preview';
+  const active = !!state.currentFile && !!editor && mode !== 'preview';
+  const canUndo = active && editor.canUndo();
+  const canRedo = active && editor.canRedo();
+  els.btnUndo.disabled = !canUndo;
+  els.btnUndo.setAttribute('aria-disabled', canUndo ? 'false' : 'true');
+  els.btnRedo.disabled = !canRedo;
+  els.btnRedo.setAttribute('aria-disabled', canRedo ? 'false' : 'true');
 }
 
 /**
@@ -960,26 +996,26 @@ async function readClipboard() {
  */
 function _setClipboard(entry, isCut) {
   if (!entry || !entry.path) return;
-  // 切换 clipboard 时先清掉旧源的高亮
-  _clearClipboardCutMark();
   state.clipboard = {
     srcPath: entry.path,
     srcName: entry.name,
     entryType: entry.entryType,
     isCut: !!isCut,
   };
-  if (isCut) {
-    const li = findFileListItem(entry.path);
-    if (li) li.classList.add('is-clipboard-cut');
+  // 高亮（含切换时清旧源）交给 FileList 组件：setClipboardCut 先清全部再标记，
+  // 且高亮态存组件内，重渲染 / windowed 滚动时由 _fillItem 自动补回 ——
+  // 之前命令式 classList.add 会被任何一次重渲染抹掉。
+  if (fileList && typeof fileList.setClipboardCut === 'function') {
+    fileList.setClipboardCut(isCut ? entry.path : null);
   }
   showToast(isCut ? `已剪切：${entry.name}` : `已复制：${entry.name}`, 'info', 1500);
 }
 
-/** 清空 .is-clipboard-cut 高亮（切换 / 粘贴 / 取消时调用）。 */
+/** 清空 .is-clipboard-cut 高亮（粘贴成功 / 取消时调用）。 */
 function _clearClipboardCutMark() {
-  if (!els.fileList) return;
-  const prev = els.fileList.querySelector('.file-item.is-clipboard-cut');
-  if (prev) prev.classList.remove('is-clipboard-cut');
+  if (fileList && typeof fileList.setClipboardCut === 'function') {
+    fileList.setClipboardCut(null);
+  }
 }
 
 function cutEntry(entry) {
@@ -1005,6 +1041,15 @@ async function pasteToCurrentDir() {
   if (clip.entryType === 'folder'
       && (destDir === clip.srcPath || destDir.startsWith(clip.srcPath + '/') || destDir.startsWith(clip.srcPath + '\\'))) {
     showToast('不能粘贴到文件夹自身或其子文件夹内', 'warning', 1500);
+    return;
+  }
+  // 剪切 → 粘回源所在目录：主进程重名避让会把这次「原地移动」变成
+  // 「name (2)」静默改名（拖拽路径已被 _isInvalidDropTarget 挡住，这里补
+  // Ctrl+V / 右键菜单入口）。视为无操作并保留 clipboard，用户可再粘去别处。
+  // pathsEqual：Windows 大小写不敏感，侧栏目录名与 currentDir 的 canonical
+  // case 可能不一致，=== 会漏判成「不同目录」。
+  if (clip.isCut && pathsEqual(dirnameOf(clip.srcPath), destDir)) {
+    showToast('已在当前目录，无需移动', 'info', 1500);
     return;
   }
   const srcEntry = { path: clip.srcPath, name: clip.srcName, entryType: clip.entryType };
@@ -1058,24 +1103,6 @@ function showSidebarEmptyContextMenu(x, y) {
       else if (value === 'paste') pasteToCurrentDir();
     },
   });
-}
-
-/**
- * 在文件列表 DOM 里按 path 反查 .file-item 元素（windowed / full 模式都适用）。
- * @param {string} path
- * @returns {HTMLElement|null}
- */
-function findFileListItem(path) {
-  if (!els.fileList || !path) return null;
-  return els.fileList.querySelector(`.file-item[data-path="${cssEscapeAttr(path)}"]`);
-}
-
-/**
- * 给 CSS 属性选择器里的特殊字符做最小转义（path 含引号 / 方括号会破坏选择器）。
- * @param {string} s
- */
-function cssEscapeAttr(s) {
-  return String(s).replace(/["\\]/g, '\\$&');
 }
 
 /**
@@ -1520,6 +1547,9 @@ function applyEditorMode(mode, opts) {
   updateStatusMode();
   updateStatusStats();
   updateStatusScroll();
+  // 模式切换（含切文件后的 applyEditorMode）不走 syncSaveButton，
+  // 撤销 / 重做按钮的 disabled 态在这里单独同步一次。
+  syncUndoRedoButtons();
 }
 
 /**
@@ -1737,6 +1767,23 @@ if (els.btnSave) {
   // 误导性表达。改成显式调用 + 让 listener 返回 void。
   els.btnSave.addEventListener('click', () => {
     save();
+  });
+}
+
+/**
+ * 撤销 / 重做按钮（2026-10）：CodeMirror history 的按钮入口。
+ * editor 是懒实例化的模块级变量（bootstrap 完成前为 null）→ 先守再调。
+ * undo/redo 生效后走 updateListener → onChange → syncSaveButton →
+ * syncUndoRedoButtons 自动刷新按钮态，这里无需手动补一次。
+ */
+if (els.btnUndo) {
+  els.btnUndo.addEventListener('click', () => {
+    if (editor) editor.undo();
+  });
+}
+if (els.btnRedo) {
+  els.btnRedo.addEventListener('click', () => {
+    if (editor) editor.redo();
   });
 }
 
@@ -3592,18 +3639,27 @@ function subscribeIpc() {
         //   - delete：救回一个 `<A>-rescued-<stamp>.md`（内容 = 用户要删的 A
         //     内容），与「删除」操作意图完全相反 —— 用户预期的删除 + 多出
         //     一个文件。
-        // 守卫：state.renamingPath / state.deletingPath 在 file-ops 的 rename /
-        // delete 进入前设，离开时清。命中 → 跳过 rescue，由 file-ops 自己的
-        // post-await 路径接管（rename 更新 state.currentFile.path；delete
-        // 调 clearCurrentFile）。
+        // 守卫：state.renamingPath / state.deletingPath / state.movingPath 在
+        // file-ops 的 rename / delete / move 进入前设，离开时清。命中 → 跳过
+        // rescue，由 file-ops 自己的 post-await 路径接管（rename / move 更新
+        // state.currentFile.path；delete 调 clearCurrentFile）。
         const isRenameInFlight = state.renamingPath
           && state.currentFile
           && state.currentFile.path === state.renamingPath;
         const isDeleteInFlight = state.deletingPath
           && state.currentFile
           && state.currentFile.path === state.deletingPath;
-        if (isRenameInFlight || isDeleteInFlight) {
-          // 飞行中的 rename / delete：由 file-ops 自己接管状态更新，
+        // move 的守卫多了前缀分支：移动祖先文件夹时，打开文件本身不在
+        // movingPath 上，但它所在目录的快照会推「文件消失」事件（rename 的
+        // 主进程侧已 markExpectedWrite 新旧两条路径，move 只标了 dest ——
+        // 源目录的移除事件本来就要流进来刷新列表，只能靠这里的飞行判定）。
+        const isMoveInFlight = state.movingPath
+          && state.currentFile
+          && (state.currentFile.path === state.movingPath
+            || state.currentFile.path.startsWith(state.movingPath + '\\')
+            || state.currentFile.path.startsWith(state.movingPath + '/'));
+        if (isRenameInFlight || isDeleteInFlight || isMoveInFlight) {
+          // 飞行中的 rename / delete / move：由 file-ops 自己接管状态更新，
           // 这里只做无操作让 fs-watcher 流程继续（applyEntries 已更新
           // state.files，但 state.currentFile 不动）。
           return;

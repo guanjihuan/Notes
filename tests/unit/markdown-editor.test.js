@@ -306,11 +306,16 @@ describe('MarkdownEditor 单实例 view 持久化 (audit R7b P1-18)', () => {
     }
   });
 
-  it('loadFile 重复同一文件：onChange 触发次数精确等于 dispatch 次数（listener 不重复挂）', () => {
+  it('loadFile 重复同一文件：不触发 onChange（setState 语义），listener 不重复挂', () => {
     // 回归锚点：旧实现每次 loadFile 都 addEventListener 三次（compositionstart
     // / end / cancel），但 dispose 才 remove —— contentDOM 上 listener 数量
-    // 线性增长。N 次切文件 → onChange 被触发 3N 次。新实现下 view 不重建，
-    // listener 只一份，N 次 loadFile 正好 N 次 onChange。
+    // 线性增长，N 次切文件 → onChange 被触发 3N 次。单实例化后 listener 只一份，
+    // 当时的断言是「N 次 loadFile 正好 N 次 onChange」。
+    // 2026-10 撤销/重做引入时复用路径再进化：从「dispatch 替换 doc」改为
+    // 「setState 重建 state」——把上一个文件的编辑 history 清零（否则切到 B 后
+    // Ctrl+Z 会退回 A 的内容，#btn-undo 也会在刚打开的文件上误亮）。
+    // setState 不派发 transaction → 一次 onChange 都不该有：加载 = 导航不是编辑，
+    // 脏态复位由 openFile 尾部显式完成。
     const { editor, onChange } = createEditor();
     editor.loadFile({ path: '/a.md', name: 'a.md' }, 'A');
     const baseCount = onChange.mock.calls.length;
@@ -318,7 +323,7 @@ describe('MarkdownEditor 单实例 view 持久化 (audit R7b P1-18)', () => {
       editor.loadFile({ path: '/a.md', name: 'a.md' }, `A${i}`);
     }
     const delta = onChange.mock.calls.length - baseCount;
-    expect(delta).toBe(5); // 精确 5，不是 10 / 15 / ...
+    expect(delta).toBe(0); // 不是 5 / 10 / 15 —— setState 完全不触发
   });
 
   it('A→B→A 场景下 lastSavedDoc 跟踪最终内容', () => {

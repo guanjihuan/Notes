@@ -129,6 +129,44 @@ describe('FileList 拖拽投放', () => {
     expect(fileLi.classList.contains('is-dragging')).toBe(false);
     expect(list._dragEntry).toBeNull();
   });
+
+  it('dragstart 设 effectAllowed=all（拖行中补按 Ctrl 仍可 copy 落地）', () => {
+    // Chromium 会把 dragover 的 dropEffect 夹进 effectAllowed：dragstart 若按
+    // 当时 Ctrl 态锁成 'move'，途中补按 Ctrl 要 copy 时 'copy' ⊄ 'move'，
+    // drop 被静默吞掉（Chromium 实测）。意图实时判定由 dragover/drop 的
+    // ctrlKey 分支负责。
+    const ev = fire(liFor('/d/note.md'), 'dragstart');
+    expect(ev.dataTransfer.effectAllowed).toBe('all');
+  });
+
+  it('_isInvalidDropTarget：源在目标目录内 → 拒绝（原地移动会变成 name (2) 静默改名）', () => {
+    // 方向回归守卫：此前条件写反成「target 在 src 之下」，该守卫从未真正生效。
+    expect(list._isInvalidDropTarget(
+      { path: '/d/sub/x.md', entryType: 'file' },
+      { path: '/d/sub', entryType: 'folder' },
+    )).toBe(true);
+    // 兄弟目录的正常拖放不受影响
+    expect(list._isInvalidDropTarget(
+      { path: '/d/note.md', entryType: 'file' },
+      { path: '/d/sub', entryType: 'folder' },
+    )).toBe(false);
+  });
+
+  it('setClipboardCut 高亮跨 setFiles 重渲染保留，传 null 清除', () => {
+    list.setClipboardCut('/d/note.md');
+    expect(liFor('/d/note.md').classList.contains('is-clipboard-cut')).toBe(true);
+    // fs-watcher 推新快照触发重渲染：命令式加的 class 会被 _fillItem 的
+    // wantClass 重赋值抹掉 —— 高亮必须由渲染期从 clipboardCutPath 补回。
+    list.setFiles([
+      { name: 'note.md', path: '/d/note.md', entryType: 'file' },
+      { name: 'sub', path: '/d/sub', entryType: 'folder' },
+      { name: 'other.md', path: '/d/other.md', entryType: 'file' },
+    ]);
+    expect(liFor('/d/note.md').classList.contains('is-clipboard-cut')).toBe(true);
+    expect(liFor('/d/sub').classList.contains('is-clipboard-cut')).toBe(false);
+    list.setClipboardCut(null);
+    expect(liFor('/d/note.md').classList.contains('is-clipboard-cut')).toBe(false);
+  });
 });
 
 describe('FileList 空白区域右键菜单', () => {

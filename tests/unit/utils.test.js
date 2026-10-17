@@ -220,12 +220,13 @@ describe('formatRelativeTime', () => {
     expect(formatRelativeTime(now - 3 * 86400_000, now)).toBe('3 天前');
     expect(formatRelativeTime(now - 6 * 86400_000, now)).toBe('6 天前');
   });
-  it('≥ 7d → 回落到绝对时间', () => {
-    const old = new Date(2024, 5, 1, 12, 0, 0).getTime();
-    const got = formatRelativeTime(old, now);
-    // 应该跟 formatDate(old) 一致
-    expect(got).toBe(formatDate(old));
-    expect(got).toBe('2024-06-01 12:00');
+  it('≥ 7d 且同年 → 紧凑 "MM-DD HH:mm"', () => {
+    const old = new Date(2024, 5, 1, 12, 0, 0).getTime(); // now 也在 2024-06
+    expect(formatRelativeTime(old, now)).toBe('06-01 12:00');
+  });
+  it('≥ 7d 且跨年 → "YYYY-MM-DD"（保年份，舍时分）', () => {
+    const old = new Date(2023, 5, 1, 12, 0, 0).getTime();
+    expect(formatRelativeTime(old, now)).toBe('2023-06-01');
   });
   it('未来时间 → 当成 0 差（"刚刚"）', () => {
     expect(formatRelativeTime(now + 5_000, now)).toBe('刚刚');

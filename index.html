@@ -152,32 +152,6 @@
       <span id="app-title" class="app-title"><span id="app-title-text" class="app-title-text">Notes</span></span>
     </div>
     <div class="toolbar-right no-drag">
-      <!--
-        搜索文件入口（设计优化 2026-09）：
-        - 从侧栏上移到底部顶栏首位，腾出侧栏垂直空间给文件列表
-        - 紧贴侧栏上方，视觉上明确"作用于侧栏"
-        - flex:0 1 240px + min-width:160px：窗口过窄时让搜索框先收缩，
-          不挤掉右侧窗口控制按钮
-      -->
-      <div class="toolbar-search">
-        <svg aria-hidden="true" class="search-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="11" cy="11" r="7"></circle>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-        </svg>
-        <!-- aria-controls="file-list"：让屏幕阅读器在输入时宣告"过滤文件列表"，
-             也让用户知道输入框控制的列表元素 id（audit P2-22）。
-             仅声明关系，不改变视觉/键盘行为。 -->
-        <input
-          type="search"
-          id="search-input"
-          class="search-input"
-          placeholder="搜索文件..."
-          aria-label="搜索文件"
-          aria-controls="file-list"
-        >
-      </div>
-      <span class="toolbar-divider" aria-hidden="true"></span>
-
       <!-- 应用组：主题 + 置顶 -->
       <div class="toolbar-group">
         <div class="btn-group" role="group" aria-label="外观">
@@ -274,8 +248,30 @@
 
       <span class="toolbar-divider" aria-hidden="true"></span>
 
-      <!-- 操作组：保存 + 关闭当前文件 + 设置 -->
+      <!-- 操作组：撤销 / 重做 + 保存 + 关闭当前文件 + 设置 -->
       <div class="toolbar-group">
+        <!--
+          撤销 / 重做（2026-10 新增）：CodeMirror history 的按钮入口。
+          作用在编辑器 → 贴近保存按钮成组（见 [[feedback-prefer-near-affected-area]]）。
+          disabled 态由 app.js syncUndoRedoButtons 按「有无打开文件 + 视图模式 +
+          history 深度」实时同步；HTML 默认 disabled 保证首帧不闪可点态。
+          Ctrl+Z / Ctrl+Y 快捷键由 CodeMirror historyKeymap 在编辑器内处理，
+          data-shortcut 仅供工具栏 hover 提示 chip 使用。
+        -->
+        <div class="btn-group" role="group" aria-label="撤销与重做">
+          <button class="btn-icon btn-group-item" id="btn-undo" title="撤销 (Ctrl+Z)" aria-label="撤销" data-shortcut="Ctrl+Z" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 14 4 9l5-5"></path>
+              <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5 5.5 5.5 0 0 1-5.5 5.5H11"></path>
+            </svg>
+          </button>
+          <button class="btn-icon btn-group-item" id="btn-redo" title="重做 (Ctrl+Y)" aria-label="重做" data-shortcut="Ctrl+Y" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m15 14 5-5-5-5"></path>
+              <path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5 5.5 5.5 0 0 0 9.5 20H13"></path>
+            </svg>
+          </button>
+        </div>
         <!--
           保存按钮始终显示在工具栏；需要保存（脏）时进入 is-dirty 提醒态（warning 色 + 脉动）。
           见 [[feedback-save-button-always-visible]]。
@@ -340,8 +336,31 @@
   -->
   <div class="app-shell" id="app">
     <aside class="sidebar" id="sidebar" aria-label="文件与目录">
-      <!-- 搜索框已上移到工具栏（见 .toolbar-search），侧栏不再保留 header。
-           排序工具条作为首屏唯一入口，垂直空间专注于文件列表 -->
+      <!--
+        搜索文件入口（设计回调 2026-10）：从工具栏移回侧栏顶部。
+        - 紧贴它过滤的 .file-list（见 [[feedback-prefer-near-affected-area]]），
+          「作用于侧栏」的语义不再需要靠注释解释
+        - Ctrl+F 聚焦 / Esc 清空沿用 shortcuts.js，id="search-input" 不变，
+          app.js / file-list.js 的接线（getElementById + FileList.searchInput）零改动
+        - 排序工具条下移一行，侧栏首屏变为「搜索 + 排序」两行
+      -->
+      <div class="sidebar-search">
+        <svg aria-hidden="true" class="search-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <!-- aria-controls="file-list"：让屏幕阅读器在输入时宣告"过滤文件列表"，
+             也让用户知道输入框控制的列表元素 id（audit P2-22）。
+             仅声明关系，不改变视觉/键盘行为。 -->
+        <input
+          type="search"
+          id="search-input"
+          class="search-input"
+          placeholder="搜索文件..."
+          aria-label="搜索文件"
+          aria-controls="file-list"
+        >
+      </div>
       <!-- 排序工具条：紧贴它作用的列表，避免埋进设置对话框（见 [[feedback-prefer-near-affected-area]]）。
            新建文件 / 新建文件夹已挪到右键菜单（侧栏空白右键、文件夹条目右键），
            侧栏首屏只剩「排序工具条」一行，主操作 + 列表工具就近成组，视觉密度更紧凑。
@@ -443,6 +462,15 @@
     </div>
 
     <div id="editor-pane" class="editor-pane">
+      <!-- 「编辑模式 + 未打开文件」时编辑列曾是整片纯黑，用户会以为界面卡死。
+           viewer 侧的 .empty-state 在 edit 模式下是隐藏的，够不着这里，
+           所以复用它的外观体系做一个紧凑版（无光晕 icon / 无 CTA）。
+           显示条件见 05-sidebar.css 的 body[data-editor-mode="edit"]:not([data-file-open]) 规则；
+           data-file-open 由 markdown-editor.js loadFile/unload 维护。 -->
+      <div class="empty-state">
+        <p>选择一个文件开始编辑</p>
+        <p class="hint hint-secondary">或按 <kbd>Ctrl</kbd>+<kbd>N</kbd> 新建笔记</p>
+      </div>
       <!-- CodeMirror 挂载到这里 -->
     </div>
 

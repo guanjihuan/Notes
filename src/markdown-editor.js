@@ -9,7 +9,7 @@
 import { EditorState, Prec, Compartment } from '@codemirror/state';
 import { EditorView, keymap } from '@codemirror/view';
 import { basicSetup } from 'codemirror';
-import { history } from '@codemirror/commands';
+import { history, undo as cmUndo, redo as cmRedo, undoDepth, redoDepth } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { getTextStats } from './stats.js';
 import { pickEditorTheme } from './editor-theme.js';
@@ -128,20 +128,113 @@ export class MarkdownEditor {
     this.lastSavedDoc = content || '';
     const insert = content || '';
 
+    // 编辑列空态提示（见 index.html #editor-pane / 05-sidebar.css）依赖
+    // body[data-file-open]：loadFile 成功 = 已打开文件；unload() 移除该属性让提示回来。
+    document.body.dataset.fileOpen = 'true';
+
     if (this.view) {
-      // view 已存在 → 复用。dispatch 替换 doc，selection 故意重置到 (0,0)
+      // view 已存在 → 复用。2026-10 起从「dispatch 替换 doc」改为
+      // 「setState 重建 state」：dispatch 替换会把「整页换内容」记进 history
+      // （一次可撤销事件），上一个文件的编辑记录也因此跨文件存活 —— 打开 B 后
+      // Ctrl+Z 能退回 A 的内容，#btn-undo 还会在刚打开的文件上误导「有可撤销」。
+      // setState 用同一份 extensions + 新 doc 建 EditorState → history state
+      // field 全新 init（undo/redo 栈清零），selection 天然落 (0,0)
       // （用户主动打开文件 = 导航，光标落文首是合理默认；与 setExternalContent
       // 的「保留光标位置」差异是设计意图：setExternalContent 是外部覆盖，
       // 不该打断用户当前阅读位置；loadFile 是用户主动切文件，重置是合理的）。
-      this.view.dispatch({
-        changes: { from: 0, to: this.view.state.doc.length, insert },
-        selection: { anchor: 0, head: 0 },
-      });
+      //
+      // 不能用 historyCompartment.reconfigure 重置：@codemirror/commands 的
+      // historyField_ 是模块级共享 StateField（index.js 里 history() 直接返回
+      // 同一个 field 实例），换一个新 history() 配置并不会让字段重新 init，
+      // 栈纹丝不动 —— 实测无效，故走 setState。
+      // setState 不是 dispatch transaction → 不 fire updateListener / onChange：
+      // 加载文件本就不是编辑动作，脏态与预览由 openFile 尾部显式
+      // （state.isDirty=false → syncSaveButton / viewer.loadContent）负责。
+      // 旧 dispatch 路径每次切文件反而多跑一次伪 onChange（live preview 重复
+      // 渲染 + auto-save 空转），去掉无行为损失。view/DOM/IME listener 全复用，
+      // 无黑闪；themeCompartment / editableCompartment 当前值原样带入新 state。
+      this.view.setState(
+        EditorState.create({ doc: insert, extensions: this._buildExtensions() })
+      );
       return;
     }
 
     // 首次：建 view（之后不再重建，直到 dispose / unload）
     this._createView(insert);
+  }
+
+  /**
+   * 构建 EditorState 的 extensions 列表（2026-10 抽出）。
+   *
+   * 两个消费方共用这一份，保证「首次建 view」与「loadFile 复用路径 setState」
+   * 的扩展集完全一致：themeCompartment / editableCompartment 是实例级 Compartment，
+   * setState 后其当前值（当前主题、只读态）原样生效，不会在切文件时被重置。
+   */
+  _buildExtensions() {
+    return [
+      EditorView.lineWrapping,
+      basicSetup,
+      // audit P0-3（C-1）：basicSetup 默认带 history() 但 history 大小无显式
+      // 上限（默认 minDepth=100，updateBranch 实际有 +20 buffer，所以 120）。
+      // 打开 5MB 文件 + 长时间编辑 → history 数组几十~几百 MB，OOM 风险。
+      // 覆盖配置：minDepth=500 限制 history 长度（老 step 被丢弃，updateBranch
+      // 内部 +20 buffer，所以 520 上限），newGroupDelay=200ms 把短时间内的连续
+      // keystroke 合并成 1 步（避免每个键 1 步、3 千字输入塞 3 千条 history）。
+      // 注：CM6 API 用 minDepth（虽然语义上是 max），不是 audit 文档误写的
+      // maxDepth；参数名以 @codemirror/commands 的 HistoryConfig 为准。
+      Prec.high(history({ minDepth: 500, newGroupDelay: 200 })),
+      markdown(),
+      this.themeCompartment.of(pickEditorTheme(this.currentTheme)),
+      this.editableCompartment.of(EditorView.editable.of(true)),
+      Prec.highest(keymap.of([
+        {
+          key: 'Mod-s',
+          preventDefault: true,
+          run: () => {
+            if (this.onSaveCallback) this.onSaveCallback();
+            return true;
+          },
+        },
+      ])),
+      EditorView.updateListener.of((update) => {
+        // audit fix (K2-H2)：CJK IME 合成期间，CM6 把每个临时字符 commit 成
+        // 独立 transaction（userEvent: 'input.type.compose'）—— 一个 20 字的
+        // 中文段落会触发 20 次 updateListener，每次 docChanged=true 都跑
+        // onChange 全链路：state.isDirty 立即翻 true（用户还没打完就显示
+        // 脏态）、save 按钮进 is-dirty 提示态、scheduleAutoSave 反复 clearTimeout、
+        // scheduleLivePreview 200ms 后 viewer.loadContentLive 整页 innerHTML
+        // 重建。合成中的 IME 字符不会真的写盘，对外只 commit 一次（compositionend）
+        // —— 跳过中间过程，让脏态 / live preview / auto-save 在 compositionend
+        // 时一次性 flush。
+        // scroll（geometryChanged）不依赖 docChanged，IME 期间用户也可能滚动
+        // 列表，跟之前一样保留。
+        const isComposing = update.transactions.some((t) => t.isUserEvent('input.type.compose'));
+        if (update.docChanged && !isComposing && this.onChangeCallback) {
+          this.onChangeCallback();
+        }
+        // P1-10：只把「真实滚动」转发给 onScroll。
+        // selectionSet（光标移动）也走到了这里 —— 但 app.js 的 onScroll 只是
+        // viewer.setScrollProgress(...) 同步右侧预览位置，光标移动跟预览无关，
+        // 不应该触发。getScrollProgress 会读 scrollHeight/clientHeight，强制
+        // layout flush，10K 行文档下每个 keystroke + 移动光标都做几次 N 次
+        // layout 计算，体感明显。
+        if (update.geometryChanged && this.onScrollCallback) {
+          // audit fix (renderer-M4)：geometryChanged 在 split 模式下会被高
+          // 频触发，rAF 合并到一帧一次。rAF 在浏览器不可见标签页里会自然暂停，
+          // 也避免背景 tab 里持续 layout flush。
+          if (this._scrollFrame !== null) {
+            cancelAnimationFrame(this._scrollFrame);
+          }
+          this._scrollFrame = requestAnimationFrame(() => {
+            this._scrollFrame = null;
+            // view 已经在 _destroyView 走完时被置 null，rAF 回调里再读会抛
+            // getScrollProgress 已经做 null 检查，但显式守一遍更稳。
+            if (!this.view || !this.onScrollCallback) return;
+            this.onScrollCallback(this.getScrollProgress());
+          });
+        }
+      }),
+    ];
   }
 
   /**
@@ -160,72 +253,11 @@ export class MarkdownEditor {
     // 拆解。
     const contentSignal = this._viewAbort.signal;
 
+    // extensions 列表抽到 _buildExtensions()（2026-10）：loadFile 复用路径
+    // setState 时要用同一份扩展集重建 state 以清空 history，两边必须一致。
     const state = EditorState.create({
       doc: initialContent,
-      extensions: [
-        EditorView.lineWrapping,
-        basicSetup,
-        // audit P0-3（C-1）：basicSetup 默认带 history() 但 history 大小无显式
-        // 上限（默认 minDepth=100，updateBranch 实际有 +20 buffer，所以 120）。
-        // 打开 5MB 文件 + 长时间编辑 → history 数组几十~几百 MB，OOM 风险。
-        // 覆盖配置：minDepth=500 限制 history 长度（老 step 被丢弃，updateBranch
-        // 内部 +20 buffer，所以 520 上限），newGroupDelay=200ms 把短时间内的连续
-        // keystroke 合并成 1 步（避免每个键 1 步、3 千字输入塞 3 千条 history）。
-        // 注：CM6 API 用 minDepth（虽然语义上是 max），不是 audit 文档误写的
-        // maxDepth；参数名以 @codemirror/commands 的 HistoryConfig 为准。
-        Prec.high(history({ minDepth: 500, newGroupDelay: 200 })),
-        markdown(),
-        this.themeCompartment.of(pickEditorTheme(this.currentTheme)),
-        this.editableCompartment.of(EditorView.editable.of(true)),
-        Prec.highest(keymap.of([
-          {
-            key: 'Mod-s',
-            preventDefault: true,
-            run: () => {
-              if (this.onSaveCallback) this.onSaveCallback();
-              return true;
-            },
-          },
-        ])),
-        EditorView.updateListener.of((update) => {
-          // audit fix (K2-H2)：CJK IME 合成期间，CM6 把每个临时字符 commit 成
-          // 独立 transaction（userEvent: 'input.type.compose'）—— 一个 20 字的
-          // 中文段落会触发 20 次 updateListener，每次 docChanged=true 都跑
-          // onChange 全链路：state.isDirty 立即翻 true（用户还没打完就显示
-          // 脏态）、save 按钮进 is-dirty 提示态、scheduleAutoSave 反复 clearTimeout、
-          // scheduleLivePreview 200ms 后 viewer.loadContentLive 整页 innerHTML
-          // 重建。合成中的 IME 字符不会真的写盘，对外只 commit 一次（compositionend）
-          // —— 跳过中间过程，让脏态 / live preview / auto-save 在 compositionend
-          // 时一次性 flush。
-          // scroll（geometryChanged）不依赖 docChanged，IME 期间用户也可能滚动
-          // 列表，跟之前一样保留。
-          const isComposing = update.transactions.some((t) => t.isUserEvent('input.type.compose'));
-          if (update.docChanged && !isComposing && this.onChangeCallback) {
-            this.onChangeCallback();
-          }
-          // P1-10：只把「真实滚动」转发给 onScroll。
-          // selectionSet（光标移动）也走到了这里 —— 但 app.js 的 onScroll 只是
-          // viewer.setScrollProgress(...) 同步右侧预览位置，光标移动跟预览无关，
-          // 不应该触发。getScrollProgress 会读 scrollHeight/clientHeight，强制
-          // layout flush，10K 行文档下每个 keystroke + 移动光标都做几次 N 次
-          // layout 计算，体感明显。
-          if (update.geometryChanged && this.onScrollCallback) {
-            // audit fix (renderer-M4)：geometryChanged 在 split 模式下会被高
-            // 频触发，rAF 合并到一帧一次。rAF 在浏览器不可见标签页里会自然暂停，
-            // 也避免背景 tab 里持续 layout flush。
-            if (this._scrollFrame !== null) {
-              cancelAnimationFrame(this._scrollFrame);
-            }
-            this._scrollFrame = requestAnimationFrame(() => {
-              this._scrollFrame = null;
-              // view 已经在 _destroyView 走完时被置 null，rAF 回调里再读会抛
-              // getScrollProgress 已经做 null 检查，但显式守一遍更稳。
-              if (!this.view || !this.onScrollCallback) return;
-              this.onScrollCallback(this.getScrollProgress());
-            });
-          }
-        }),
-      ],
+      extensions: this._buildExtensions(),
     });
 
     this.view = new EditorView({
@@ -311,6 +343,8 @@ export class MarkdownEditor {
   unload() {
     this._destroyView();
     this.lastSavedDoc = '';
+    // 与 loadFile 的 dataset.fileOpen 成对：无文件时编辑列显示空态提示
+    delete document.body.dataset.fileOpen;
     // Phase N-2 修复（关键 bug · 保存按钮失灵）：
     //   K2-L10 的旧实现会在这里清掉 onChange/onSave/onScroll 三个 callback。
     //   后果：clearCurrentFile() → unload() 把 callback 置空 → 下次 openFile
@@ -441,6 +475,38 @@ export class MarkdownEditor {
 
   focus() {
     if (this.view) this.view.focus();
+  }
+
+  /**
+   * 撤销 / 重做（2026-10，供 app.js 工具栏 #btn-undo / #btn-redo 调用）。
+   * app.js 顶层禁止静态 import @codemirror/*（audit P2-9），history 深度读取和
+   * 命令执行都收敛在本类内部，对外只暴露 can* / undo / redo 四个薄方法。
+   *
+   * - view 懒创建（首次 loadFile 才有）→ can* 在无 view 时一律 false
+   * - undo()/redo() 返回是否真的撤/重做了（CM 命令的布尔返回）；
+   *   成功时把焦点还给编辑器 —— 点按钮会把焦点从 editor 抢走，还回去让用户
+   *   能继续打字；没东西可撤时不动焦点
+   */
+  canUndo() {
+    return !!this.view && undoDepth(this.view.state) > 0;
+  }
+
+  canRedo() {
+    return !!this.view && redoDepth(this.view.state) > 0;
+  }
+
+  undo() {
+    if (!this.view) return false;
+    const ok = cmUndo(this.view);
+    if (ok) this.view.focus();
+    return ok;
+  }
+
+  redo() {
+    if (!this.view) return false;
+    const ok = cmRedo(this.view);
+    if (ok) this.view.focus();
+    return ok;
   }
 
   /**

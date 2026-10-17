@@ -43,7 +43,11 @@ export function formatDate(mtimeMs) {
  *   < 24h（且跨日）→ "昨天"
  *   < 24h（同日）  → "N 小时前"
  *   < 7d         → "N 天前"
- *   ≥ 7d         → 回落到 formatDate（绝对时间）
+ *   ≥ 7d         → 紧凑绝对时间：同年 "MM-DD HH:mm"，跨年 "YYYY-MM-DD"
+ *
+ * 不直接用 formatDate 的 "YYYY-MM-DD HH:mm"：侧栏 meta 行宽约 190px，
+ * "2.6 KB · 2026-09-24 16:14" 会被 ellipsis 截成 "2026-09-24 16…"，
+ * 年份对近一年的文件信息量最低，优先砍掉。
  *
  * @param {number} mtimeMs
  * @param {number} [nowMs=Date.now()]
@@ -74,8 +78,21 @@ export function formatRelativeTime(mtimeMs, nowMs = Date.now()) {
   if (daysApart === 1) return '昨天';
   if (daysApart < 7) return `${daysApart} 天前`;
 
-  // ≥ 7d：回落绝对时间，避免"183 天前"这种无意义表达
-  return formatDate(mtimeMs);
+  // ≥ 7d：回落绝对时间，避免"183 天前"这种无意义表达。
+  // 侧栏空间只放得下 16 字符里的前 11 个左右，所以给紧凑版式：
+  //   同年   → "MM-DD HH:mm"（年份是废话：能同年说明就是今年改的）
+  //   跨年   → "YYYY-MM-DD"（时间部分退场，保住年份这个关键信息）
+  if (mtime.getFullYear() === now.getFullYear()) {
+    const mo = String(mtime.getMonth() + 1).padStart(2, '0');
+    const da = String(mtime.getDate()).padStart(2, '0');
+    const h = String(mtime.getHours()).padStart(2, '0');
+    const mi = String(mtime.getMinutes()).padStart(2, '0');
+    return `${mo}-${da} ${h}:${mi}`;
+  }
+  const y = mtime.getFullYear();
+  const mo = String(mtime.getMonth() + 1).padStart(2, '0');
+  const da = String(mtime.getDate()).padStart(2, '0');
+  return `${y}-${mo}-${da}`;
 }
 
 /**

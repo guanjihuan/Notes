@@ -93,6 +93,12 @@ describe('ALLOWED_URI_REGEXP 单测', () => {
     ['image:001.jpg', true],
     ['screenshot:1.png', true],
     ['dir/sub:dir/file.png', true],
+    // 回归（37664cb 重构引入）：分支 B 段字符类曾排除 `#`，把「文件#锚点」
+    // 跨文件跳转形态整类误拒（app.js resolveLocalFile 消费 # 后缀）。
+    ['foo/bar#baz', true],
+    ['page.md#chapter', true],
+    ['sprite.svg#icon-home', true],
+    ['notes/page.md#sec', true],
     // 即使危险 scheme 后只接字母（无 `/`），正则仍拒绝：顶层 `(?!)` 拦掉。
     ['javascript:foo', false],
     ['vbscript:foo', false],
@@ -101,6 +107,13 @@ describe('ALLOWED_URI_REGEXP 单测', () => {
     ['vbscript:msgbox(1)', false],
     ['data:text/html,xxx', false],
     ['chrome-extension://x/y', false],
+    // 分支 A 收紧：旧版不要求「冒号后带点扩展名」，`scheme:无点token` 整类
+    // 放行（blob: / chrome: / ms-msdt: …），白名单被稀释成 4 scheme 黑名单。
+    // 现在恢复默认拒绝；仅剩主进程导航守卫兜底的状态不复存在。
+    ['blob:x', false],
+    ['chrome:x', false],
+    ['ms-msdt:x', false],
+    ['view-source:x', false],
     // 协议相对 URL：// 或 \\ 开头会被浏览器解析为「继承当前 scheme」，
     // 攻击面是「静默导航到外站 / 把用户隐私发给 evil.com」。
     // 必须与绝对路径 /abs/x.png 区分开 —— 单 / 放行，双 / 拒绝。

@@ -150,6 +150,89 @@ describe('moveEntry / copyEntry', () => {
     expect(ctx.state.currentFile.path).toBe('/d/note.md');
   });
 
+  it('moveEntry 飞行中设置 state.movingPath，成功后 finally 清空（fs-watcher 竞态守卫）', async () => {
+    const ctx = makeCtx();
+    let seenDuringFlight;
+    ctx.api.moveFile = vi.fn(async () => {
+      seenDuringFlight = ctx.state.movingPath;
+      return { ok: true, path: '/d/sub/note.md', name: 'note.md', entryType: 'file', mtimeMs: 123, size: 10, relDir: 'sub' };
+    });
+    globalThis.window = { api: ctx.api };
+    const ops = createFileOps(ctx);
+
+    await ops.moveEntry({ path: '/d/note.md', name: 'note.md', entryType: 'file' }, '/d/sub');
+
+    expect(seenDuringFlight).toBe('/d/note.md');
+    expect(ctx.state.movingPath).toBeNull();
+    // 移动文件本身 → currentFileRelDir 同步为 result.relDir
+    expect(ctx.state.currentFileRelDir).toBe('sub');
+  });
+
+  it('moveEntry 失败同样清空 movingPath 守卫', async () => {
+    const ctx = makeCtx();
+    ctx.api.moveFile = vi.fn(async () => ({ ok: false, code: 'EACCES', message: '没有访问权限' }));
+    globalThis.window = { api: ctx.api };
+    const ops = createFileOps(ctx);
+
+    await ops.moveEntry({ path: '/d/note.md', name: 'note.md', entryType: 'file' }, '/d/sub');
+
+    expect(ctx.state.movingPath).toBeNull();
+  });
+
+  it('moveEntry 祖先文件夹被移动（重名避让改名）：新路径用 result.path 重拼、relDir 指向文件所在目录', async () => {
+    const ctx = makeCtx();
+    ctx.state.currentFile = { path: '/d/A/sub/note.md', name: 'note.md', mtimeMs: 7, size: 42 };
+    ctx.state.currentFileRelDir = 'A/sub';
+    // 移动 /d/A → /d/B，重名避让后实际落点 /d/B/A (2)
+    ctx.api.moveFile = vi.fn(async () => ({
+      ok: true, path: '/d/B/A (2)', name: 'A (2)', entryType: 'folder', relDir: 'B', mtimeMs: 123, size: 10,
+    }));
+    globalThis.window = { api: ctx.api };
+    const ops = createFileOps(ctx);
+
+    await ops.moveEntry({ path: '/d/A', name: 'A', entryType: 'folder' }, '/d/B');
+
+    // 旧实现：destDir + remainder → 丢掉文件夹自身段，拼成 /d/B/sub/note.md（错）
+    expect(ctx.state.currentFile.path).toBe('/d/B/A (2)/sub/note.md');
+    expect(ctx.state.currentFile.name).toBe('note.md');
+    // 旧实现：直接用 result.relDir='B'（被移动文件夹的新父目录，错）
+    expect(ctx.state.currentFileRelDir).toBe('B/A (2)/sub');
+    expect(ctx.controls.fileList.setActive).toHaveBeenCalledWith('/d/B/A (2)/sub/note.md');
+  });
+
+  it('moveEntry 祖先文件夹被移动（打开文件直接在文件夹下）：relDir = 新父/新名', async () => {
+    const ctx = makeCtx();
+    ctx.state.currentFile = { path: '/d/A/note.md', name: 'note.md', mtimeMs: 7, size: 42 };
+    ctx.api.moveFile = vi.fn(async () => ({
+      ok: true, path: '/d/B/A', name: 'A', entryType: 'folder', relDir: 'B', mtimeMs: 123, size: 10,
+    }));
+    globalThis.window = { api: ctx.api };
+    const ops = createFileOps(ctx);
+
+    await ops.moveEntry({ path: '/d/A', name: 'A', entryType: 'folder' }, '/d/B');
+
+    expect(ctx.state.currentFile.path).toBe('/d/B/A/note.md');
+    expect(ctx.state.currentFileRelDir).toBe('B/A');
+  });
+
+  it('moveEntry 祖先判定带分隔符边界：/d/A 移动不误伤打开文件 /d/Abc.md', async () => {
+    const ctx = makeCtx();
+    ctx.state.currentFile = { path: '/d/Abc.md', name: 'Abc.md', mtimeMs: 7, size: 42 };
+    ctx.state.currentFileRelDir = '';
+    // result.entryType folder 且 cfPath 与被移动文件夹共享前缀但不同目录
+    ctx.api.moveFile = vi.fn(async () => ({
+      ok: true, path: '/d/B/A', name: 'A', entryType: 'folder', relDir: 'B', mtimeMs: 123, size: 10,
+    }));
+    globalThis.window = { api: ctx.api };
+    const ops = createFileOps(ctx);
+
+    await ops.moveEntry({ path: '/d/A', name: 'A', entryType: 'folder' }, '/d/B');
+
+    // 旧实现裸 startsWith('/d/A') 会误命中 '/d/Abc.md' 并把状态改坏
+    expect(ctx.state.currentFile.path).toBe('/d/Abc.md');
+    expect(ctx.state.currentFileRelDir).toBe('');
+  });
+
   it('moveEntry / copyEntry 入参缺字段时直接返回 null', async () => {
     const ctx = makeCtx();
     const ops = createFileOps(ctx);

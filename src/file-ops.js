@@ -673,38 +673,66 @@ export function createFileOps(ctx) {
    */
   async function moveEntry(entry, destDir) {
     if (!entry || !entry.path || !destDir) return null;
-    const result = await api.moveFile(entry.path, destDir);
-    if (!result || !result.ok) {
-      showToast(`移动失败：${window.api.friendlyFsError(result && result.code, result && result.message)}`, 'error');
-      return result || null;
-    }
-    showToast(`已移动到：${result.name}`, 'success', 1500);
-    // 移动涉及当前打开文件 → 同步路径 / 状态栏 / viewer 相对图解析
-    // 覆盖两种情况：
-    //   1) 移动的就是打开的文件本身（state.currentFile.path === entry.path）
-    //   2) 移动的是打开文件的祖先文件夹（state.currentFile.path 在 entry.path 之下）——
-    //      audit 修复：之前只覆盖情况 1，导致情况 2 下 state.currentFileRelDir /
-    //      currentFile.path 仍指向旧位置，onFilesChanged 把"旧目录的移除事件"
-    //      误判为"当前文件被删除"，触发 rescue + 写一个孤儿 .md 到根目录。
-    if (state.currentFile && state.currentFile.path) {
-      const cfPath = state.currentFile.path;
-      if (cfPath === entry.path) {
-        _applyMoveToOpenFile(result);
-      } else if (result.entryType === 'folder' && cfPath.startsWith(entry.path)) {
-        // 祖先文件夹被移走 → 重新拼出文件新路径
-        const newFilePath = destDir + cfPath.slice(entry.path.length);
-        const newName = newFilePath.replace(/^.*[\\/]/, '');
-        _applyMoveToOpenFile({
-          path: newFilePath,
-          name: newName,
-          mtimeMs: state.currentFile.mtimeMs,
-          size: state.currentFile.size,
-          // destDir 的 relDir 与 result.relDir 一致（祖先移动后，新父 = destDir）
-          relDir: typeof result.relDir === 'string' ? result.relDir : '',
-        });
+    // 飞行守卫（rename / delete 的 renamingPath / deletingPath 同款，app.js
+    // onFilesChanged 消费）：await moveFile（renameWithRetry + stat 最坏 350ms，
+    // SMB/OneDrive 上更高）可能晚于 fs-watcher 的 300ms 防抖完成 —— watcher 会
+    // 先推「源没了」的 files:changed。没有守卫，onFilesChanged 会把打开文件
+    // 误判为「被外部删除」，触发 rescue 孤儿文件 / 清空编辑器。
+    state.movingPath = entry.path;
+    try {
+      const result = await api.moveFile(entry.path, destDir);
+      if (!result || !result.ok) {
+        showToast(`移动失败：${window.api.friendlyFsError(result && result.code, result && result.message)}`, 'error');
+        return result || null;
       }
+      showToast(`已移动到：${result.name}`, 'success', 1500);
+      // 移动涉及当前打开文件 → 同步路径 / 状态栏 / viewer 相对图解析
+      // 覆盖两种情况：
+      //   1) 移动的就是打开的文件本身（state.currentFile.path === entry.path）
+      //   2) 移动的是打开文件的祖先文件夹（state.currentFile.path 在 entry.path 之下）——
+      //      audit 修复：之前只覆盖情况 1，导致情况 2 下 state.currentFileRelDir /
+      //      currentFile.path 仍指向旧位置，onFilesChanged 把"旧目录的移除事件"
+      //      误判为"当前文件被删除"，触发 rescue + 写一个孤儿 .md 到根目录。
+      if (state.currentFile && state.currentFile.path) {
+        const cfPath = state.currentFile.path;
+        if (cfPath === entry.path) {
+          _applyMoveToOpenFile(result);
+        } else if (result.entryType === 'folder'
+            && (cfPath.startsWith(entry.path + '\\') || cfPath.startsWith(entry.path + '/'))) {
+          // 祖先文件夹被移走 → 重新拼出文件新路径。remainder 以一个路径分隔符
+          // 开头（'\sub\file.md' / '\file.md'）。新路径 = 被移动文件夹的**实际**
+          // 新位置 result.path（重名避让时会被改名，≠ destDir + 原名）+ remainder。
+          // 旧实现用 destDir + remainder，丢掉了被移动文件夹自身那一段名字 →
+          // 路径整个拼错。
+          const remainder = cfPath.slice(entry.path.length);
+          const cut = Math.max(remainder.lastIndexOf('\\'), remainder.lastIndexOf('/'));
+          const newFilePath = result.path + remainder;
+          const newName = remainder.slice(cut + 1);
+          // relDir 要指向**文件所在目录**：result.relDir 只是被移动文件夹的新
+          // 父目录，还须拼上文件夹的新名（result.name）与文件夹内的相对目录段
+          // （'\sub\file.md' → 'sub'）。旧实现直接写 result.relDir，打开文件
+          // 在子目录里时 onFilesChanged 的 payloadRel 门永远错配。
+          const innerDirSegs = cut > 0
+            ? remainder.slice(0, cut).replace(/^[\\/]+/, '').replace(/\\/g, '/')
+            : '';
+          const relDir = typeof result.relDir === 'string'
+            ? [result.relDir, result.name, innerDirSegs].filter((s) => s).join('/')
+            : '';
+          _applyMoveToOpenFile({
+            path: newFilePath,
+            name: newName,
+            mtimeMs: state.currentFile.mtimeMs,
+            size: state.currentFile.size,
+            relDir,
+          });
+        }
+      }
+      return result;
+    } finally {
+      // 仿 rename 的顺序：post-await 先更新 currentFile.path / relDir，守卫
+      // 最后清 —— 晚到的旧目录事件已按新路径走常规 diff。
+      state.movingPath = null;
     }
-    return result;
   }
 
   /**
@@ -790,7 +818,7 @@ export function createFileOps(ctx) {
     items.push({ label: '重命名', value: 'rename' });
     items.push({ label: '在文件夹中显示', value: 'reveal' });
     items.push({ separator: true, value: '' });
-    items.push({ label: '删除', value: 'delete' });
+    items.push({ label: '删除', value: 'delete', danger: true });
     contextMenu.show({
       x, y, items,
       onSelect: (value) => {
